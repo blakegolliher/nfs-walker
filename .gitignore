@@ -1,0 +1,46 @@
+# Build artifacts
+/target/
+/build/
+
+# Cargo lock (optional - include for binaries, exclude for libraries)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test outputs
+*.db
+*.parquet
+/tmp/
+
+# Notes and prompts
+*.prompt
+*.prompts
+prompts/
+notes/
+*.notes
+NOTES.md
+PROMPTS.md
+TODO.md
+
+# Credentials
+.env
+*.pem
+*.key
+
+# Claude/AI
+.claude/
+prompt.md
+
+# SQLite temp files
+*.db-shm
+*.db-wal
+*.db-journal
