@@ -104,14 +104,36 @@ nfs-walker nfs://server/export --format parquet -o scan.parquet
 
 ## Performance
 
-Measured performance scanning 2.1 million files:
+### Benchmark: nfs-walker vs Traditional Tools
+
+Scanning 2.1 million files over NFS:
+
+| Tool                  | Time     | Speedup |
+|-----------------------|----------|---------|
+| `find` (count only)   | 12m 13s  | 1x      |
+| `find` (with stat)    | 11m 43s  | 1x      |
+| `du -s`               | 11m 46s  | 1x      |
+| `ls -lR`              | 9m 24s   | 1.3x    |
+| `rsync --list-only`   | 1m 54s   | 6.4x    |
+| `tree`                | 1m 26s   | 8.5x    |
+| **nfs-walker**        | **33s**  | **22x** |
+
+### Why is nfs-walker faster?
+
+Traditional tools use the kernel NFS client, which serializes requests and has significant per-operation overhead. nfs-walker uses:
+
+1. **Direct NFS protocol** - Bypasses the kernel, communicates directly with the NFS server
+2. **READDIRPLUS** - Single NFS operation returns directory listing + file attributes (no separate stat calls)
+3. **Connection pooling** - Multiple parallel NFS connections (default: 16)
+4. **Async I/O** - Tokio-based async runtime maximizes throughput
+
+### Output Format Comparison
 
 | Format  | Throughput       | Output Size |
 |---------|------------------|-------------|
-| SQLite  | 50K files/sec    | 646 MB      |
-| Parquet | 313K files/sec   | 78 MB       |
+| SQLite  | 65K files/sec    | 646 MB      |
+| Parquet | 65K files/sec    | 78 MB       |
 
-- **Parquet is 6x faster** for writes
 - **Parquet is 8x smaller** with ZSTD compression
 - **Memory usage**: <200MB regardless of filesystem size
 
