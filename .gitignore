@@ -44,3 +44,4 @@ prompt.md
 *.db-shm
 *.db-wal
 *.db-journal
+docs/

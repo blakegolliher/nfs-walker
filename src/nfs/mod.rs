@@ -53,6 +53,6 @@ mod connection;
 pub mod pool;
 pub mod types;
 
-pub use connection::{NfsConnection, NfsConnectionBuilder};
-pub use pool::NfsConnectionPool;
+pub use connection::{NfsConnection, NfsConnectionBuilder, NfsDirHandle};
+pub use pool::{NfsConnectionPool, SyncNfsConnectionPool, StatResult};
 pub use types::{DbEntry, DirStats, EntryType, NfsDirEntry, NfsStat, Permissions};

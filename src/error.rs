@@ -43,7 +43,7 @@ pub enum WalkerError {
 }
 
 /// NFS connection and protocol errors
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum NfsError {
     /// Failed to parse NFS URL
     #[error("Invalid NFS URL '{url}': {reason}")]

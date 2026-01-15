@@ -81,6 +81,10 @@ impl NfsConnection {
             ffi::nfs_set_timeout(self.context, timeout_ms);
         }
 
+        // Note: Disabled buffer size override - caused hangs with some servers
+        // libnfs default is 8KB, negotiated with server's dtpref during mount
+        // TODO: Investigate why larger buffers cause issues
+
         // Convert strings to C strings
         let server_cstr = CString::new(self.server.as_str()).map_err(|_| {
             NfsError::ConnectionFailed {
@@ -170,6 +174,220 @@ impl NfsConnection {
         }
 
         Ok(entries)
+    }
+
+    /// Read directory entries in chunks, calling a callback for each chunk
+    ///
+    /// This is more memory-efficient for large directories and allows
+    /// distributing work across workers as entries are read.
+    ///
+    /// Returns the total number of entries processed.
+    pub fn readdir_plus_chunked<F>(
+        &self,
+        path: &str,
+        chunk_size: usize,
+        mut callback: F,
+    ) -> NfsResult<usize>
+    where
+        F: FnMut(Vec<NfsDirEntry>) -> bool, // Return false to stop early
+    {
+        if !self.mounted {
+            return Err(NfsError::ReadDirFailed {
+                path: path.into(),
+                reason: "Not mounted".into(),
+            });
+        }
+
+        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadDirFailed {
+            path: path.into(),
+            reason: "Path contains null bytes".into(),
+        })?;
+
+        // Open directory
+        let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
+        let result = unsafe {
+            ffi::nfs_opendir(self.context, path_cstr.as_ptr(), &mut dir_handle)
+        };
+
+        if result != 0 {
+            return Err(self.translate_error(path, result));
+        }
+
+        let mut total_entries = 0;
+        let mut chunk = Vec::with_capacity(chunk_size);
+
+        loop {
+            let dirent = unsafe { ffi::nfs_readdir(self.context, dir_handle) };
+
+            if dirent.is_null() {
+                // End of directory - send final chunk if any
+                if !chunk.is_empty() {
+                    total_entries += chunk.len();
+                    callback(chunk);
+                }
+                break;
+            }
+
+            // Safety: dirent is valid until next readdir call or closedir
+            let entry = unsafe { self.convert_dirent(dirent) };
+            chunk.push(entry);
+
+            // When chunk is full, send it to callback
+            if chunk.len() >= chunk_size {
+                total_entries += chunk.len();
+                let continue_reading = callback(chunk);
+                chunk = Vec::with_capacity(chunk_size);
+
+                if !continue_reading {
+                    break;
+                }
+            }
+        }
+
+        // Close directory
+        unsafe {
+            ffi::nfs_closedir(self.context, dir_handle);
+        }
+
+        Ok(total_entries)
+    }
+
+    /// Open a directory for manual iteration with seek support
+    ///
+    /// This allows for cookie-based parallel reading:
+    /// 1. Open directory
+    /// 2. Read entries, periodically calling telldir() to get position
+    /// 3. Later, seekdir() to jump to a saved position
+    pub fn opendir(&self, path: &str) -> NfsResult<NfsDirHandle> {
+        if !self.mounted {
+            return Err(NfsError::ReadDirFailed {
+                path: path.into(),
+                reason: "Not mounted".into(),
+            });
+        }
+
+        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadDirFailed {
+            path: path.into(),
+            reason: "Path contains null bytes".into(),
+        })?;
+
+        let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
+        let result = unsafe {
+            ffi::nfs_opendir(self.context, path_cstr.as_ptr(), &mut dir_handle)
+        };
+
+        if result != 0 {
+            return Err(self.translate_error(path, result));
+        }
+
+        Ok(NfsDirHandle {
+            context: self.context,
+            handle: dir_handle,
+            path: path.to_string(),
+        })
+    }
+
+    /// Open a directory starting from a specific NFS cookie position
+    ///
+    /// This enables parallel directory reading by having multiple workers
+    /// start reading from different cookie positions within the same directory.
+    ///
+    /// # Arguments
+    /// * `path` - Directory path to open
+    /// * `cookie` - Starting cookie (0 = beginning, or value from a previous entry's cookie field)
+    /// * `max_entries` - Maximum entries to fetch from server (0 = no limit, read until EOF)
+    ///
+    /// # Note
+    /// The cookieverf is set to zero. Most NFS servers accept this, but some
+    /// may reject non-zero cookies without a valid verifier.
+    pub fn opendir_at_cookie(&self, path: &str, cookie: u64, max_entries: u32) -> NfsResult<NfsDirHandle> {
+        if !self.mounted {
+            return Err(NfsError::ReadDirFailed {
+                path: path.into(),
+                reason: "Not mounted".into(),
+            });
+        }
+
+        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadDirFailed {
+            path: path.into(),
+            reason: "Path contains null bytes".into(),
+        })?;
+
+        let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
+        let result = unsafe {
+            ffi::nfs_opendir_at_cookie(self.context, path_cstr.as_ptr(), cookie, max_entries, &mut dir_handle)
+        };
+
+        if result != 0 {
+            return Err(self.translate_error(path, result));
+        }
+
+        Ok(NfsDirHandle {
+            context: self.context,
+            handle: dir_handle,
+            path: path.to_string(),
+        })
+    }
+
+    /// Open a directory for reading names only, starting at a specific cookie position
+    ///
+    /// This uses READDIR instead of READDIRPLUS, which is dramatically faster
+    /// for large directories because the server doesn't need to stat() each file.
+    ///
+    /// Returned entries will have:
+    /// - name: populated
+    /// - inode: populated
+    /// - cookie: populated (use for next batch)
+    /// - entry_type: Unknown (no attributes fetched)
+    /// - stat: minimal (only inode populated)
+    ///
+    /// Use `NfsDirHandle::get_cookieverf()` to get the verifier for the next batch.
+    ///
+    /// # Arguments
+    /// * `path` - Directory path to read
+    /// * `cookie` - Starting position (0 for beginning, or last entry's cookie)
+    /// * `cookieverf` - Cookie verifier from previous batch (0 for first call)
+    /// * `max_entries` - Maximum entries to fetch (batch size)
+    pub fn opendir_names_only_at_cookie(
+        &self,
+        path: &str,
+        cookie: u64,
+        cookieverf: u64,
+        max_entries: u32,
+    ) -> NfsResult<NfsDirHandle> {
+        if !self.mounted {
+            return Err(NfsError::ReadDirFailed {
+                path: path.into(),
+                reason: "Not mounted".into(),
+            });
+        }
+
+        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadDirFailed {
+            path: path.into(),
+            reason: "Path contains null bytes".into(),
+        })?;
+
+        let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
+        let result = unsafe {
+            ffi::nfs_opendir_names_only_at_cookie(
+                self.context,
+                path_cstr.as_ptr(),
+                cookie,
+                cookieverf,
+                max_entries,
+                &mut dir_handle,
+            )
+        };
+
+        if result != 0 {
+            return Err(self.translate_error(path, result));
+        }
+
+        Ok(NfsDirHandle {
+            context: self.context,
+            handle: dir_handle,
+            path: path.to_string(),
+        })
     }
 
     /// Stat a single path
@@ -263,6 +481,7 @@ impl NfsConnection {
             entry_type,
             stat,
             inode: d.inode,
+            cookie: d.cookie,
         }
     }
 
@@ -313,6 +532,134 @@ impl Drop for NfsConnection {
                 ffi::nfs_destroy_context(self.context);
             }
             self.context = ptr::null_mut();
+        }
+    }
+}
+
+/// Handle to an open NFS directory for sequential or parallel reading
+///
+/// Provides access to telldir/seekdir for cookie-based positioning.
+/// The directory is automatically closed when the handle is dropped.
+pub struct NfsDirHandle {
+    context: *mut ffi::nfs_context,
+    handle: *mut ffi::nfsdir,
+    path: String,
+}
+
+// NfsDirHandle must be used with the same NfsConnection that created it
+// It's Send because NfsConnection is Send
+unsafe impl Send for NfsDirHandle {}
+
+impl NfsDirHandle {
+    /// Get the current position (cookie) in the directory
+    ///
+    /// This can be saved and later used with seekdir() to resume reading
+    /// from this position, potentially from a different connection.
+    pub fn telldir(&self) -> i64 {
+        unsafe { ffi::nfs_telldir(self.context, self.handle) as i64 }
+    }
+
+    /// Seek to a previously saved position (cookie)
+    ///
+    /// After seeking, the next readdir() call will return entries
+    /// starting from that position.
+    pub fn seekdir(&self, cookie: i64) {
+        unsafe { ffi::nfs_seekdir(self.context, self.handle, cookie as std::ffi::c_long) }
+    }
+
+    /// Rewind to the beginning of the directory
+    pub fn rewinddir(&self) {
+        unsafe { ffi::nfs_rewinddir(self.context, self.handle) }
+    }
+
+    /// Read the next directory entry
+    ///
+    /// Returns None when there are no more entries.
+    pub fn readdir(&self) -> Option<NfsDirEntry> {
+        let dirent = unsafe { ffi::nfs_readdir(self.context, self.handle) };
+
+        if dirent.is_null() {
+            return None;
+        }
+
+        // Safety: dirent is valid until next readdir call or closedir
+        Some(unsafe { Self::convert_dirent(dirent) })
+    }
+
+    /// Read up to `count` entries, returning them with the final cookie position
+    ///
+    /// Returns (entries, final_cookie) where final_cookie is the position
+    /// after the last entry read.
+    pub fn read_batch(&self, count: usize) -> (Vec<NfsDirEntry>, i64) {
+        let mut entries = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            match self.readdir() {
+                Some(entry) => entries.push(entry),
+                None => break,
+            }
+        }
+
+        let cookie = self.telldir();
+        (entries, cookie)
+    }
+
+    /// Get the directory path
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Get the cookie verifier from the last READDIR response
+    ///
+    /// This is required for streaming with `opendir_names_only_at_cookie()`.
+    /// Pass this verifier along with the last entry's cookie to resume reading.
+    pub fn get_cookieverf(&self) -> u64 {
+        unsafe { ffi::nfs_readdir_get_cookieverf(self.handle) }
+    }
+
+    /// Convert a libnfs dirent to our NfsDirEntry (same as NfsConnection::convert_dirent)
+    unsafe fn convert_dirent(dirent: *mut ffi::nfsdirent) -> NfsDirEntry {
+        let d = &*dirent;
+
+        let name = if d.name.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(d.name).to_string_lossy().into_owned()
+        };
+
+        let entry_type = EntryType::from_mode(d.mode);
+
+        let stat = Some(NfsStat {
+            size: d.size,
+            inode: d.inode,
+            nlink: d.nlink as u64,
+            uid: d.uid,
+            gid: d.gid,
+            mode: d.mode,
+            atime: Some(d.atime.tv_sec as i64),
+            mtime: Some(d.mtime.tv_sec as i64),
+            ctime: Some(d.ctime.tv_sec as i64),
+            blksize: d.blksize,
+            blocks: d.blocks,
+        });
+
+        NfsDirEntry {
+            name,
+            entry_type,
+            stat,
+            inode: d.inode,
+            cookie: d.cookie,
+        }
+    }
+}
+
+impl Drop for NfsDirHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                ffi::nfs_closedir(self.context, self.handle);
+            }
+            self.handle = ptr::null_mut();
         }
     }
 }
