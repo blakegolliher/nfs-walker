@@ -116,7 +116,7 @@ impl WalkCoordinator {
         let start_datetime: DateTime<Utc> = Utc::now();
         self.start_time = Some(start_time);
 
-        info!(
+        debug!(
             url = %self.config.nfs_url.to_display_string(),
             workers = self.config.worker_count,
             "Starting filesystem walk"
@@ -162,7 +162,7 @@ impl WalkCoordinator {
         // Record walk end
         let duration = start_time.elapsed();
 
-        info!(
+        debug!(
             dirs = dirs,
             files = files,
             bytes = bytes,
@@ -202,7 +202,7 @@ impl WalkCoordinator {
             self.workers.push(worker);
         }
 
-        info!(count = self.workers.len(), "Workers spawned");
+        debug!(count = self.workers.len(), "Workers spawned");
         Ok(())
     }
 

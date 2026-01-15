@@ -157,7 +157,7 @@ fn worker_loop(
     shutdown: Arc<AtomicBool>,
     stats: Arc<WorkerStats>,
 ) -> Result<(), WorkerError> {
-    info!(worker = id, "Worker starting");
+    debug!(worker = id, "Worker starting");
 
     // Create NFS connection for this worker
     let mut nfs = match NfsConnectionBuilder::new(config.nfs_url.clone())
@@ -175,7 +175,7 @@ fn worker_loop(
         }
     };
 
-    info!(
+    debug!(
         worker = id,
         server = nfs.server(),
         export = nfs.export(),
@@ -234,7 +234,7 @@ fn worker_loop(
         }
     }
 
-    info!(
+    debug!(
         worker = id,
         dirs = stats.dirs_processed.load(Ordering::Relaxed),
         files = stats.files_found.load(Ordering::Relaxed),
@@ -287,7 +287,7 @@ fn process_directory(
 
     // Phase 1: Probe with READDIRPLUS to analyze directory composition
     // Use regular opendir() which is known to work reliably
-    info!(worker = worker_id, path = %task.path, "Starting directory probe");
+    debug!(worker = worker_id, path = %task.path, "Starting directory probe");
     let probe_handle = match nfs.opendir(&task.path) {
         Ok(h) => h,
         Err(e) => {
@@ -327,7 +327,7 @@ fn process_directory(
     let probe_size = probe_entries.len();
     let probe_full = probe_size >= SKINNY_PROBE_SIZE;
 
-    info!(
+    debug!(
         worker = worker_id,
         path = %task.path,
         probe_size = probe_size,
@@ -345,7 +345,7 @@ fn process_directory(
     let use_skinny = probe_full && dir_ratio <= SKINNY_MAX_DIR_RATIO;
 
     if use_skinny {
-        info!(
+        debug!(
             worker = worker_id,
             path = %task.path,
             probe_size = probe_size,
@@ -457,7 +457,7 @@ fn process_directory(
 
     // Log large directories
     if entry_count > LARGE_DIR_THRESHOLD {
-        info!(
+        debug!(
             worker = worker_id,
             path = %task.path,
             entries = entry_count,
@@ -531,7 +531,7 @@ fn continue_with_skinny_full(
     let mut first_batch_inodes: HashSet<u64> = HashSet::new();
     let mut is_first_batch = true;
 
-    info!(
+    debug!(
         worker = worker_id,
         path = %task.path,
         "Starting skinny full scan"
@@ -541,7 +541,7 @@ fn continue_with_skinny_full(
     const MAX_BATCHES: u32 = 100;
 
     loop {
-        info!(
+        trace!(
             worker = worker_id,
             batch = batch_num,
             cookie = cookie,
@@ -567,7 +567,7 @@ fn continue_with_skinny_full(
 
             // Check for wrap-around by seeing if we encounter an inode from first batch
             if !is_first_batch && first_batch_inodes.contains(&entry.inode) {
-                warn!(
+                debug!(
                     worker = worker_id,
                     batch = batch_num,
                     inode = entry.inode,
@@ -624,7 +624,7 @@ fn continue_with_skinny_full(
         let new_verifier = dir_handle.get_cookieverf();
 
         // Log batch progress
-        info!(
+        trace!(
             worker = worker_id,
             batch = batch_num,
             entries = batch_count,
@@ -638,7 +638,7 @@ fn continue_with_skinny_full(
 
         // Exit if wrap-around detected
         if wrap_detected {
-            info!(
+            debug!(
                 worker = worker_id,
                 total = *entry_count,
                 "Exiting skinny scan due to wrap-around"
@@ -648,7 +648,7 @@ fn continue_with_skinny_full(
 
         // EOF when we get an empty batch
         if batch_count == 0 {
-            info!(
+            debug!(
                 worker = worker_id,
                 total = *entry_count,
                 "Skinny scan complete - EOF reached"
@@ -658,12 +658,12 @@ fn continue_with_skinny_full(
 
         // Safety limit to prevent infinite loops
         if batch_num >= MAX_BATCHES {
-            warn!(
+            debug!(
                 worker = worker_id,
                 path = %task.path,
                 batches = batch_num,
                 entries = *entry_count,
-                "Hit safety limit on skinny batches - stopping"
+                "Hit safety limit on skinny batches"
             );
             break;
         }
@@ -849,7 +849,7 @@ fn process_directory_simple(
 
     // Log large directories for visibility
     if entries.len() > LARGE_DIR_THRESHOLD {
-        info!(
+        debug!(
             worker = worker_id,
             path = %task.path,
             entries = entries.len(),
