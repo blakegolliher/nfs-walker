@@ -11,7 +11,7 @@ use crate::config::WalkConfig;
 use crate::db::BatchedWriter;
 use crate::error::{Result, WalkerError, WorkerError};
 use crate::nfs::types::DbEntry;
-use crate::walker::queue::WorkQueue;
+use crate::walker::queue::{EntryQueue, WorkQueue};
 use crate::walker::worker::{aggregate_stats, Worker};
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,8 +53,11 @@ pub struct WalkCoordinator {
     /// Configuration
     config: Arc<WalkConfig>,
 
-    /// Work queue
+    /// Work queue for directory tasks
     queue: WorkQueue,
+
+    /// Entry queue for distributing file entries from large directories
+    entry_queue: EntryQueue,
 
     /// Database writer
     writer: BatchedWriter,
@@ -74,8 +77,12 @@ impl WalkCoordinator {
     pub fn new(config: WalkConfig) -> Result<Self> {
         let config = Arc::new(config);
 
-        // Create work queue
+        // Create work queue for directory tasks
         let queue = WorkQueue::new(config.queue_size);
+
+        // Create entry queue for distributing entries from large directories
+        // Size it large enough to buffer entries while workers process them
+        let entry_queue = EntryQueue::new(config.batch_size * 4);
 
         // Create database writer
         let writer = BatchedWriter::new(
@@ -90,6 +97,7 @@ impl WalkCoordinator {
         Ok(Self {
             config,
             queue,
+            entry_queue,
             writer,
             workers: Vec::new(),
             shutdown,
@@ -185,6 +193,8 @@ impl WalkCoordinator {
                 Arc::clone(&self.config),
                 self.queue.receiver(),
                 self.queue.sender(),
+                self.entry_queue.sender(),
+                self.entry_queue.receiver(),
                 writer_handle.clone(),
                 Arc::clone(&self.shutdown),
             )?;
@@ -209,8 +219,11 @@ impl WalkCoordinator {
                 return false;
             }
 
-            // Check if queue is complete
-            if self.queue.is_complete() {
+            // Check if both queues are complete (no pending work)
+            let dir_queue_complete = self.queue.is_complete();
+            let entry_queue_empty = self.entry_queue.is_empty();
+
+            if dir_queue_complete && entry_queue_empty {
                 stable_count += 1;
                 if stable_count >= stable_checks_required {
                     return true;

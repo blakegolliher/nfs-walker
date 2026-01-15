@@ -3,7 +3,11 @@
 //! This module provides a bounded work queue for directory tasks.
 //! When the queue is full, backpressure is applied by processing
 //! subdirectories inline rather than blocking.
+//!
+//! Also provides an entry queue for distributing file entries from
+//! large directories across all workers.
 
+use crate::nfs::types::DbEntry;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -285,6 +289,172 @@ impl<'a> WorkGuard<'a> {
 impl<'a> Drop for WorkGuard<'a> {
     fn drop(&mut self) {
         self.receiver.end_work();
+    }
+}
+
+/// Threshold for distributing entries across workers
+/// Directories with more entries than this will use the shared entry queue
+pub const LARGE_DIR_THRESHOLD: usize = 10_000;
+
+/// Queue for distributing file entries from large directories
+///
+/// When a directory has many entries, they are pushed to this queue
+/// so that all workers can help send them to the database writer.
+pub struct EntryQueue {
+    /// Sender for adding entries
+    sender: Sender<DbEntry>,
+
+    /// Receiver for getting entries
+    receiver: Receiver<DbEntry>,
+
+    /// Statistics
+    stats: Arc<EntryQueueStats>,
+}
+
+/// Statistics for the entry queue
+#[derive(Debug, Default)]
+pub struct EntryQueueStats {
+    /// Total entries pushed
+    pub entries_pushed: AtomicU64,
+
+    /// Total entries processed
+    pub entries_processed: AtomicU64,
+}
+
+impl EntryQueue {
+    /// Create a new entry queue with the specified capacity
+    pub fn new(capacity: usize) -> Self {
+        let (sender, receiver) = bounded(capacity);
+
+        Self {
+            sender,
+            receiver,
+            stats: Arc::new(EntryQueueStats::default()),
+        }
+    }
+
+    /// Get a sender handle
+    pub fn sender(&self) -> EntryQueueSender {
+        EntryQueueSender {
+            sender: self.sender.clone(),
+            stats: Arc::clone(&self.stats),
+        }
+    }
+
+    /// Get a receiver handle
+    pub fn receiver(&self) -> EntryQueueReceiver {
+        EntryQueueReceiver {
+            receiver: self.receiver.clone(),
+            stats: Arc::clone(&self.stats),
+        }
+    }
+
+    /// Get statistics
+    pub fn stats(&self) -> Arc<EntryQueueStats> {
+        Arc::clone(&self.stats)
+    }
+
+    /// Check if the queue is empty
+    pub fn is_empty(&self) -> bool {
+        self.receiver.is_empty()
+    }
+
+    /// Get current queue length
+    pub fn len(&self) -> usize {
+        self.receiver.len()
+    }
+}
+
+/// Handle for sending entries to the queue
+#[derive(Clone)]
+pub struct EntryQueueSender {
+    sender: Sender<DbEntry>,
+    stats: Arc<EntryQueueStats>,
+}
+
+impl EntryQueueSender {
+    /// Try to send an entry without blocking
+    pub fn try_send(&self, entry: DbEntry) -> Result<bool, ()> {
+        match self.sender.try_send(entry) {
+            Ok(()) => {
+                self.stats.entries_pushed.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Disconnected(_)) => Err(()),
+        }
+    }
+
+    /// Send an entry, blocking if necessary
+    pub fn send(&self, entry: DbEntry) -> Result<(), ()> {
+        self.sender.send(entry).map_err(|_| ())?;
+        self.stats.entries_pushed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Push multiple entries (blocks until all are sent)
+    pub fn send_batch(&self, entries: Vec<DbEntry>) -> Result<usize, ()> {
+        let mut count = 0;
+        for entry in entries {
+            self.sender.send(entry).map_err(|_| ())?;
+            count += 1;
+        }
+        self.stats.entries_pushed.fetch_add(count, Ordering::Relaxed);
+        Ok(count as usize)
+    }
+}
+
+/// Handle for receiving entries from the queue
+#[derive(Clone)]
+pub struct EntryQueueReceiver {
+    receiver: Receiver<DbEntry>,
+    stats: Arc<EntryQueueStats>,
+}
+
+impl EntryQueueReceiver {
+    /// Try to receive an entry without blocking
+    pub fn try_recv(&self) -> Option<DbEntry> {
+        match self.receiver.try_recv() {
+            Ok(entry) => {
+                self.stats.entries_processed.fetch_add(1, Ordering::Relaxed);
+                Some(entry)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Receive with timeout
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<DbEntry> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(entry) => {
+                self.stats.entries_processed.fetch_add(1, Ordering::Relaxed);
+                Some(entry)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Drain up to `max` entries from the queue
+    pub fn drain(&self, max: usize) -> Vec<DbEntry> {
+        let mut entries = Vec::with_capacity(max.min(100));
+        for _ in 0..max {
+            match self.receiver.try_recv() {
+                Ok(entry) => entries.push(entry),
+                Err(_) => break,
+            }
+        }
+        self.stats.entries_processed.fetch_add(entries.len() as u64, Ordering::Relaxed);
+        entries
+    }
+
+    /// Check if the queue is empty
+    pub fn is_empty(&self) -> bool {
+        self.receiver.is_empty()
+    }
+
+    /// Get current queue length
+    pub fn len(&self) -> usize {
+        self.receiver.len()
     }
 }
 
