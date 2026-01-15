@@ -54,7 +54,7 @@ libc = "0.2"
 [build-dependencies]
 # For generating libnfs bindings
 bindgen = "0.69"
-pkg-config = "0.3"
+cmake = "0.1"
 cc = "1"
 
 [dev-dependencies]
