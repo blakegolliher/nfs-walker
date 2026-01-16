@@ -79,6 +79,8 @@ impl NfsConnection {
         let timeout_ms = timeout.as_millis() as i32;
         unsafe {
             ffi::nfs_set_timeout(self.context, timeout_ms);
+            // Force NFSv3 to avoid buggy NFSv4 path
+            ffi::nfs_set_version(self.context, 3);
         }
 
         // Note: Disabled buffer size override - caused hangs with some servers
