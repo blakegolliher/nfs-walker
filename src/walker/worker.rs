@@ -261,8 +261,9 @@ fn process_directory(
     writer: &WriterHandle,
     stats: &WorkerStats,
 ) -> WalkOutcome {
-    // Use simple READDIRPLUS-only path if skinny mode is disabled
-    if config.disable_skinny {
+    // Use simple READDIRPLUS-only path unless skinny mode is explicitly enabled
+    // Skinny mode is opt-in because READDIRPLUS is faster for typical directory trees
+    if !config.enable_skinny {
         return process_directory_simple(worker_id, task, config, nfs, queue_tx, entry_tx, writer, stats);
     }
     // Check depth limit

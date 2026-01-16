@@ -114,9 +114,12 @@ pub struct CliArgs {
     #[arg(long, default_value = "sqlite", value_name = "FORMAT")]
     pub format: OutputFormat,
 
-    /// Disable skinny read optimization (use READDIRPLUS for all directories)
-    #[arg(long)]
-    pub no_skinny: bool,
+    /// [EXPERIMENTAL] Enable skinny read optimization for huge flat directories
+    ///
+    /// WARNING: This mode is experimental and may not enumerate all files correctly.
+    /// Use only for testing. The default READDIRPLUS mode is recommended.
+    #[arg(long, hide = true)]
+    pub skinny: bool,
 }
 
 /// Output format for scan results
@@ -333,8 +336,8 @@ pub struct WalkConfig {
     /// Output format
     pub output_format: OutputFormat,
 
-    /// Disable skinny read optimization
-    pub disable_skinny: bool,
+    /// Enable skinny read optimization (opt-in for huge flat directories)
+    pub enable_skinny: bool,
 }
 
 impl WalkConfig {
@@ -410,7 +413,7 @@ impl WalkConfig {
             use_async: args.r#async,
             connection_count: args.connections,
             output_format: args.format,
-            disable_skinny: args.no_skinny,
+            enable_skinny: args.skinny,
         })
     }
 
@@ -487,7 +490,7 @@ mod tests {
             use_async: false,
             connection_count: 16,
             output_format: OutputFormat::Sqlite,
-            disable_skinny: false,
+            enable_skinny: false,
         };
 
         assert!(config.is_excluded("/data/.snapshot/hourly.0"));

@@ -16,7 +16,7 @@ High-performance NFS filesystem scanner with SQLite and Parquet output. Designed
 
 - Linux (Ubuntu 22.04+ recommended)
 - Rust 1.82+ (for building)
-- libnfs-dev
+- CMake 3.10+ (for building vendored libnfs)
 
 ## Installation
 
@@ -24,11 +24,13 @@ High-performance NFS filesystem scanner with SQLite and Parquet output. Designed
 
 ```bash
 # Ubuntu/Debian
-sudo apt install build-essential pkg-config libsqlite3-dev libnfs-dev libclang-dev
+sudo apt install build-essential pkg-config libsqlite3-dev libclang-dev cmake
 
 # Or use the Makefile
 make install-deps
 ```
+
+> **Note**: libnfs is vendored in this project with custom optimizations. You don't need to install it separately.
 
 ### Build
 
@@ -44,17 +46,20 @@ The binary will be at `./build/nfs-walker`.
 # Basic scan with SQLite output
 nfs-walker nfs://server/export -o scan.db
 
-# High parallelism with progress display
-nfs-walker nfs://192.168.1.100/data --connections 64 -p -o scan.db
+# High parallelism with progress display (recommended)
+nfs-walker nfs://server/export -w 64 -p -o scan.db
 
-# Parquet output (recommended for large scans)
-nfs-walker nfs://server/export --format parquet -o scan.parquet
+# Parquet output (8x smaller files)
+nfs-walker nfs://server/export --format parquet -w 64 -o scan.parquet
 
 # Directories only (smaller output)
 nfs-walker server:/export --dirs-only -o dirs.db
 
 # With exclusions
 nfs-walker nfs://server/data --exclude ".snapshot" --exclude ".zfs" -o scan.db
+
+# Scan a subdirectory within an export
+nfs-walker nfs://server/export/subdir -w 64 -p -o scan.db
 ```
 
 ### Options
@@ -65,21 +70,32 @@ Arguments:
 
 Options:
   -o, --output <FILE>       Output file [default: walk.db]
-  -w, --workers <NUM>       Number of concurrent tasks [default: num_cpus * 2]
+  -w, --workers <NUM>       Number of worker threads [default: num_cpus * 2]
   -q, --queue-size <NUM>    Work queue size [default: 10000]
-  -b, --batch-size <NUM>    Batch size for writes [default: 10000]
+  -b, --batch-size <NUM>    Batch size for DB writes [default: 10000]
   -d, --max-depth <NUM>     Maximum directory depth
   -p, --progress            Show progress during walk
-  -v, --verbose             Verbose output
+  -v, --verbose             Verbose output (show errors and warnings)
   --dirs-only               Only record directories
   --no-atime                Skip atime attribute
   --exclude <PATTERN>       Exclude paths matching regex (repeatable)
   --timeout <SECS>          NFS connection timeout [default: 30]
   --retries <NUM>           Retry attempts for transient errors [default: 3]
-  --connections <NUM>       Number of NFS connections [default: 16]
   --format <FORMAT>         Output format: sqlite, parquet [default: sqlite]
   -h, --help                Print help
   -V, --version             Print version
+```
+
+### Recommended Settings
+
+For best performance:
+
+```bash
+# High parallelism (recommended for most cases)
+nfs-walker nfs://server/export -w 64 -p -o scan.db
+
+# Very large filesystems (10M+ files)
+nfs-walker nfs://server/export -w 64 -b 50000 -p -o scan.db
 ```
 
 ## Output Formats
@@ -104,37 +120,34 @@ nfs-walker nfs://server/export --format parquet -o scan.parquet
 
 ## Performance
 
-### Benchmark: nfs-walker vs Traditional Tools
+### Benchmark Results
 
-Scanning 2.1 million files over NFS:
+| Dataset | Files | Time | Throughput |
+|---------|-------|------|------------|
+| Tree structure (syncengine-demo) | 2.1M | 41.7s | **50,659 files/sec** |
+| Flat directory (flat_10m) | 10M | 297s | **33,624 files/sec** |
+| Small tree (syncengine-demo/home) | 231K | 4.8s | **48,455 files/sec** |
 
-| Tool                  | Time     | Speedup |
-|-----------------------|----------|---------|
-| `find` (count only)   | 12m 13s  | 1x      |
-| `find` (with stat)    | 11m 43s  | 1x      |
-| `du -s`               | 11m 46s  | 1x      |
-| `ls -lR`              | 9m 24s   | 1.3x    |
-| `rsync --list-only`   | 1m 54s   | 6.4x    |
-| `tree`                | 1m 26s   | 8.5x    |
-| **nfs-walker**        | **33s**  | **22x** |
+### Comparison with Python os.scandir
+
+A multi-threaded Python crawler using `os.scandir` on mounted NFS achieves ~25,000-37,000 files/sec with 192 threads. nfs-walker achieves **50,000+ files/sec** with 64 workers - approximately **2x faster**.
 
 ### Why is nfs-walker faster?
 
 Traditional tools use the kernel NFS client, which serializes requests and has significant per-operation overhead. nfs-walker uses:
 
-1. **Direct NFS protocol** - Bypasses the kernel, communicates directly with the NFS server
-2. **READDIRPLUS** - Single NFS operation returns directory listing + file attributes (no separate stat calls)
-3. **Connection pooling** - Multiple parallel NFS connections (default: 16)
-4. **Async I/O** - Tokio-based async runtime maximizes throughput
+1. **Direct NFS protocol** - Bypasses the kernel, communicates directly with the NFS server using libnfs
+2. **NFSv3 READDIRPLUS** - Single NFS operation returns directory listing + file attributes (no separate stat calls)
+3. **Parallel workers** - Multiple worker threads with separate NFS connections
+4. **Efficient batching** - Batched SQLite/Parquet writes minimize I/O overhead
 
 ### Output Format Comparison
 
-| Format  | Throughput       | Output Size |
-|---------|------------------|-------------|
-| SQLite  | 65K files/sec    | 646 MB      |
-| Parquet | 65K files/sec    | 78 MB       |
+| Format  | Compression | Typical Size (2.1M files) |
+|---------|-------------|---------------------------|
+| SQLite  | None        | ~645 MB                   |
+| Parquet | ZSTD        | ~78 MB (8x smaller)       |
 
-- **Parquet is 8x smaller** with ZSTD compression
 - **Memory usage**: <200MB regardless of filesystem size
 
 ## Query Examples
@@ -390,12 +403,12 @@ depth: uint32 (not null)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        NFS Server                               │
+│                     NFS Server (NFSv3)                          │
 └─────────────────────────────┬───────────────────────────────────┘
                               │ READDIRPLUS
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Connection Pool                              │
+│                     Worker Threads                              │
 │  ┌─────────┐  ┌─────────┐  ┌─────────┐         ┌─────────┐     │
 │  │  Conn 1 │  │  Conn 2 │  │  Conn 3 │  ...    │  Conn N │     │
 │  │ libnfs  │  │ libnfs  │  │ libnfs  │         │ libnfs  │     │
