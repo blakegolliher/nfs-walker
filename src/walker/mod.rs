@@ -45,5 +45,5 @@ pub mod worker;
 
 pub use async_coordinator::{AsyncWalkCoordinator, AsyncWalkResult, AsyncWalkStats};
 pub use coordinator::{WalkCoordinator, WalkProgress, WalkResult};
-pub use queue::{DirTask, QueueStats, WorkQueue};
+pub use queue::{DirTask, EntryQueue, QueueStats, WorkQueue, LARGE_DIR_THRESHOLD};
 pub use worker::{Worker, WorkerStats};

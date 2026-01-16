@@ -185,6 +185,9 @@ pub struct NfsDirEntry {
 
     /// Inode number (always available)
     pub inode: u64,
+
+    /// NFS directory cookie (position marker for parallel reads)
+    pub cookie: u64,
 }
 
 impl NfsDirEntry {
@@ -443,6 +446,7 @@ mod tests {
                 ..Default::default()
             }),
             inode: 1,
+            cookie: 0,
         };
 
         let dir_entry = NfsDirEntry {
@@ -450,6 +454,7 @@ mod tests {
             entry_type: EntryType::Directory,
             stat: None,
             inode: 2,
+            cookie: 0,
         };
 
         stats.add_entry(&file_entry);
@@ -468,6 +473,7 @@ mod tests {
             entry_type: EntryType::File,
             stat: None,
             inode: 123,
+            cookie: 0,
         };
 
         let db_entry = DbEntry::from_nfs_entry(&nfs_entry, "/data/subdir", 2);
@@ -491,6 +497,7 @@ mod tests {
             entry_type: EntryType::Directory,
             stat: None,
             inode: 1,
+            cookie: 0,
         };
         let child = DbEntry::from_nfs_entry(&nfs_entry, "/data", 2);
         assert_eq!(child.path, "/data/subdir");

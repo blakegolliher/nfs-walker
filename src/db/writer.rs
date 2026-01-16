@@ -373,10 +373,15 @@ fn flush_entries(
 
             last_id = tx.last_insert_rowid();
 
-            // Track all entry IDs for parent lookups and dir_stats
-            // Directories need to be tracked for child lookups
-            // All entries need to be tracked for dir_stats updates
-            path_to_id.insert(entry.path.clone(), last_id);
+            // Only track directory paths in path_to_id
+            // We need directory IDs for:
+            // 1. parent_id resolution (files need their parent directory's ID)
+            // 2. dir_stats updates (need directory entry_id)
+            // Files don't need to be tracked since nothing references them by path
+            // This keeps memory usage bounded - typically far fewer directories than files
+            if entry.entry_type.is_dir() {
+                path_to_id.insert(entry.path.clone(), last_id);
+            }
 
             stats.entries_written.fetch_add(1, Ordering::Relaxed);
         }
@@ -385,13 +390,8 @@ fn flush_entries(
     tx.commit()?;
     stats.batches_committed.fetch_add(1, Ordering::Relaxed);
 
-    // Keep path_to_id from growing unbounded
-    // We need this map for parent_id resolution and dir_stats lookups
-    // Memory: ~100 bytes per entry, so 2M entries = ~200MB
-    // Only clear if extremely large to prevent OOM
-    if path_to_id.len() > 5_000_000 {
-        path_to_id.clear();
-    }
+    // Note: We no longer clear path_to_id since it only contains directories
+    // Even with millions of files, directory count is typically much smaller
 
     Ok(last_id)
 }
@@ -415,9 +415,19 @@ fn flush_dir_stats(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
         )?;
 
+        // Prepare fallback lookup statement for paths not in the map
+        let mut lookup_stmt = tx.prepare_cached(
+            "SELECT id FROM entries WHERE path = ? AND entry_type = 1"
+        )?;
+
         for (path, ds) in buffer.drain(..) {
-            // Look up entry_id from path
-            if let Some(&entry_id) = path_to_id.get(&path) {
+            // Look up entry_id from path - try in-memory map first
+            let entry_id = path_to_id.get(&path).copied().or_else(|| {
+                // Fallback to database lookup if not in map
+                lookup_stmt.query_row(params![&path], |row| row.get(0)).ok()
+            });
+
+            if let Some(entry_id) = entry_id {
                 stmt.execute(params![
                     entry_id,
                     ds.file_count as i64,
@@ -429,7 +439,8 @@ fn flush_dir_stats(
 
                 stats.dir_stats_written.fetch_add(1, Ordering::Relaxed);
             }
-            // If path not found in map (e.g., after clearing), skip this dir_stats entry
+            // If path not found anywhere, skip this dir_stats entry
+            // This shouldn't happen normally - directory should always exist
         }
     }
 

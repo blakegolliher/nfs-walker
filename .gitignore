@@ -44,3 +44,7 @@ prompt.md
 *.db-shm
 *.db-wal
 *.db-journal
+docs/
+
+# Vendored dependencies (built from source)
+vendor/libnfs/

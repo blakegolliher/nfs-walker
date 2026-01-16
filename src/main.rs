@@ -94,6 +94,11 @@ fn run_sync(config: WalkConfig) -> Result<()> {
         }
     }
 
+    // Get database file size
+    let db_size = std::fs::metadata(&config.output_path)
+        .map(|m| m.len())
+        .ok();
+
     // Print summary
     print_summary(
         result.total_dirs,
@@ -102,6 +107,7 @@ fn run_sync(config: WalkConfig) -> Result<()> {
         result.errors,
         result.duration,
         &config.output_path.display().to_string(),
+        db_size,
     );
 
     // Report success/failure
@@ -166,6 +172,11 @@ async fn run_async_inner(config: WalkConfig) -> Result<()> {
         }
     }
 
+    // Get database file size
+    let db_size = std::fs::metadata(&config.output_path)
+        .map(|m| m.len())
+        .ok();
+
     // Print summary
     print_summary(
         result.total_dirs,
@@ -174,6 +185,7 @@ async fn run_async_inner(config: WalkConfig) -> Result<()> {
         result.errors,
         result.duration,
         &config.output_path.display().to_string(),
+        db_size,
     );
 
     // Report success/failure

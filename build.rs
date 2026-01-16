@@ -1,38 +1,60 @@
 //! Build script for nfs-walker
 //!
-//! Generates Rust bindings for libnfs using bindgen.
-//! Requires libnfs-dev to be installed on the system.
+//! Builds libnfs from the vendored submodule and generates Rust bindings.
+//!
+//! The vendored libnfs is in vendor/libnfs and includes VAST's optimizations
+//! for high-performance directory scanning.
 
 use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    // Rerun if wrapper header changes
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let libnfs_dir = manifest_dir.join("vendor").join("libnfs");
+
+    // Check if vendored libnfs exists
+    if !libnfs_dir.exists() {
+        eprintln!("Error: Vendored libnfs not found at {}", libnfs_dir.display());
+        eprintln!();
+        eprintln!("Please initialize the submodule:");
+        eprintln!("  git submodule update --init");
+        eprintln!();
+        eprintln!("Or clone it manually:");
+        eprintln!("  git clone https://gitlab.vastdata.com/storage/vast-libnfs.git vendor/libnfs");
+        std::process::exit(1);
+    }
+
+    // Rerun if libnfs sources change
+    println!("cargo:rerun-if-changed=vendor/libnfs/lib");
+    println!("cargo:rerun-if-changed=vendor/libnfs/include");
     println!("cargo:rerun-if-changed=src/nfs/wrapper.h");
 
-    // Find libnfs using pkg-config
-    let nfs_lib = match pkg_config::Config::new()
-        .atleast_version("4.0.0")
-        .probe("libnfs")
-    {
-        Ok(lib) => lib,
-        Err(e) => {
-            // Provide helpful error message
-            eprintln!("Error: Could not find libnfs via pkg-config: {}", e);
-            eprintln!();
-            eprintln!("To install libnfs on Ubuntu/Debian:");
-            eprintln!("  sudo apt install libnfs-dev");
-            eprintln!();
-            eprintln!("Or build from source:");
-            eprintln!("  git clone https://github.com/sahlberg/libnfs.git");
-            eprintln!("  cd libnfs && ./bootstrap && ./configure && make && sudo make install");
-            std::process::exit(1);
-        }
-    };
+    // Build libnfs using cmake
+    let dst = cmake::Config::new(&libnfs_dir)
+        .define("BUILD_SHARED_LIBS", "OFF")   // Static library
+        .define("ENABLE_TESTS", "OFF")        // Skip tests
+        .define("ENABLE_DOCUMENTATION", "OFF") // Skip docs
+        .define("ENABLE_EXAMPLES", "OFF")     // Skip examples
+        .build();
 
-    // Collect include paths for bindgen
-    let mut builder = bindgen::Builder::default()
+    let lib_dir = dst.join("lib");
+    let lib64_dir = dst.join("lib64");
+    let include_dir = dst.join("include");
+
+    // Link paths (cmake might put libs in lib/ or lib64/)
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-search=native={}", lib64_dir.display());
+
+    // Link libnfs statically
+    println!("cargo:rustc-link-lib=static=nfs");
+
+    // Generate bindings using bindgen
+    let bindings = bindgen::Builder::default()
         .header("src/nfs/wrapper.h")
+        // Point to vendored headers
+        .clang_arg(format!("-I{}", include_dir.display()))
+        .clang_arg(format!("-I{}", libnfs_dir.join("include").display()))
         // Only generate bindings for nfs functions
         .allowlist_function("nfs_.*")
         .allowlist_function("rpc_.*")
@@ -56,31 +78,12 @@ fn main() {
         // Layout tests can be noisy
         .layout_tests(false)
         // Make it cleaner
-        .generate_comments(true);
-
-    // Add include paths from pkg-config
-    for path in &nfs_lib.include_paths {
-        builder = builder.clang_arg(format!("-I{}", path.display()));
-    }
-
-    // Generate bindings
-    let bindings = builder
+        .generate_comments(true)
         .generate()
         .expect("Unable to generate libnfs bindings");
 
-    // Write to OUT_DIR
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    // Write bindings
     bindings
-        .write_to_file(out_path.join("nfs_bindings.rs"))
+        .write_to_file(out_dir.join("nfs_bindings.rs"))
         .expect("Couldn't write bindings!");
-
-    // Link libraries
-    for lib in &nfs_lib.libs {
-        println!("cargo:rustc-link-lib={}", lib);
-    }
-
-    // Link paths
-    for path in &nfs_lib.link_paths {
-        println!("cargo:rustc-link-search=native={}", path.display());
-    }
 }

@@ -109,6 +109,7 @@ pub fn print_summary(
     errors: u64,
     duration: Duration,
     db_path: &str,
+    db_size: Option<u64>,
 ) {
     let bytes_str = format_size(bytes, BINARY);
     let duration_secs = duration.as_secs_f64();
@@ -141,7 +142,13 @@ pub fn print_summary(
             format_number(errors)
         );
     }
-    println!("  {} {}", style("Database:").bold(), db_path);
+    // Show database path with size if available
+    if let Some(size) = db_size {
+        let db_size_str = format_size(size, BINARY);
+        println!("  {} {} ({})", style("Database:").bold(), db_path, db_size_str);
+    } else {
+        println!("  {} {}", style("Database:").bold(), db_path);
+    }
     println!();
 }
 

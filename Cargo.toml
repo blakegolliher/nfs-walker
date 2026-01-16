@@ -54,7 +54,7 @@ libc = "0.2"
 [build-dependencies]
 # For generating libnfs bindings
 bindgen = "0.69"
-pkg-config = "0.3"
+cmake = "0.1"
 cc = "1"
 
 [dev-dependencies]
@@ -64,6 +64,18 @@ criterion = "0.5"
 [[bench]]
 name = "walker_bench"
 harness = false
+
+[[bin]]
+name = "nfs-walker"
+path = "src/main.rs"
+
+[[bin]]
+name = "cookie-debug"
+path = "src/bin/cookie_debug.rs"
+
+[[bin]]
+name = "skinny-stream-test"
+path = "src/bin/skinny_stream_test.rs"
 
 [profile.release]
 lto = true
