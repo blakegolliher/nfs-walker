@@ -40,10 +40,13 @@
 
 pub mod async_coordinator;
 pub mod coordinator;
+pub mod fast_walker;
+pub mod parallel_stat;
 pub mod queue;
 pub mod worker;
 
 pub use async_coordinator::{AsyncWalkCoordinator, AsyncWalkResult, AsyncWalkStats};
 pub use coordinator::{WalkCoordinator, WalkProgress, WalkResult};
+pub use fast_walker::{FastWalker, FastWalkResult, HfcProgress};
 pub use queue::{DirTask, EntryQueue, QueueStats, WorkQueue, LARGE_DIR_THRESHOLD};
 pub use worker::{Worker, WorkerStats};

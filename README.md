@@ -6,6 +6,7 @@ High-performance NFS filesystem scanner with SQLite and Parquet output. Designed
 
 - **Direct NFS Protocol Access** - Uses libnfs for direct NFS protocol communication, bypassing the kernel NFS client
 - **Parallel Scanning** - Connection pooling with configurable concurrency for maximum throughput
+- **HFC Mode** - High File Count mode optimized for directories with millions of files (56k files/sec)
 - **Memory Efficient** - Bounded work queue with backpressure prevents memory explosion
 - **Multiple Output Formats**:
   - **SQLite** - Best for ad-hoc queries and interactive exploration
@@ -40,12 +41,16 @@ The binary will be at `./build/nfs-walker`.
 
 ## Usage
 
+### Standard Recursive Mode
+
+For scanning directory trees with mixed content:
+
 ```bash
 # Basic scan with SQLite output
 nfs-walker nfs://server/export -o scan.db
 
 # High parallelism with progress display
-nfs-walker nfs://192.168.1.100/data --connections 64 -p -o scan.db
+nfs-walker nfs://192.168.1.100/data -w 8 -p -o scan.db
 
 # Parquet output (recommended for large scans)
 nfs-walker nfs://server/export --format parquet -o scan.parquet
@@ -57,6 +62,28 @@ nfs-walker server:/export --dirs-only -o dirs.db
 nfs-walker nfs://server/data --exclude ".snapshot" --exclude ".zfs" -o scan.db
 ```
 
+### HFC Mode (High File Count)
+
+Optimized for flat directories with millions of files:
+
+```bash
+# Scan a directory with millions of files
+nfs-walker nfs://server/export/flat_dir --hfc -w 8 -p -o output.db
+
+# With verbose logging for debugging
+nfs-walker nfs://server/export/flat_dir --hfc -w 8 -p -v -o output.db
+```
+
+**When to use HFC mode:**
+- Single directory with >100K files
+- Flat structure (few or no subdirectories)
+- Files are the dominant content (not directories)
+
+**When to use Standard mode:**
+- Directory trees with many subdirectories
+- Mixed content (directories and files)
+- Need recursive traversal
+
 ### Options
 
 ```
@@ -65,18 +92,21 @@ Arguments:
 
 Options:
   -o, --output <FILE>       Output file [default: walk.db]
-  -w, --workers <NUM>       Number of concurrent tasks [default: num_cpus * 2]
+  -w, --workers <NUM>       Number of worker threads [default: num_cpus * 2]
   -q, --queue-size <NUM>    Work queue size [default: 10000]
   -b, --batch-size <NUM>    Batch size for writes [default: 10000]
   -d, --max-depth <NUM>     Maximum directory depth
   -p, --progress            Show progress during walk
   -v, --verbose             Verbose output
+  --hfc                     High file count mode for flat directories with millions of files
   --dirs-only               Only record directories
   --no-atime                Skip atime attribute
+  --no-skinny               Disable skinny read optimization
   --exclude <PATTERN>       Exclude paths matching regex (repeatable)
   --timeout <SECS>          NFS connection timeout [default: 30]
   --retries <NUM>           Retry attempts for transient errors [default: 3]
-  --connections <NUM>       Number of NFS connections [default: 16]
+  --async                   Use async mode with connection pooling
+  --connections <NUM>       Number of NFS connections (async mode) [default: 16]
   --format <FORMAT>         Output format: sqlite, parquet [default: sqlite]
   -h, --help                Print help
   -V, --version             Print version
@@ -118,14 +148,25 @@ Scanning 2.1 million files over NFS:
 | `tree`                | 1m 26s   | 8.5x    |
 | **nfs-walker**        | **33s**  | **22x** |
 
+### Performance by Mode
+
+| Mode | Files | Time | Rate | Use Case |
+|------|-------|------|------|----------|
+| Standard (recursive) | 2.1M + 7.2K dirs | 37.5s | 56K/s | Directory trees |
+| HFC (8 workers) | 10M | 177s | 56K/s | Flat directories |
+| HFC (16 workers) | 10M | 223s | 45K/s | Server saturated |
+
+**Key finding**: 8 workers typically outperforms 16 workers. Server-side saturation is the limit, not client.
+
 ### Why is nfs-walker faster?
 
 Traditional tools use the kernel NFS client, which serializes requests and has significant per-operation overhead. nfs-walker uses:
 
 1. **Direct NFS protocol** - Bypasses the kernel, communicates directly with the NFS server
 2. **READDIRPLUS** - Single NFS operation returns directory listing + file attributes (no separate stat calls)
-3. **Connection pooling** - Multiple parallel NFS connections (default: 16)
-4. **Async I/O** - Tokio-based async runtime maximizes throughput
+3. **Connection pooling** - Multiple parallel NFS connections
+4. **Async pipelining** - HFC mode pipelines 128 concurrent stat requests per connection
+5. **Work-stealing** - Dynamic load balancing ensures fast workers get more work
 
 ### Output Format Comparison
 
@@ -390,28 +431,37 @@ depth: uint32 (not null)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        NFS Server                               │
-└─────────────────────────────┬───────────────────────────────────┘
-                              │ READDIRPLUS
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Connection Pool                              │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐         ┌─────────┐     │
-│  │  Conn 1 │  │  Conn 2 │  │  Conn 3 │  ...    │  Conn N │     │
-│  │ libnfs  │  │ libnfs  │  │ libnfs  │         │ libnfs  │     │
-│  └────┬────┘  └────┬────┘  └────┬────┘         └────┬────┘     │
-│       └────────────┼────────────┼────────────────────┘          │
-│                    ▼            ▼                               │
-│            ┌──────────────────────────┐                         │
-│            │      Work Queue          │                         │
-│            │   (bounded, backpressure)│                         │
-│            └────────────┬─────────────┘                         │
-│                         ▼                                       │
-│            ┌──────────────────────────┐                         │
-│            │    Batched Writer        │                         │
-│            │  (SQLite or Parquet)     │                         │
-│            └──────────────────────────┘                         │
+│                            CLI                                   │
+│      --hfc → HFC Mode    (default) → Standard Recursive Mode    │
 └─────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+┌─────────────────────────┐     ┌─────────────────────────────┐
+│     HFC Mode            │     │    Standard Recursive Mode  │
+│   (FastWalker)          │     │  (WalkCoordinator)          │
+├─────────────────────────┤     ├─────────────────────────────┤
+│ Phase 1: collect_names()│     │ - Work queue of directories │
+│   - Single NFS conn     │     │ - Workers process dirs      │
+│   - opendir_names_only  │     │ - READDIRPLUS for entries   │
+│                         │     │ - Recursive discovery       │
+│ Phase 2: parallel_stat()│     │                             │
+│   - Work-stealing queue │     │                             │
+│   - 10K entry batches   │     │                             │
+│   - N worker threads    │     │                             │
+│   - 128 pipelined stats │     │                             │
+│     per connection      │     │                             │
+└─────────────────────────┘     └─────────────────────────────┘
+              │                               │
+              └───────────────┬───────────────┘
+                              ▼
+              ┌─────────────────────────────┐
+              │     Batched Writer          │
+              │  - Crossbeam channel        │
+              │  - Multi-row INSERTs (50)   │
+              │  - 10K batch transactions   │
+              │  - SQLite WAL mode          │
+              └─────────────────────────────┘
                               │
                               ▼
                     ┌──────────────────┐

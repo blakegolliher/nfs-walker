@@ -376,6 +376,44 @@ impl DbEntry {
         }
     }
 
+    /// Create a DbEntry from an NfsStat (used for parallel GETATTR)
+    pub fn from_stat(
+        full_path: &str,
+        name: &str,
+        stat: &NfsStat,
+        depth: u32,
+    ) -> Self {
+        // Compute parent path from full path
+        let parent = if depth == 0 || full_path == "/" {
+            None
+        } else if let Some(pos) = full_path.rfind('/') {
+            if pos == 0 {
+                Some("/".to_string())
+            } else {
+                Some(full_path[..pos].to_string())
+            }
+        } else {
+            Some("/".to_string())
+        };
+
+        Self {
+            parent_path: parent,
+            name: name.to_string(),
+            path: full_path.to_string(),
+            entry_type: stat.entry_type(),
+            size: stat.size,
+            mtime: stat.mtime,
+            atime: stat.atime,
+            ctime: stat.ctime,
+            mode: Some(stat.mode),
+            uid: Some(stat.uid),
+            gid: Some(stat.gid),
+            nlink: Some(stat.nlink),
+            inode: stat.inode,
+            depth,
+        }
+    }
+
     /// Create a root entry
     pub fn root(path: &str) -> Self {
         Self {

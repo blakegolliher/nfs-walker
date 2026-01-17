@@ -20,7 +20,7 @@ use std::time::Duration;
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
 #[allow(dead_code)]
-mod ffi {
+pub(crate) mod ffi {
     include!(concat!(env!("OUT_DIR"), "/nfs_bindings.rs"));
 }
 
@@ -329,6 +329,50 @@ impl NfsConnection {
         })
     }
 
+    /// Open a directory for reading names only (READDIR)
+    ///
+    /// This uses READDIR instead of READDIRPLUS, which is dramatically faster
+    /// for large directories because the server doesn't need to stat() each file.
+    /// libnfs handles cookie management internally - just iterate with readdir().
+    ///
+    /// Returned entries will have:
+    /// - name: populated
+    /// - inode: populated
+    /// - entry_type: Unknown (no attributes fetched)
+    /// - stat: minimal (only inode populated)
+    pub fn opendir_names_only(&self, path: &str) -> NfsResult<NfsDirHandle> {
+        if !self.mounted {
+            return Err(NfsError::ReadDirFailed {
+                path: path.into(),
+                reason: "Not mounted".into(),
+            });
+        }
+
+        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadDirFailed {
+            path: path.into(),
+            reason: "Path contains null bytes".into(),
+        })?;
+
+        let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
+        let result = unsafe {
+            ffi::nfs_opendir_names_only(
+                self.context,
+                path_cstr.as_ptr(),
+                &mut dir_handle,
+            )
+        };
+
+        if result != 0 {
+            return Err(self.translate_error(path, result));
+        }
+
+        Ok(NfsDirHandle {
+            context: self.context,
+            handle: dir_handle,
+            path: path.to_string(),
+        })
+    }
+
     /// Open a directory for reading names only, starting at a specific cookie position
     ///
     /// This uses READDIR instead of READDIRPLUS, which is dramatically faster
@@ -516,6 +560,16 @@ impl NfsConnection {
     pub fn is_connected(&self) -> bool {
         self.mounted
     }
+
+    /// Get raw NFS context pointer for async operations
+    ///
+    /// # Safety
+    /// The returned pointer is only valid while this NfsConnection exists.
+    /// The caller must not use this pointer after the connection is dropped.
+    /// The caller must not call any functions that would invalidate the context.
+    pub(crate) unsafe fn raw_context(&self) -> *mut ffi::nfs_context {
+        self.context
+    }
 }
 
 impl Drop for NfsConnection {
@@ -617,6 +671,15 @@ impl NfsDirHandle {
         unsafe { ffi::nfs_readdir_get_cookieverf(self.handle) }
     }
 
+    /// Check if end-of-directory was reached in the last READDIR response
+    ///
+    /// This is the authoritative way to detect end of directory when streaming
+    /// with `opendir_names_only_at_cookie()`. Do NOT rely on empty batches or
+    /// repeated entries to detect EOF - always check this flag.
+    pub fn is_eof(&self) -> bool {
+        unsafe { ffi::nfs_readdir_is_eof(self.handle) != 0 }
+    }
+
     /// Convert a libnfs dirent to our NfsDirEntry (same as NfsConnection::convert_dirent)
     unsafe fn convert_dirent(dirent: *mut ffi::nfsdirent) -> NfsDirEntry {
         let d = &*dirent;
@@ -669,6 +732,8 @@ pub struct NfsConnectionBuilder {
     url: NfsUrl,
     timeout: Duration,
     retries: u32,
+    /// Override server with specific IP (for DNS round-robin)
+    override_ip: Option<String>,
 }
 
 impl NfsConnectionBuilder {
@@ -678,7 +743,15 @@ impl NfsConnectionBuilder {
             url,
             timeout: Duration::from_secs(30),
             retries: 3,
+            override_ip: None,
         }
+    }
+
+    /// Override the server hostname with a specific IP address
+    /// Used for DNS round-robin load balancing
+    pub fn with_ip(mut self, ip: String) -> Self {
+        self.override_ip = Some(ip);
+        self
     }
 
     /// Set connection timeout
@@ -697,6 +770,18 @@ impl NfsConnectionBuilder {
     pub fn connect(self) -> NfsResult<NfsConnection> {
         let mut last_error = None;
 
+        // Use override IP if provided, otherwise use URL server
+        let url = if let Some(ip) = self.override_ip {
+            NfsUrl {
+                server: ip,
+                port: self.url.port,
+                export: self.url.export.clone(),
+                subpath: self.url.subpath.clone(),
+            }
+        } else {
+            self.url.clone()
+        };
+
         for attempt in 0..=self.retries {
             if attempt > 0 {
                 // Exponential backoff: 100ms, 200ms, 400ms, ...
@@ -704,7 +789,7 @@ impl NfsConnectionBuilder {
                 std::thread::sleep(delay);
             }
 
-            match NfsConnection::connect_to(&self.url, self.timeout) {
+            match NfsConnection::connect_to(&url, self.timeout) {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
                     last_error = Some(e);
@@ -713,9 +798,73 @@ impl NfsConnectionBuilder {
         }
 
         Err(last_error.unwrap_or_else(|| NfsError::ConnectionFailed {
-            server: self.url.server,
+            server: url.server,
             reason: "Connection failed after all retries".into(),
         }))
+    }
+}
+
+/// Resolve a hostname to all its IP addresses
+///
+/// Returns a list of IP addresses for DNS round-robin load balancing.
+/// Makes multiple resolution attempts using `host` command to bypass
+/// system resolver caching and catch rotating DNS servers.
+/// If resolution fails, returns the original hostname as the only entry.
+pub fn resolve_dns(hostname: &str) -> Vec<String> {
+    resolve_dns_with_attempts(hostname, 20)
+}
+
+/// Resolve DNS with a specified number of attempts to catch all rotating IPs
+pub fn resolve_dns_with_attempts(hostname: &str, attempts: usize) -> Vec<String> {
+    use std::collections::HashSet;
+    use std::process::Command;
+
+    let mut all_ips = HashSet::new();
+
+    // Use `host` command to bypass system resolver caching
+    // Each call to `host` does a fresh DNS query
+    for _ in 0..attempts {
+        if let Ok(output) = Command::new("host")
+            .arg(hostname)
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    // Parse lines like: "hostname has address 1.2.3.4"
+                    if line.contains("has address") {
+                        if let Some(ip) = line.split_whitespace().last() {
+                            all_ips.insert(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if all_ips.is_empty() {
+        // Fallback to system resolver if `host` command fails
+        use std::net::ToSocketAddrs;
+        let addr_str = format!("{}:0", hostname);
+        if let Ok(addrs) = addr_str.to_socket_addrs() {
+            for addr in addrs {
+                let ip = match addr {
+                    std::net::SocketAddr::V4(v4) => v4.ip().to_string(),
+                    std::net::SocketAddr::V6(v6) => v6.ip().to_string(),
+                };
+                all_ips.insert(ip);
+            }
+        }
+    }
+
+    if all_ips.is_empty() {
+        // Resolution failed, return hostname as-is (libnfs will resolve it)
+        vec![hostname.to_string()]
+    } else {
+        // Sort for deterministic ordering
+        let mut ips: Vec<String> = all_ips.into_iter().collect();
+        ips.sort();
+        ips
     }
 }
 

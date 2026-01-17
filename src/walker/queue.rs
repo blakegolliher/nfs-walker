@@ -12,6 +12,22 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// A batch of entries needing GETATTR (for parallel stat processing)
+#[derive(Debug, Clone)]
+pub struct StatTask {
+    /// Parent directory path
+    pub parent_path: String,
+
+    /// Entry name within the parent directory
+    pub name: String,
+
+    /// Inode number (for logging/debugging)
+    pub inode: u64,
+
+    /// Depth from root
+    pub depth: u32,
+}
+
 /// A task to walk a directory
 #[derive(Debug, Clone)]
 pub struct DirTask {
@@ -445,6 +461,172 @@ impl EntryQueueReceiver {
         }
         self.stats.entries_processed.fetch_add(entries.len() as u64, Ordering::Relaxed);
         entries
+    }
+
+    /// Check if the queue is empty
+    pub fn is_empty(&self) -> bool {
+        self.receiver.is_empty()
+    }
+
+    /// Get current queue length
+    pub fn len(&self) -> usize {
+        self.receiver.len()
+    }
+}
+
+// ============================================================================
+// StatQueue - Queue for parallel GETATTR processing
+// ============================================================================
+
+/// Queue for distributing GETATTR work across workers
+///
+/// When a large directory is encountered in skinny mode, entries are pushed
+/// to this queue so multiple workers can issue GETATTR calls in parallel.
+pub struct StatQueue {
+    /// Sender for adding stat tasks
+    sender: Sender<StatTask>,
+
+    /// Receiver for getting stat tasks
+    receiver: Receiver<StatTask>,
+
+    /// Statistics
+    stats: Arc<StatQueueStats>,
+}
+
+/// Statistics for the stat queue
+#[derive(Debug, Default)]
+pub struct StatQueueStats {
+    /// Total tasks pushed
+    pub tasks_pushed: AtomicU64,
+
+    /// Total tasks processed
+    pub tasks_processed: AtomicU64,
+}
+
+impl StatQueue {
+    /// Create a new stat queue with the specified capacity
+    pub fn new(capacity: usize) -> Self {
+        let (sender, receiver) = bounded(capacity);
+
+        Self {
+            sender,
+            receiver,
+            stats: Arc::new(StatQueueStats::default()),
+        }
+    }
+
+    /// Get a sender handle
+    pub fn sender(&self) -> StatQueueSender {
+        StatQueueSender {
+            sender: self.sender.clone(),
+            stats: Arc::clone(&self.stats),
+        }
+    }
+
+    /// Get a receiver handle
+    pub fn receiver(&self) -> StatQueueReceiver {
+        StatQueueReceiver {
+            receiver: self.receiver.clone(),
+            stats: Arc::clone(&self.stats),
+        }
+    }
+
+    /// Get statistics
+    pub fn stats(&self) -> Arc<StatQueueStats> {
+        Arc::clone(&self.stats)
+    }
+
+    /// Check if the queue is empty
+    pub fn is_empty(&self) -> bool {
+        self.receiver.is_empty()
+    }
+
+    /// Get current queue length
+    pub fn len(&self) -> usize {
+        self.receiver.len()
+    }
+}
+
+/// Handle for sending stat tasks to the queue
+#[derive(Clone)]
+pub struct StatQueueSender {
+    sender: Sender<StatTask>,
+    stats: Arc<StatQueueStats>,
+}
+
+impl StatQueueSender {
+    /// Try to send a task without blocking
+    pub fn try_send(&self, task: StatTask) -> Result<bool, ()> {
+        match self.sender.try_send(task) {
+            Ok(()) => {
+                self.stats.tasks_pushed.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Disconnected(_)) => Err(()),
+        }
+    }
+
+    /// Send a task, blocking if necessary
+    pub fn send(&self, task: StatTask) -> Result<(), ()> {
+        self.sender.send(task).map_err(|_| ())?;
+        self.stats.tasks_pushed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Push multiple tasks (blocks until all are sent)
+    pub fn send_batch(&self, tasks: Vec<StatTask>) -> Result<usize, ()> {
+        let mut count = 0;
+        for task in tasks {
+            self.sender.send(task).map_err(|_| ())?;
+            count += 1;
+        }
+        self.stats.tasks_pushed.fetch_add(count, Ordering::Relaxed);
+        Ok(count as usize)
+    }
+}
+
+/// Handle for receiving stat tasks from the queue
+#[derive(Clone)]
+pub struct StatQueueReceiver {
+    receiver: Receiver<StatTask>,
+    stats: Arc<StatQueueStats>,
+}
+
+impl StatQueueReceiver {
+    /// Try to receive a task without blocking
+    pub fn try_recv(&self) -> Option<StatTask> {
+        match self.receiver.try_recv() {
+            Ok(task) => {
+                self.stats.tasks_processed.fetch_add(1, Ordering::Relaxed);
+                Some(task)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Receive with timeout
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<StatTask> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(task) => {
+                self.stats.tasks_processed.fetch_add(1, Ordering::Relaxed);
+                Some(task)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Drain up to `max` tasks from the queue
+    pub fn drain(&self, max: usize) -> Vec<StatTask> {
+        let mut tasks = Vec::with_capacity(max.min(100));
+        for _ in 0..max {
+            match self.receiver.try_recv() {
+                Ok(task) => tasks.push(task),
+                Err(_) => break,
+            }
+        }
+        self.stats.tasks_processed.fetch_add(tasks.len() as u64, Ordering::Relaxed);
+        tasks
     }
 
     /// Check if the queue is empty
