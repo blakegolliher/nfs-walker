@@ -117,6 +117,11 @@ pub struct CliArgs {
     /// Disable skinny read optimization (use READDIRPLUS for all directories)
     #[arg(long)]
     pub no_skinny: bool,
+
+    /// High file count mode: optimized for directories with millions of files.
+    /// Uses names-only readdir + parallel stat. Does not recurse into subdirectories.
+    #[arg(long)]
+    pub hfc: bool,
 }
 
 /// Output format for scan results
@@ -203,9 +208,11 @@ impl NfsUrl {
         }
 
         // Try legacy format: server:/export
-        if let Some(idx) = url.find(":/") {
-            let server = url[..idx].to_string();
-            let full_path = &url[idx + 1..];
+        // First strip nfs:// prefix if present to avoid matching the :// in nfs://
+        let legacy_url = url.strip_prefix("nfs://").unwrap_or(url);
+        if let Some(idx) = legacy_url.find(":/") {
+            let server = legacy_url[..idx].to_string();
+            let full_path = &legacy_url[idx + 1..];
             let (export, subpath) = Self::split_export_path(full_path);
 
             if server.is_empty() {
@@ -335,6 +342,9 @@ pub struct WalkConfig {
 
     /// Disable skinny read optimization
     pub disable_skinny: bool,
+
+    /// High file count mode (no directory recursion)
+    pub hfc_mode: bool,
 }
 
 impl WalkConfig {
@@ -411,6 +421,7 @@ impl WalkConfig {
             connection_count: args.connections,
             output_format: args.format,
             disable_skinny: args.no_skinny,
+            hfc_mode: args.hfc,
         })
     }
 
@@ -488,6 +499,7 @@ mod tests {
             connection_count: 16,
             output_format: OutputFormat::Sqlite,
             disable_skinny: false,
+            hfc_mode: false,
         };
 
         assert!(config.is_excluded("/data/.snapshot/hourly.0"));

@@ -12,15 +12,16 @@ use crate::db::WriterHandle;
 use crate::error::{WalkOutcome, WorkerError};
 use crate::nfs::types::{DbEntry, DirStats, EntryType, NfsDirEntry};
 use crate::nfs::{NfsConnection, NfsConnectionBuilder};
+use crate::walker::parallel_stat::process_directory_parallel;
 use crate::walker::queue::{
-    DirTask, EntryQueueReceiver, EntryQueueSender, WorkGuard, WorkQueueReceiver, WorkQueueSender,
-    LARGE_DIR_THRESHOLD,
+    DirTask, EntryQueueReceiver, EntryQueueSender, StatQueueReceiver, StatQueueSender, StatTask,
+    WorkGuard, WorkQueueReceiver, WorkQueueSender, LARGE_DIR_THRESHOLD,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 /// Batch size for skinny streaming reads (entries per RPC call)
 const SKINNY_BATCH_SIZE: u32 = 10_000;
@@ -94,6 +95,8 @@ impl Worker {
         queue_tx: WorkQueueSender,
         entry_tx: EntryQueueSender,
         entry_rx: EntryQueueReceiver,
+        stat_tx: StatQueueSender,
+        stat_rx: StatQueueReceiver,
         writer: WriterHandle,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self, WorkerError> {
@@ -104,7 +107,8 @@ impl Worker {
             .name(format!("walker-{}", id))
             .spawn(move || {
                 worker_loop(
-                    id, config, queue_rx, queue_tx, entry_tx, entry_rx, writer, shutdown, stats_clone,
+                    id, config, queue_rx, queue_tx, entry_tx, entry_rx, stat_tx, stat_rx,
+                    writer, shutdown, stats_clone,
                 )
             })
             .map_err(|e| WorkerError::InitFailed {
@@ -146,6 +150,7 @@ impl Worker {
 }
 
 /// Main worker loop
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     id: usize,
     config: Arc<WalkConfig>,
@@ -153,6 +158,8 @@ fn worker_loop(
     queue_tx: WorkQueueSender,
     entry_tx: EntryQueueSender,
     entry_rx: EntryQueueReceiver,
+    stat_tx: StatQueueSender,
+    stat_rx: StatQueueReceiver,
     writer: WriterHandle,
     shutdown: Arc<AtomicBool>,
     stats: Arc<WorkerStats>,
@@ -184,8 +191,8 @@ fn worker_loop(
 
     // Process tasks until shutdown
     while !shutdown.load(Ordering::Relaxed) {
-        // First, try to get a directory task
-        let task = match queue_rx.recv_timeout(Duration::from_millis(10)) {
+        // First, try to get a directory task (highest priority)
+        let task = match queue_rx.recv_timeout(Duration::from_millis(5)) {
             Some(task) => Some(task),
             None => None,
         };
@@ -202,8 +209,10 @@ fn worker_loop(
                 &mut nfs,
                 &queue_tx,
                 &entry_tx,
+                &stat_tx,
                 &writer,
                 &stats,
+                &shutdown,
             );
 
             match &outcome {
@@ -217,21 +226,30 @@ fn worker_loop(
                     warn!(worker = id, path = %path, error = %error, "Directory failed");
                 }
             }
-        } else {
-            // No directory tasks available - help process entries from large directories
-            // This is how workers share the load when one directory has many files
-            let entries = entry_rx.drain(100); // Process up to 100 entries at a time
-            if !entries.is_empty() {
-                for entry in entries {
-                    if let Err(e) = writer.send_entry(entry) {
-                        error!(worker = id, error = %e, "Failed to send entry to writer");
-                    }
-                }
-            } else {
-                // No entries to process either, wait a bit
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            continue;
         }
+
+        // No directory tasks - try processing stat tasks (parallel GETATTR)
+        let stat_tasks = stat_rx.drain(50); // Process up to 50 stat tasks at a time
+        if !stat_tasks.is_empty() {
+            let _guard = WorkGuard::new(&queue_rx); // Mark as working
+            process_stat_tasks(id, &mut nfs, &config, &queue_tx, &writer, &stats, stat_tasks);
+            continue;
+        }
+
+        // No stat tasks - try processing db entry tasks
+        let entries = entry_rx.drain(100);
+        if !entries.is_empty() {
+            for entry in entries {
+                if let Err(e) = writer.send_entry(entry) {
+                    error!(worker = id, error = %e, "Failed to send entry to writer");
+                }
+            }
+            continue;
+        }
+
+        // Nothing to do, wait a bit
+        std::thread::sleep(Duration::from_millis(5));
     }
 
     debug!(
@@ -244,26 +262,103 @@ fn worker_loop(
     Ok(())
 }
 
+/// Process stat tasks - issue GETATTR calls for parallel stat resolution
+fn process_stat_tasks(
+    worker_id: usize,
+    nfs: &mut NfsConnection,
+    config: &WalkConfig,
+    queue_tx: &WorkQueueSender,
+    writer: &WriterHandle,
+    stats: &WorkerStats,
+    tasks: Vec<StatTask>,
+) {
+    let task_count = tasks.len();
+    let mut dir_count = 0u64;
+    let mut file_count = 0u64;
+
+    for task in tasks {
+        let full_path = if task.parent_path == "/" {
+            format!("/{}", task.name)
+        } else {
+            format!("{}/{}", task.parent_path, task.name)
+        };
+
+        match nfs.stat(&full_path) {
+            Ok(stat_result) => {
+                let entry_type = stat_result.entry_type();
+
+                if entry_type == EntryType::Directory {
+                    dir_count += 1;
+
+                    // Queue directory for processing
+                    let should_queue = config
+                        .max_depth
+                        .map(|max| (task.depth) as usize <= max)
+                        .unwrap_or(true);
+
+                    if should_queue && !config.is_excluded(&full_path) {
+                        let subtask = DirTask::new(full_path.clone(), None, task.depth);
+                        if let Err(()) = queue_tx.try_send(subtask) {
+                            warn!(worker = worker_id, path = %full_path, "Failed to queue directory from stat");
+                        }
+                    }
+                } else {
+                    file_count += 1;
+                }
+
+                // Create db entry with full attributes
+                let db_entry = DbEntry::from_stat(&full_path, &task.name, &stat_result, task.depth);
+
+                if !config.dirs_only || entry_type == EntryType::Directory {
+                    if let Err(e) = writer.send_entry(db_entry) {
+                        error!(worker = worker_id, error = %e, "Failed to send stat entry to writer");
+                    }
+                }
+            }
+            Err(e) => {
+                // Non-fatal: entry might have been deleted or we lack permissions
+                trace!(worker = worker_id, path = %full_path, error = %e, "GETATTR failed");
+                stats.record_error();
+            }
+        }
+    }
+
+    // Update stats
+    stats.record_files(file_count);
+
+    trace!(
+        worker = worker_id,
+        tasks = task_count,
+        files = file_count,
+        dirs = dir_count,
+        "Processed stat tasks"
+    );
+}
+
 /// Process a single directory using hybrid READDIRPLUS/skinny approach
 ///
 /// Strategy:
 /// 1. Probe first batch with READDIRPLUS to analyze directory composition
-/// 2. If mostly files (< 1% directories), switch to skinny streaming for speed
-/// 3. If many subdirectories, continue with READDIRPLUS for complete type info
-/// 4. For skinny mode, stat Unknown entries at the end to find any subdirectories
+/// 2. If large flat directory (>100K entries), use parallel READDIRPLUS
+/// 3. If mostly files (< 1% directories), switch to skinny streaming for speed
+/// 4. If many subdirectories, continue with READDIRPLUS for complete type info
+/// 5. For skinny mode, push Unknown entries to stat queue for parallel GETATTR
+#[allow(clippy::too_many_arguments)]
 fn process_directory(
     worker_id: usize,
     task: &DirTask,
     config: &WalkConfig,
     nfs: &mut NfsConnection,
     queue_tx: &WorkQueueSender,
-    entry_tx: &EntryQueueSender,
+    _entry_tx: &EntryQueueSender,
+    _stat_tx: &StatQueueSender,
     writer: &WriterHandle,
     stats: &WorkerStats,
+    shutdown: &Arc<AtomicBool>,
 ) -> WalkOutcome {
     // Use simple READDIRPLUS-only path if skinny mode is disabled
     if config.disable_skinny {
-        return process_directory_simple(worker_id, task, config, nfs, queue_tx, entry_tx, writer, stats);
+        return process_directory_simple(worker_id, task, config, nfs, queue_tx, _entry_tx, writer, stats);
     }
     // Check depth limit
     if let Some(max_depth) = config.max_depth {
@@ -286,9 +381,9 @@ fn process_directory(
     }
 
     // Phase 1: Probe with READDIRPLUS to analyze directory composition
-    // Use regular opendir() which is known to work reliably
+    // Use opendir_at_cookie with a limit to avoid reading entire huge directories
     debug!(worker = worker_id, path = %task.path, "Starting directory probe");
-    let probe_handle = match nfs.opendir(&task.path) {
+    let probe_handle = match nfs.opendir_at_cookie(&task.path, 0, (SKINNY_PROBE_SIZE + 10) as u32) {
         Ok(h) => h,
         Err(e) => {
             stats.record_error();
@@ -341,116 +436,93 @@ fn process_directory(
         0.0
     };
 
-    // Decide: use skinny mode if probe is full AND directory ratio is low
-    let use_skinny = probe_full && dir_ratio <= SKINNY_MAX_DIR_RATIO;
+    // Decide: use parallel mode if probe is full AND directory ratio is low (flat dir)
+    let use_parallel = probe_full && dir_ratio <= SKINNY_MAX_DIR_RATIO;
 
-    if use_skinny {
+    // For large flat directories, use simple parallel READDIR + GETATTR
+    if use_parallel {
+        drop(probe_handle);
+
         debug!(
             worker = worker_id,
             path = %task.path,
             probe_size = probe_size,
             dir_ratio = %format!("{:.2}%", dir_ratio * 100.0),
-            "Switching to skinny mode for large flat directory"
+            "Using parallel READDIR+GETATTR for flat directory"
         );
+
+        match process_directory_parallel(
+            nfs,
+            &task.path,
+            config,
+            queue_tx,
+            writer,
+            task.depth,
+            shutdown,
+        ) {
+            Ok((entries, subdirs, _duration)) => {
+                stats.record_dir();
+                stats.record_files(entries);
+                return WalkOutcome::Success {
+                    path: task.path.clone(),
+                    entries: entries as usize,
+                    subdirs: subdirs as usize,
+                };
+            }
+            Err(e) => {
+                stats.record_error();
+                return WalkOutcome::Failed {
+                    path: task.path.clone(),
+                    error: e,
+                };
+            }
+        }
     }
 
+    // Standard READDIRPLUS path for small/mixed directories
+    // (Large flat directories are handled by process_directory_parallel above)
     stats.record_dir();
 
-    // Track all results
     let mut dir_stats = DirStats::default();
     let mut entry_count = 0usize;
     let mut subdir_count = 0usize;
-    let mut unknown_entries: Vec<(String, u64)> = Vec::new(); // (path, inode) for later stat
 
-    // Phase 2: Continue reading the rest of the directory
-    if use_skinny {
-        // For skinny mode, we restart from the beginning with READDIR
-        // because READDIRPLUS cookies may not be compatible with READDIR
-        // The probe entries are NOT written to DB - skinny will read everything fresh
-        drop(probe_handle);
+    // Process probe entries first
+    for entry in probe_entries {
+        entry_count += 1;
+        let db_entry = DbEntry::from_nfs_entry(&entry, &task.path, task.depth + 1);
+        dir_stats.add_entry(&entry);
 
-        match continue_with_skinny_full(
-            worker_id,
-            task,
-            config,
-            nfs,
-            queue_tx,
-            writer,
-            &mut dir_stats,
-            &mut entry_count,
-            &mut subdir_count,
-            &mut unknown_entries,
-        ) {
-            Ok(()) => {}
-            Err(e) => {
-                warn!(worker = worker_id, path = %task.path, error = %e, "Skinny scan failed");
-            }
-        }
-    } else {
-        // READDIRPLUS mode: process probe entries first, then continue reading
-        for entry in probe_entries {
-            entry_count += 1;
-            let db_entry = DbEntry::from_nfs_entry(&entry, &task.path, task.depth + 1);
-            dir_stats.add_entry(&entry);
-
-            if entry.entry_type == EntryType::Directory {
-                subdir_count += 1;
-                queue_subdir(worker_id, &db_entry, task, config, queue_tx);
-            }
-
-            if !config.dirs_only || entry.entry_type == EntryType::Directory {
-                if let Err(e) = writer.send_entry(db_entry) {
-                    error!(worker = worker_id, error = %e, "Failed to send entry to writer");
-                }
-            }
+        if entry.entry_type == EntryType::Directory {
+            subdir_count += 1;
+            queue_subdir(worker_id, &db_entry, task, config, queue_tx);
         }
 
-        // Continue reading from where probe left off
-        while let Some(entry) = probe_handle.readdir() {
-            if entry.is_special() {
-                continue;
-            }
-
-            entry_count += 1;
-            let db_entry = DbEntry::from_nfs_entry(&entry, &task.path, task.depth + 1);
-            dir_stats.add_entry(&entry);
-
-            if entry.entry_type == EntryType::Directory {
-                subdir_count += 1;
-                queue_subdir(worker_id, &db_entry, task, config, queue_tx);
-            }
-
-            if !config.dirs_only || entry.entry_type == EntryType::Directory {
-                if let Err(e) = writer.send_entry(db_entry) {
-                    error!(worker = worker_id, error = %e, "Failed to send entry to writer");
-                }
+        if !config.dirs_only || entry.entry_type == EntryType::Directory {
+            if let Err(e) = writer.send_entry(db_entry) {
+                error!(worker = worker_id, error = %e, "Failed to send entry to writer");
             }
         }
     }
 
-    // Phase 3: Resolve Unknown entries (from skinny mode) to find directories
-    if !unknown_entries.is_empty() {
-        let resolved_dirs = resolve_unknown_entries(
-            worker_id,
-            nfs,
-            &unknown_entries,
-        );
+    // Continue reading from where probe left off
+    while let Some(entry) = probe_handle.readdir() {
+        if entry.is_special() {
+            continue;
+        }
 
-        for dir_path in resolved_dirs {
+        entry_count += 1;
+        let db_entry = DbEntry::from_nfs_entry(&entry, &task.path, task.depth + 1);
+        dir_stats.add_entry(&entry);
+
+        if entry.entry_type == EntryType::Directory {
             subdir_count += 1;
+            queue_subdir(worker_id, &db_entry, task, config, queue_tx);
+        }
 
-            // Queue the directory for processing
-            let should_queue = config
-                .max_depth
-                .map(|max| (task.depth + 1) as usize <= max)
-                .unwrap_or(true);
-
-            if should_queue && !config.is_excluded(&dir_path) {
-                let subtask = DirTask::new(dir_path, None, task.depth + 1);
-                if !queue_tx.try_send(subtask.clone()).unwrap_or(false) {
-                    queue_tx.record_inline();
-                    trace!(worker = worker_id, path = %subtask.path, "Backpressure - task will be retried");
-                }
+        if !config.dirs_only || entry.entry_type == EntryType::Directory {
+            if let Err(e) = writer.send_entry(db_entry) {
+                error!(worker = worker_id, error = %e, "Failed to send entry to writer");
             }
         }
     }
@@ -461,12 +533,10 @@ fn process_directory(
             worker = worker_id,
             path = %task.path,
             entries = entry_count,
-            mode = if use_skinny { "skinny" } else { "readdirplus" },
             "Processed large directory"
         );
     }
 
-    // Record file stats
     stats.record_files(dir_stats.file_count);
     stats.record_bytes(dir_stats.total_bytes);
 
@@ -502,178 +572,6 @@ fn queue_subdir(
             trace!(worker = worker_id, path = %subtask.path, "Backpressure - task will be retried");
         }
     }
-}
-
-/// Full skinny scan of a directory from the beginning
-///
-/// Used when we detect a large flat directory - reads everything with READDIR
-/// instead of READDIRPLUS for better performance.
-#[allow(clippy::too_many_arguments)]
-fn continue_with_skinny_full(
-    worker_id: usize,
-    task: &DirTask,
-    config: &WalkConfig,
-    nfs: &mut NfsConnection,
-    queue_tx: &WorkQueueSender,
-    writer: &WriterHandle,
-    dir_stats: &mut DirStats,
-    entry_count: &mut usize,
-    subdir_count: &mut usize,
-    unknown_entries: &mut Vec<(String, u64)>,
-) -> Result<(), crate::error::NfsError> {
-    use std::collections::HashSet;
-
-    let mut cookie: u64 = 0;
-    let mut cookieverf: u64 = 0;
-    let mut batch_num = 0u32;
-
-    // Track first batch inodes to detect wrap-around
-    let mut first_batch_inodes: HashSet<u64> = HashSet::new();
-    let mut is_first_batch = true;
-
-    debug!(
-        worker = worker_id,
-        path = %task.path,
-        "Starting skinny full scan"
-    );
-
-    // Safety limit - 100 batches of 10k = 1M entries max
-    const MAX_BATCHES: u32 = 100;
-
-    loop {
-        trace!(
-            worker = worker_id,
-            batch = batch_num,
-            cookie = cookie,
-            cookieverf = cookieverf,
-            "Opening skinny batch"
-        );
-
-        let dir_handle = nfs.opendir_names_only_at_cookie(
-            &task.path,
-            cookie,
-            cookieverf,
-            SKINNY_BATCH_SIZE,
-        )?;
-
-        let mut batch_count = 0u32;
-        let mut last_cookie = cookie;
-        let mut wrap_detected = false;
-
-        while let Some(entry) = dir_handle.readdir() {
-            if entry.is_special() {
-                continue;
-            }
-
-            // Check for wrap-around by seeing if we encounter an inode from first batch
-            if !is_first_batch && first_batch_inodes.contains(&entry.inode) {
-                debug!(
-                    worker = worker_id,
-                    batch = batch_num,
-                    inode = entry.inode,
-                    name = %entry.name,
-                    total = *entry_count,
-                    "Wrap-around detected - same inode seen again"
-                );
-                wrap_detected = true;
-                break;
-            }
-
-            // Record first batch inodes for wrap detection
-            if is_first_batch {
-                first_batch_inodes.insert(entry.inode);
-            }
-
-            batch_count += 1;
-            *entry_count += 1;
-            last_cookie = entry.cookie;
-
-            // Build path for this entry
-            let entry_path = if task.path == "/" {
-                format!("/{}", entry.name)
-            } else {
-                format!("{}/{}", task.path, entry.name)
-            };
-
-            // Skinny entries have Unknown type - track for later stat resolution
-            if entry.entry_type == EntryType::Unknown {
-                unknown_entries.push((entry_path.clone(), entry.inode));
-                dir_stats.file_count += 1; // Assume file, will correct if wrong
-            } else {
-                dir_stats.add_entry(&entry);
-                if entry.entry_type == EntryType::Directory {
-                    *subdir_count += 1;
-                    let db_entry = DbEntry::from_nfs_entry(&entry, &task.path, task.depth + 1);
-                    queue_subdir(worker_id, &db_entry, task, config, queue_tx);
-                }
-            }
-
-            // Create and send DB entry
-            let db_entry = DbEntry::from_nfs_entry(&entry, &task.path, task.depth + 1);
-
-            if !config.dirs_only || entry.entry_type == EntryType::Directory {
-                if let Err(e) = writer.send_entry(db_entry) {
-                    error!(worker = worker_id, error = %e, "Failed to send entry to writer");
-                }
-            }
-        }
-
-        is_first_batch = false;
-
-        // Update cookie and verifier for next batch
-        let new_verifier = dir_handle.get_cookieverf();
-
-        // Log batch progress
-        trace!(
-            worker = worker_id,
-            batch = batch_num,
-            entries = batch_count,
-            total = *entry_count,
-            cookie = last_cookie,
-            new_verifier = new_verifier,
-            "Skinny batch complete"
-        );
-
-        batch_num += 1;
-
-        // Exit if wrap-around detected
-        if wrap_detected {
-            debug!(
-                worker = worker_id,
-                total = *entry_count,
-                "Exiting skinny scan due to wrap-around"
-            );
-            break;
-        }
-
-        // EOF when we get an empty batch
-        if batch_count == 0 {
-            debug!(
-                worker = worker_id,
-                total = *entry_count,
-                "Skinny scan complete - EOF reached"
-            );
-            break;
-        }
-
-        // Safety limit to prevent infinite loops
-        if batch_num >= MAX_BATCHES {
-            debug!(
-                worker = worker_id,
-                path = %task.path,
-                batches = batch_num,
-                entries = *entry_count,
-                "Hit safety limit on skinny batches"
-            );
-            break;
-        }
-
-        // Update for next batch
-        cookie = last_cookie;
-        cookieverf = new_verifier;
-    }
-
-    Ok(())
 }
 
 /// Continue reading directory with skinny streaming after probe (unused - kept for reference)
@@ -758,6 +656,8 @@ fn continue_with_skinny(
 /// Resolve Unknown entries by stat'ing them to find directories
 ///
 /// Returns the paths of entries that are actually directories.
+/// NOTE: Kept for reference - replaced by parallel stat via StatQueue
+#[allow(dead_code)]
 fn resolve_unknown_entries(
     worker_id: usize,
     nfs: &mut NfsConnection,

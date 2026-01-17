@@ -1,38 +1,53 @@
 //! Build script for nfs-walker
 //!
 //! Generates Rust bindings for libnfs using bindgen.
-//! Requires libnfs-dev to be installed on the system.
+//! Uses the patched libnfs from vendor/libnfs.
 
 use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    // Rerun if wrapper header changes
+    // Get the project root directory
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let vendor_libnfs = manifest_dir.join("vendor/libnfs");
+    let vendor_build = vendor_libnfs.join("build");
+    let vendor_include = vendor_libnfs.join("include");
+
+    // Rerun if wrapper header or vendor sources change
     println!("cargo:rerun-if-changed=src/nfs/wrapper.h");
+    println!(
+        "cargo:rerun-if-changed={}",
+        vendor_include.join("nfsc/libnfs.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        vendor_include.join("libnfs-private.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        vendor_libnfs.join("lib/libnfs.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        vendor_libnfs.join("lib/nfs_v3.c").display()
+    );
 
-    // Find libnfs using pkg-config
-    let nfs_lib = match pkg_config::Config::new()
-        .atleast_version("4.0.0")
-        .probe("libnfs")
-    {
-        Ok(lib) => lib,
-        Err(e) => {
-            // Provide helpful error message
-            eprintln!("Error: Could not find libnfs via pkg-config: {}", e);
-            eprintln!();
-            eprintln!("To install libnfs on Ubuntu/Debian:");
-            eprintln!("  sudo apt install libnfs-dev");
-            eprintln!();
-            eprintln!("Or build from source:");
-            eprintln!("  git clone https://github.com/sahlberg/libnfs.git");
-            eprintln!("  cd libnfs && ./bootstrap && ./configure && make && sudo make install");
-            std::process::exit(1);
-        }
-    };
+    // Check if vendor libnfs is built
+    let vendor_lib = vendor_build.join("lib/libnfs.so");
+    if !vendor_lib.exists() {
+        eprintln!("Error: Vendor libnfs not built. Please run:");
+        eprintln!(
+            "  cd {} && mkdir -p build && cd build && cmake .. && make -j$(nproc)",
+            vendor_libnfs.display()
+        );
+        std::process::exit(1);
+    }
 
-    // Collect include paths for bindgen
-    let mut builder = bindgen::Builder::default()
+    // Generate bindings from vendor headers
+    let builder = bindgen::Builder::default()
         .header("src/nfs/wrapper.h")
+        // Add vendor include path (must come first to override system headers)
+        .clang_arg(format!("-I{}", vendor_include.display()))
         // Only generate bindings for nfs functions
         .allowlist_function("nfs_.*")
         .allowlist_function("rpc_.*")
@@ -42,8 +57,13 @@ fn main() {
         .allowlist_type("nfsdirent")
         .allowlist_type("nfs_stat_64")
         .allowlist_type("nfs_context")
+        .allowlist_type("nfs_cb")
         .allowlist_var("NFS.*")
         .allowlist_var("O_.*")
+        .allowlist_var("POLLIN")
+        .allowlist_var("POLLOUT")
+        .allowlist_var("POLLERR")
+        .allowlist_var("POLLHUP")
         // Generate Debug trait where possible
         .derive_debug(true)
         .derive_default(true)
@@ -58,11 +78,6 @@ fn main() {
         // Make it cleaner
         .generate_comments(true);
 
-    // Add include paths from pkg-config
-    for path in &nfs_lib.include_paths {
-        builder = builder.clang_arg(format!("-I{}", path.display()));
-    }
-
     // Generate bindings
     let bindings = builder
         .generate()
@@ -74,13 +89,16 @@ fn main() {
         .write_to_file(out_path.join("nfs_bindings.rs"))
         .expect("Couldn't write bindings!");
 
-    // Link libraries
-    for lib in &nfs_lib.libs {
-        println!("cargo:rustc-link-lib={}", lib);
-    }
+    // Link against vendor libnfs
+    println!(
+        "cargo:rustc-link-search=native={}",
+        vendor_build.join("lib").display()
+    );
+    println!("cargo:rustc-link-lib=nfs");
 
-    // Link paths
-    for path in &nfs_lib.link_paths {
-        println!("cargo:rustc-link-search=native={}", path.display());
-    }
+    // Set rpath so the binary can find the library at runtime
+    println!(
+        "cargo:rustc-link-arg=-Wl,-rpath,{}",
+        vendor_build.join("lib").display()
+    );
 }

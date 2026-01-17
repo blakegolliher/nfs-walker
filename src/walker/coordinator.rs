@@ -11,7 +11,7 @@ use crate::config::WalkConfig;
 use crate::db::BatchedWriter;
 use crate::error::{Result, WalkerError, WorkerError};
 use crate::nfs::types::DbEntry;
-use crate::walker::queue::{EntryQueue, WorkQueue};
+use crate::walker::queue::{EntryQueue, StatQueue, WorkQueue};
 use crate::walker::worker::{aggregate_stats, Worker};
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +59,9 @@ pub struct WalkCoordinator {
     /// Entry queue for distributing file entries from large directories
     entry_queue: EntryQueue,
 
+    /// Stat queue for parallel GETATTR processing
+    stat_queue: StatQueue,
+
     /// Database writer
     writer: BatchedWriter,
 
@@ -84,6 +87,10 @@ impl WalkCoordinator {
         // Size it large enough to buffer entries while workers process them
         let entry_queue = EntryQueue::new(config.batch_size * 4);
 
+        // Create stat queue for parallel GETATTR processing
+        // Size it based on worker count * batch size for good parallelism
+        let stat_queue = StatQueue::new(config.worker_count * config.batch_size);
+
         // Create database writer
         let writer = BatchedWriter::new(
             &config.output_path,
@@ -98,6 +105,7 @@ impl WalkCoordinator {
             config,
             queue,
             entry_queue,
+            stat_queue,
             writer,
             workers: Vec::new(),
             shutdown,
@@ -111,7 +119,17 @@ impl WalkCoordinator {
     }
 
     /// Run the filesystem walk
-    pub fn run(mut self) -> Result<WalkResult> {
+    pub fn run(self) -> Result<WalkResult> {
+        self.run_with_progress(|_| {})
+    }
+
+    /// Run the filesystem walk with a progress callback
+    ///
+    /// The callback is called periodically (roughly every 100ms) with the current progress.
+    pub fn run_with_progress<F>(mut self, mut progress_callback: F) -> Result<WalkResult>
+    where
+        F: FnMut(WalkProgress),
+    {
         let start_time = Instant::now();
         let start_datetime: DateTime<Utc> = Utc::now();
         self.start_time = Some(start_time);
@@ -144,8 +162,8 @@ impl WalkCoordinator {
         // Spawn workers
         self.spawn_workers()?;
 
-        // Wait for completion
-        let completed = self.wait_for_completion();
+        // Wait for completion, calling progress callback periodically
+        let completed = self.wait_for_completion(&mut progress_callback, start_time);
 
         // Signal shutdown
         self.shutdown.store(true, Ordering::SeqCst);
@@ -195,6 +213,8 @@ impl WalkCoordinator {
                 self.queue.sender(),
                 self.entry_queue.sender(),
                 self.entry_queue.receiver(),
+                self.stat_queue.sender(),
+                self.stat_queue.receiver(),
                 writer_handle.clone(),
                 Arc::clone(&self.shutdown),
             )?;
@@ -207,7 +227,10 @@ impl WalkCoordinator {
     }
 
     /// Wait for the walk to complete or be interrupted
-    fn wait_for_completion(&self) -> bool {
+    fn wait_for_completion<F>(&self, progress_callback: &mut F, start_time: Instant) -> bool
+    where
+        F: FnMut(WalkProgress),
+    {
         let check_interval = Duration::from_millis(100);
         let stable_checks_required = 3; // Must be complete for 3 consecutive checks
         let mut stable_count = 0;
@@ -219,11 +242,29 @@ impl WalkCoordinator {
                 return false;
             }
 
-            // Check if both queues are complete (no pending work)
+            // Collect and report progress
+            let (dirs, files, bytes, errors, _skipped) = aggregate_stats(&self.workers);
+            let active_workers = self.queue.active_workers().load(Ordering::Relaxed);
+
+            let progress = WalkProgress {
+                dirs,
+                files,
+                bytes,
+                queue_size: self.queue.len(),
+                active_workers,
+                total_workers: self.config.worker_count,
+                errors,
+                elapsed: start_time.elapsed(),
+            };
+
+            progress_callback(progress);
+
+            // Check if all queues are complete (no pending work)
             let dir_queue_complete = self.queue.is_complete();
             let entry_queue_empty = self.entry_queue.is_empty();
+            let stat_queue_empty = self.stat_queue.is_empty();
 
-            if dir_queue_complete && entry_queue_empty {
+            if dir_queue_complete && entry_queue_empty && stat_queue_empty {
                 stable_count += 1;
                 if stable_count >= stable_checks_required {
                     return true;

@@ -50,9 +50,14 @@
 //! ```
 
 mod connection;
+pub mod async_stat;
 pub mod pool;
 pub mod types;
 
-pub use connection::{NfsConnection, NfsConnectionBuilder, NfsDirHandle};
+// Re-export ffi for async_stat module
+pub(crate) use connection::ffi;
+
+pub use async_stat::{AsyncStatEngine, AsyncStatStats, LiveProgress, StatResult as AsyncStatResult};
+pub use connection::{resolve_dns, NfsConnection, NfsConnectionBuilder, NfsDirHandle};
 pub use pool::{NfsConnectionPool, SyncNfsConnectionPool, StatResult};
 pub use types::{DbEntry, DirStats, EntryType, NfsDirEntry, NfsStat, Permissions};

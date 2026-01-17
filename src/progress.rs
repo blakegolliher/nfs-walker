@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Progress reporter that displays walk status
+#[derive(Clone)]
 pub struct ProgressReporter {
     /// Progress bar
     bar: ProgressBar,

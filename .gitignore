@@ -45,3 +45,4 @@ prompt.md
 *.db-wal
 *.db-journal
 docs/
+vendor/libnfs

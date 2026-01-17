@@ -10,9 +10,11 @@ use rusqlite::Connection;
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// SQL to create the main entries table
+/// Note: Using INTEGER PRIMARY KEY (without AUTOINCREMENT) for speed.
+/// This still auto-assigns IDs but without the sqlite_sequence overhead.
 const CREATE_ENTRIES_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS entries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER PRIMARY KEY,
     parent_id INTEGER,
     name TEXT NOT NULL,
     path TEXT NOT NULL,
@@ -26,9 +28,7 @@ CREATE TABLE IF NOT EXISTS entries (
     gid INTEGER,
     nlink INTEGER,
     inode INTEGER,
-    depth INTEGER NOT NULL,
-
-    FOREIGN KEY (parent_id) REFERENCES entries(id)
+    depth INTEGER NOT NULL
 )
 "#;
 
@@ -67,13 +67,14 @@ const CREATE_INDEXES: &[&str] = &[
 /// SQLite pragmas for optimal write performance
 const WRITE_PRAGMAS: &str = r#"
 PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA cache_size = -64000;      -- 64MB cache
+PRAGMA synchronous = OFF;
+PRAGMA cache_size = -128000;     -- 128MB cache
 PRAGMA temp_store = MEMORY;
-PRAGMA mmap_size = 268435456;    -- 256MB mmap
+PRAGMA mmap_size = 536870912;    -- 512MB mmap
 PRAGMA page_size = 4096;
 PRAGMA auto_vacuum = NONE;
 PRAGMA locking_mode = EXCLUSIVE;
+PRAGMA wal_autocheckpoint = 10000;
 "#;
 
 /// SQLite pragmas for read-optimized queries (applied after walk completes)
