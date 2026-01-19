@@ -99,8 +99,9 @@ impl WriterHandle {
     /// Request shutdown (waits for pending writes)
     pub fn shutdown(&self) -> DbResult<()> {
         self.shutdown.store(true, Ordering::SeqCst);
+        // Use send_timeout to avoid blocking forever if channel is full
         self.sender
-            .send(WriterMessage::Shutdown)
+            .send_timeout(WriterMessage::Shutdown, Duration::from_secs(5))
             .map_err(|_| DbError::ChannelClosed)
     }
 
@@ -153,13 +154,14 @@ impl BatchedWriter {
         schema::set_walk_info(&conn, keys::STATUS, "running")?;
 
         let stats_clone = Arc::clone(&stats);
+        let shutdown_clone = Arc::clone(&shutdown);
         let db_path_clone = db_path.to_path_buf();
 
         // Spawn writer thread
         let handle = thread::Builder::new()
             .name("db-writer".into())
             .spawn(move || {
-                writer_thread(conn, receiver, stats_clone, batch_size)
+                writer_thread(conn, receiver, stats_clone, batch_size, shutdown_clone)
             })
             .map_err(|e| DbError::CreateFailed {
                 path: db_path.to_path_buf(),
@@ -181,16 +183,48 @@ impl BatchedWriter {
     /// Wait for the writer to finish and finalize the database
     pub fn finish(mut self) -> DbResult<()> {
         // Request shutdown
+        tracing::info!("Writer: sending shutdown signal");
         let _ = self.writer_handle.shutdown();
 
-        // Wait for thread to finish
-        if let Some(handle) = self.handle.take() {
-            match handle.join() {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(DbError::Transaction("Writer thread panicked".into()));
+        // Wait for thread to finish with timeout
+        let thread_finished = if let Some(handle) = self.handle.take() {
+            // Use a polling approach with timeout
+            let start = std::time::Instant::now();
+            let timeout = Duration::from_secs(60);
+            tracing::info!("Writer: waiting for thread to finish (60s timeout)");
+
+            loop {
+                if handle.is_finished() {
+                    tracing::info!(elapsed_ms = start.elapsed().as_millis(), "Writer: thread finished");
+                    match handle.join() {
+                        Ok(result) => {
+                            if let Err(e) = result {
+                                tracing::warn!("Writer thread error: {}", e);
+                            }
+                        }
+                        Err(_) => {
+                            tracing::warn!("Writer thread panicked");
+                        }
+                    }
+                    break true;
                 }
+
+                if start.elapsed() > timeout {
+                    // Thread didn't finish in time - can't safely finalize
+                    tracing::warn!("Writer thread did not finish in time, skipping finalization");
+                    break false;
+                }
+
+                std::thread::sleep(Duration::from_millis(50));
             }
+        } else {
+            true
+        };
+
+        // Only finalize if the writer thread finished (released the db lock)
+        if !thread_finished {
+            tracing::warn!("Database may not be fully finalized - indexes not created");
+            return Ok(());
         }
 
         // Reopen database for finalization
@@ -220,6 +254,7 @@ fn writer_thread(
     receiver: Receiver<WriterMessage>,
     stats: Arc<WriterStats>,
     batch_size: usize,
+    shutdown: Arc<AtomicBool>,
 ) -> DbResult<()> {
     let mut entry_buffer: Vec<DbEntry> = Vec::with_capacity(batch_size);
     // DirStats now uses path (String) instead of entry_id
@@ -228,6 +263,25 @@ fn writer_thread(
     let mut path_to_id: HashMap<String, i64> = HashMap::new();
 
     loop {
+        // Check shutdown flag on EVERY iteration - this is critical for clean exit
+        // when async tasks are stuck in spawn_blocking and haven't dropped their handles
+        if shutdown.load(Ordering::Relaxed) {
+            // Shutdown requested - do final flush and exit immediately
+            tracing::info!(
+                buffered_entries = entry_buffer.len(),
+                buffered_dir_stats = dir_stats_buffer.len(),
+                "Writer thread: shutdown flag detected, flushing and exiting"
+            );
+            if !entry_buffer.is_empty() {
+                let _ = flush_entries(&conn, &mut entry_buffer, &mut path_to_id, &stats);
+            }
+            if !dir_stats_buffer.is_empty() {
+                let _ = flush_dir_stats(&conn, &mut dir_stats_buffer, &path_to_id, &stats);
+            }
+            tracing::info!("Writer thread: exiting");
+            break;
+        }
+
         // Try to receive without blocking first (drain queue)
         match receiver.try_recv() {
             Ok(msg) => {
@@ -276,7 +330,7 @@ fn writer_thread(
                     flush_entries(&conn, &mut entry_buffer, &mut path_to_id, &stats)?;
                 }
 
-                // Block waiting for next message
+                // Block waiting for next message (short timeout to check shutdown flag)
                 match receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(msg) => {
                         match msg {
@@ -309,7 +363,7 @@ fn writer_thread(
                         }
                     }
                     Err(_) => {
-                        // Timeout - continue loop
+                        // Timeout - continue loop to check shutdown flag
                     }
                 }
             }

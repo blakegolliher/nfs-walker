@@ -27,17 +27,17 @@ static NFS_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:nfs://)?([^:/]+)(:\d+)?(/[^\s]*)$").expect("Invalid NFS URL regex")
 });
 
-/// High-performance NFS filesystem walker with SQLite output
+/// Simple NFS filesystem walker with SQLite output
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "nfs-walker",
     version,
-    about = "High-performance NFS filesystem walker with SQLite output",
+    about = "Simple NFS filesystem walker with SQLite output",
     long_about = "Walks an NFS filesystem using direct libnfs access and outputs results to a SQLite database.\n\n\
-                  Designed for scanning billions of files with minimal memory footprint.",
+                  Uses READDIR for directory names and parallel GETATTR for file attributes.",
     after_help = "EXAMPLES:\n    \
         nfs-walker nfs://server/export -o scan.db\n    \
-        nfs-walker 192.168.1.100:/data -w 64 -p\n    \
+        nfs-walker 192.168.1.100:/data -w 8 -p\n    \
         nfs-walker nfs://cluster/share --exclude '.snapshot' --dirs-only"
 )]
 pub struct CliArgs {
@@ -49,7 +49,7 @@ pub struct CliArgs {
     #[arg(short, long, default_value = "walk.db", value_name = "FILE")]
     pub output: PathBuf,
 
-    /// Number of worker threads
+    /// Number of worker threads for parallel GETATTR
     #[arg(
         short = 'w',
         long,
@@ -63,7 +63,7 @@ pub struct CliArgs {
     pub queue_size: usize,
 
     /// SQLite batch insert size
-    #[arg(short = 'b', long, default_value = "10000", value_name = "NUM")]
+    #[arg(short = 'b', long, default_value = "1000", value_name = "NUM")]
     pub batch_size: usize,
 
     /// Maximum directory depth (unlimited if not set)
@@ -86,10 +86,6 @@ pub struct CliArgs {
     #[arg(long)]
     pub no_atime: bool,
 
-    /// Resume from existing database (not yet implemented)
-    #[arg(long, value_name = "DB")]
-    pub resume: Option<PathBuf>,
-
     /// Exclude paths matching pattern (can be repeated)
     #[arg(long = "exclude", value_name = "PATTERN", action = clap::ArgAction::Append)]
     pub exclude_patterns: Vec<String>,
@@ -101,39 +97,6 @@ pub struct CliArgs {
     /// Number of retry attempts for transient errors
     #[arg(long, default_value = "3", value_name = "NUM")]
     pub retries: u32,
-
-    /// Use async mode with connection pooling (faster for high-latency NFS)
-    #[arg(long)]
-    pub r#async: bool,
-
-    /// Number of NFS connections in pool (async mode only)
-    #[arg(long, default_value = "16", value_name = "NUM")]
-    pub connections: usize,
-
-    /// Output format: sqlite, parquet, or arrow
-    #[arg(long, default_value = "sqlite", value_name = "FORMAT")]
-    pub format: OutputFormat,
-
-    /// Disable skinny read optimization (use READDIRPLUS for all directories)
-    #[arg(long)]
-    pub no_skinny: bool,
-
-    /// High file count mode: optimized for directories with millions of files.
-    /// Uses names-only readdir + parallel stat. Does not recurse into subdirectories.
-    #[arg(long)]
-    pub hfc: bool,
-}
-
-/// Output format for scan results
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum OutputFormat {
-    /// SQLite database (default)
-    #[default]
-    Sqlite,
-    /// Apache Parquet columnar format
-    Parquet,
-    /// Apache Arrow IPC format
-    Arrow,
 }
 
 fn default_workers() -> usize {
@@ -330,21 +293,6 @@ pub struct WalkConfig {
 
     /// Retry count for transient errors
     pub retry_count: u32,
-
-    /// Use async mode
-    pub use_async: bool,
-
-    /// Number of connections in pool (async mode)
-    pub connection_count: usize,
-
-    /// Output format
-    pub output_format: OutputFormat,
-
-    /// Disable skinny read optimization
-    pub disable_skinny: bool,
-
-    /// High file count mode (no directory recursion)
-    pub hfc_mode: bool,
 }
 
 impl WalkConfig {
@@ -417,11 +365,6 @@ impl WalkConfig {
             exclude_patterns,
             timeout_secs: args.timeout,
             retry_count: args.retries,
-            use_async: args.r#async,
-            connection_count: args.connections,
-            output_format: args.format,
-            disable_skinny: args.no_skinny,
-            hfc_mode: args.hfc,
         })
     }
 
@@ -495,11 +438,6 @@ mod tests {
             exclude_patterns: vec![Regex::new(r"\.snapshot").unwrap()],
             timeout_secs: 30,
             retry_count: 3,
-            use_async: false,
-            connection_count: 16,
-            output_format: OutputFormat::Sqlite,
-            disable_skinny: false,
-            hfc_mode: false,
         };
 
         assert!(config.is_excluded("/data/.snapshot/hourly.0"));

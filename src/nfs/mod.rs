@@ -10,7 +10,7 @@
 //! │                    NfsConnection                     │
 //! │  - One per worker thread (not thread-safe)          │
 //! │  - RAII cleanup (unmount + destroy on drop)         │
-//! │  - Uses READDIRPLUS for efficient directory listing │
+//! │  - Uses READDIR for names, GETATTR for attributes   │
 //! └─────────────────────────────────────────────────────┘
 //!                          │
 //!                          ▼
@@ -40,24 +40,20 @@
 //!     .connect()
 //!     .unwrap();
 //!
-//! // Read a directory
-//! let entries = conn.readdir_plus("/data").unwrap();
-//! for entry in entries {
+//! // Read a directory (names only)
+//! let handle = conn.opendir_names_only("/data").unwrap();
+//! while let Some(entry) = handle.readdir() {
 //!     if !entry.is_special() {
-//!         println!("{}: {:?}", entry.name, entry.entry_type);
+//!         println!("{}", entry.name);
 //!     }
 //! }
 //! ```
 
-mod connection;
-pub mod async_stat;
-pub mod pool;
+pub mod connection;
+pub mod dns_resolver;
 pub mod types;
 
-// Re-export ffi for async_stat module
-pub(crate) use connection::ffi;
-
-pub use async_stat::{AsyncStatEngine, AsyncStatStats, LiveProgress, StatResult as AsyncStatResult};
 pub use connection::{resolve_dns, NfsConnection, NfsConnectionBuilder, NfsDirHandle};
-pub use pool::{NfsConnectionPool, SyncNfsConnectionPool, StatResult};
+pub use connection::ffi;
+pub use dns_resolver::{DnsResolver, DEFAULT_DNS_REFRESH_SECS};
 pub use types::{DbEntry, DirStats, EntryType, NfsDirEntry, NfsStat, Permissions};

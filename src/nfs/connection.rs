@@ -20,7 +20,7 @@ use std::time::Duration;
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
 #[allow(dead_code)]
-pub(crate) mod ffi {
+pub mod ffi {
     include!(concat!(env!("OUT_DIR"), "/nfs_bindings.rs"));
 }
 
@@ -567,7 +567,8 @@ impl NfsConnection {
     /// The returned pointer is only valid while this NfsConnection exists.
     /// The caller must not use this pointer after the connection is dropped.
     /// The caller must not call any functions that would invalidate the context.
-    pub(crate) unsafe fn raw_context(&self) -> *mut ffi::nfs_context {
+    #[allow(dead_code)]
+    pub unsafe fn raw_context(&self) -> *mut ffi::nfs_context {
         self.context
     }
 }

@@ -13,7 +13,7 @@ use crate::config::WalkConfig;
 use crate::db::WriterHandle;
 use crate::error::NfsResult;
 use crate::nfs::types::{DbEntry, EntryType};
-use crate::nfs::{resolve_dns, AsyncStatEngine, LiveProgress, NfsConnectionBuilder};
+use crate::nfs::{AsyncStatEngine, DnsResolver, LiveProgress, NfsConnectionBuilder};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -22,8 +22,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Maximum number of connections/workers for parallel async stat
-/// Each connection pipelines 128 concurrent requests
-const MAX_ASYNC_CONNECTIONS: usize = 128;
+/// Each connection pipelines 128 concurrent requests.
+/// Note: High values can cause segfaults due to libnfs resource limits.
+/// 32 workers * 128 in-flight = 4096 concurrent ops is a safe upper bound.
+const MAX_ASYNC_CONNECTIONS: usize = 32;
 
 /// Batch size for work-stealing queue
 /// Small enough to allow good load balancing, large enough to amortize overhead
@@ -75,27 +77,33 @@ impl Default for HfcProgress {
 pub struct FastWalker {
     config: Arc<WalkConfig>,
     shutdown: Arc<AtomicBool>,
-    /// Resolved IP addresses for DNS round-robin
-    resolved_ips: Vec<String>,
+    /// DNS resolver for load balancing across multiple IPs
+    dns_resolver: Arc<DnsResolver>,
     /// Live progress counters
     progress: HfcProgress,
 }
 
 impl FastWalker {
     pub fn new(config: WalkConfig) -> Self {
-        // Resolve DNS to get all IPs for load balancing
-        let resolved_ips = resolve_dns(&config.nfs_url.server);
+        let config = Arc::new(config);
+
+        // Create DNS resolver for load balancing
+        let dns_resolver = DnsResolver::new(
+            &config.nfs_url.server,
+            config.dns_refresh_secs,
+            !config.disable_dns_lb,
+        );
 
         info!(
             server = %config.nfs_url.server,
-            ips = ?resolved_ips,
-            "Resolved DNS for NFS server"
+            ips = ?dns_resolver.all_ips(),
+            "DNS resolver initialized for NFS server"
         );
 
         Self {
-            config: Arc::new(config),
+            config,
             shutdown: Arc::new(AtomicBool::new(false)),
-            resolved_ips,
+            dns_resolver,
             progress: HfcProgress::new(),
         }
     }
@@ -286,8 +294,9 @@ impl FastWalker {
         let config = Arc::clone(&self.config);
         let path_owned = path.to_string();
         let path_for_log = path.to_string();
-        // Use first resolved IP for name collection
-        let target_ip = self.resolved_ips[0].clone();
+        // Use worker ID 0 for name collection (any consistent ID works)
+        let target_ip = self.dns_resolver.get_ip_for_worker(0)
+            .unwrap_or_else(|| config.nfs_url.server.clone());
 
         debug!(path = %path, ip = %target_ip, "Collecting names with opendir_names_only");
         let start = Instant::now();
@@ -381,6 +390,7 @@ impl FastWalker {
         // Create batches for the work queue
         let num_batches = (total + WORK_BATCH_SIZE - 1) / WORK_BATCH_SIZE;
 
+        let all_ips = self.dns_resolver.all_ips();
         info!(
             parent = %parent_path,
             total_entries = total,
@@ -388,7 +398,7 @@ impl FastWalker {
             batches = num_batches,
             batch_size = WORK_BATCH_SIZE,
             pipeline_depth = 128,
-            ips = ?self.resolved_ips,
+            ips = ?all_ips,
             "Starting work-stealing stat phase"
         );
 
@@ -421,9 +431,11 @@ impl FastWalker {
             let dir_tx = dir_tx.cloned();
             let progress = self.progress.clone();
             let work_rx = work_rx.clone();
+            let shutdown = Arc::clone(&self.shutdown);
 
-            // Round-robin IP assignment across workers
-            let ip = self.resolved_ips[worker_id % self.resolved_ips.len()].clone();
+            // Get IP assignment from DNS resolver
+            let ip = self.dns_resolver.get_ip_for_worker(worker_id)
+                .unwrap_or_else(|| config.nfs_url.server.clone());
 
             // Clone stats counters for this worker
             let w_processed = Arc::clone(&stats_processed);
@@ -442,7 +454,8 @@ impl FastWalker {
                 work_stealing_stat_worker(
                     config, parent, work_rx, writer, depth, dir_tx,
                     worker_id, ip, progress,
-                    w_processed, w_files, w_dirs, w_bytes, w_errors
+                    w_processed, w_files, w_dirs, w_bytes, w_errors,
+                    shutdown
                 )
             });
 
@@ -521,8 +534,15 @@ fn work_stealing_stat_worker(
     stats_dirs: Arc<AtomicU64>,
     stats_bytes: Arc<AtomicU64>,
     stats_errors: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
 ) -> NfsResult<usize> {
     let start = Instant::now();
+
+    // Check shutdown before connecting
+    if shutdown.load(Ordering::Relaxed) {
+        debug!(worker = worker_id, "Shutdown requested before connecting");
+        return Ok(0);
+    }
 
     // Create NFS connection to specific IP (reused for all batches)
     let nfs = NfsConnectionBuilder::new(config.nfs_url.clone())
@@ -549,8 +569,13 @@ fn work_stealing_stat_worker(
     let mut batches_processed = 0;
     let mut total_entries = 0u64;
 
-    // Process batches until queue is exhausted
+    // Process batches until queue is exhausted or shutdown requested
     while let Ok(names) = work_rx.recv() {
+        // Check shutdown at the start of each batch
+        if shutdown.load(Ordering::Relaxed) {
+            debug!(worker = worker_id, "Shutdown requested, exiting worker loop");
+            break;
+        }
         let batch_size = names.len();
 
         // Run async stat engine on this batch

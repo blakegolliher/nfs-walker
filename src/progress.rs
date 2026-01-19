@@ -2,7 +2,6 @@
 //!
 //! Provides real-time progress display using indicatif progress bars.
 
-use crate::walker::WalkProgress;
 use console::style;
 use humansize::{format_size, BINARY};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -38,25 +37,6 @@ impl ProgressReporter {
             bar,
             stop: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    /// Update the progress display
-    pub fn update(&self, progress: &WalkProgress) {
-        let bytes_str = format_size(progress.bytes, BINARY);
-        let rate = progress.files_per_second();
-
-        let msg = format!(
-            "Dirs: {} | Files: {} | Size: {} | Rate: {:.0}/s | Queue: {} | Workers: {}/{}",
-            format_number(progress.dirs),
-            format_number(progress.files),
-            bytes_str,
-            rate,
-            progress.queue_size,
-            progress.active_workers,
-            progress.total_workers,
-        );
-
-        self.bar.set_message(msg);
     }
 
     /// Set a status message

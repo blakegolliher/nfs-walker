@@ -11,6 +11,7 @@ use crate::config::WalkConfig;
 use crate::db::BatchedWriter;
 use crate::error::{Result, WalkerError, WorkerError};
 use crate::nfs::types::DbEntry;
+use crate::nfs::DnsResolver;
 use crate::walker::queue::{EntryQueue, StatQueue, WorkQueue};
 use crate::walker::worker::{aggregate_stats, Worker};
 use chrono::{DateTime, Utc};
@@ -73,12 +74,22 @@ pub struct WalkCoordinator {
 
     /// Walk start time
     start_time: Option<Instant>,
+
+    /// DNS resolver for load balancing across multiple IPs
+    dns_resolver: Arc<DnsResolver>,
 }
 
 impl WalkCoordinator {
     /// Create a new walk coordinator
     pub fn new(config: WalkConfig) -> Result<Self> {
         let config = Arc::new(config);
+
+        // Create DNS resolver for load balancing
+        let dns_resolver = DnsResolver::new(
+            &config.nfs_url.server,
+            config.dns_refresh_secs,
+            !config.disable_dns_lb,
+        );
 
         // Create work queue for directory tasks
         let queue = WorkQueue::new(config.queue_size);
@@ -110,6 +121,7 @@ impl WalkCoordinator {
             workers: Vec::new(),
             shutdown,
             start_time: None,
+            dns_resolver,
         })
     }
 
@@ -217,6 +229,7 @@ impl WalkCoordinator {
                 self.stat_queue.receiver(),
                 writer_handle.clone(),
                 Arc::clone(&self.shutdown),
+                Arc::clone(&self.dns_resolver),
             )?;
 
             self.workers.push(worker);
