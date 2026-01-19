@@ -61,12 +61,38 @@ impl NfsConnection {
             ));
         }
 
+        // Force NFSv3 - we don't support NFSv4
+        // NFS_V3 = 3, NFS_V4 = 4 (from libnfs-raw-nfs.h)
+        unsafe {
+            ffi::nfs_set_version(context, 3);
+        }
+
+        // Set uid/gid to current user for proper NFS auth
+        unsafe {
+            let uid = libc::getuid() as i32;
+            let gid = libc::getgid() as i32;
+            ffi::nfs_set_uid(context, uid);
+            ffi::nfs_set_gid(context, gid);
+        }
+
         Ok(Self {
             context,
             server: url.server.clone(),
             export: url.export.clone(),
             mounted: false,
         })
+    }
+
+    /// Set READDIR buffer size before connecting
+    ///
+    /// Must be called before `connect()`. Larger buffers reduce RPC round-trips
+    /// for directory listings. Default is 8KB, max is 4MB.
+    ///
+    /// Note: Some servers may not handle large buffers well. Test with your server.
+    pub fn set_readdir_buffer_size(&self, size: u32) {
+        unsafe {
+            ffi::nfs_set_readdir_max_buffer_size(self.context, size, size);
+        }
     }
 
     /// Connect and mount the NFS export
@@ -667,9 +693,23 @@ impl NfsDirHandle {
     /// Get the cookie verifier from the last READDIR response
     ///
     /// This is required for streaming with `opendir_names_only_at_cookie()`.
-    /// Pass this verifier along with the last entry's cookie to resume reading.
+    /// Pass this verifier along with the continuation cookie to resume reading.
     pub fn get_cookieverf(&self) -> u64 {
         unsafe { ffi::nfs_readdir_get_cookieverf(self.handle) }
+    }
+
+    /// Get the continuation cookie for streaming READDIR
+    ///
+    /// This returns the cookie of the LAST entry received from the server.
+    /// IMPORTANT: Use this value (not the last-iterated entry's cookie) when calling
+    /// `opendir_names_only_at_cookie()` for the next batch. The entries linked list
+    /// is in reverse order, so iterating through entries and taking the last cookie
+    /// would give you the first entry's cookie, causing re-reads.
+    ///
+    /// NOTE: This is the last entry's cookie, NOT max cookie. With hash-based
+    /// cookies (like VAST), max cookie != last entry and would cause re-reads.
+    pub fn get_continuation_cookie(&self) -> u64 {
+        unsafe { ffi::nfs_readdir_get_continuation_cookie(self.handle) }
     }
 
     /// Check if end-of-directory was reached in the last READDIR response
@@ -735,6 +775,9 @@ pub struct NfsConnectionBuilder {
     retries: u32,
     /// Override server with specific IP (for DNS round-robin)
     override_ip: Option<String>,
+    /// READDIR buffer size in bytes (default: 8KB, max: 4MB)
+    /// Larger buffers reduce RPC round-trips for directory listings.
+    readdir_buffer_size: Option<u32>,
 }
 
 impl NfsConnectionBuilder {
@@ -745,6 +788,7 @@ impl NfsConnectionBuilder {
             timeout: Duration::from_secs(30),
             retries: 3,
             override_ip: None,
+            readdir_buffer_size: None,
         }
     }
 
@@ -764,6 +808,16 @@ impl NfsConnectionBuilder {
     /// Set retry count
     pub fn retries(mut self, retries: u32) -> Self {
         self.retries = retries;
+        self
+    }
+
+    /// Set READDIR buffer size in bytes
+    ///
+    /// Larger buffers reduce RPC round-trips for directory listings.
+    /// Default is 8KB, max is 4MB. Values are rounded to 4KB boundaries.
+    /// For large directories, 1MB is a good choice.
+    pub fn readdir_buffer_size(mut self, size: u32) -> Self {
+        self.readdir_buffer_size = Some(size);
         self
     }
 
@@ -790,8 +844,21 @@ impl NfsConnectionBuilder {
                 std::thread::sleep(delay);
             }
 
-            match NfsConnection::connect_to(&url, self.timeout) {
-                Ok(conn) => return Ok(conn),
+            // Create connection, apply settings, then connect
+            match NfsConnection::new(&url) {
+                Ok(mut conn) => {
+                    // Apply readdir buffer size if configured
+                    if let Some(size) = self.readdir_buffer_size {
+                        conn.set_readdir_buffer_size(size);
+                    }
+
+                    match conn.connect(self.timeout) {
+                        Ok(()) => return Ok(conn),
+                        Err(e) => {
+                            last_error = Some(e);
+                        }
+                    }
+                }
                 Err(e) => {
                     last_error = Some(e);
                 }

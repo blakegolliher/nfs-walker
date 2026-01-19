@@ -97,6 +97,11 @@ pub struct CliArgs {
     /// Number of retry attempts for transient errors
     #[arg(long, default_value = "3", value_name = "NUM")]
     pub retries: u32,
+
+    /// High file count mode: uses READDIR + pipelined async GETATTR
+    /// Optimized for directories with millions of files
+    #[arg(long)]
+    pub hfc: bool,
 }
 
 fn default_workers() -> usize {
@@ -293,6 +298,9 @@ pub struct WalkConfig {
 
     /// Retry count for transient errors
     pub retry_count: u32,
+
+    /// High file count mode (READDIR + pipelined GETATTR)
+    pub hfc_mode: bool,
 }
 
 impl WalkConfig {
@@ -365,6 +373,7 @@ impl WalkConfig {
             exclude_patterns,
             timeout_secs: args.timeout,
             retry_count: args.retries,
+            hfc_mode: args.hfc,
         })
     }
 
@@ -438,6 +447,7 @@ mod tests {
             exclude_patterns: vec![Regex::new(r"\.snapshot").unwrap()],
             timeout_secs: 30,
             retry_count: 3,
+            hfc_mode: false,
         };
 
         assert!(config.is_excluded("/data/.snapshot/hourly.0"));

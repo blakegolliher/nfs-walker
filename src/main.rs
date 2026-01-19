@@ -7,7 +7,7 @@ use clap::Parser;
 use humansize::{format_size, BINARY};
 use nfs_walker::config::{CliArgs, WalkConfig};
 use nfs_walker::progress::{print_header, print_summary, ProgressReporter};
-use nfs_walker::walker::SimpleWalker;
+use nfs_walker::walker::{AsyncWalker, SimpleWalker, WalkStats};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -38,77 +38,30 @@ fn run() -> Result<()> {
 
     // Print header
     if config.show_progress {
+        let mode = if config.hfc_mode { "HFC" } else { "Standard" };
         print_header(
             &config.nfs_url.to_display_string(),
             config.worker_count,
             &config.output_path.display().to_string(),
         );
+        eprintln!("Mode: {} ({})", mode,
+            if config.hfc_mode { "READDIR + pipelined GETATTR" } else { "READDIRPLUS" });
     }
 
-    // Create walker
-    let walker = SimpleWalker::new(config.clone());
+    // Save output path before moving config
+    let output_path = config.output_path.clone();
 
-    // Setup signal handler for graceful shutdown
-    let shutdown_flag = walker.shutdown_flag();
-    let ctrl_c_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let ctrl_c_count_handler = Arc::clone(&ctrl_c_count);
-    ctrlc::set_handler(move || {
-        let count = ctrl_c_count_handler.fetch_add(1, Ordering::SeqCst);
-        if count == 0 {
-            eprintln!("\nInterrupt received, shutting down gracefully...");
-            eprintln!("Press Ctrl+C again to force exit immediately.");
-            shutdown_flag.store(true, Ordering::SeqCst);
-        } else {
-            eprintln!("\nForced exit!");
-            std::process::exit(130);
-        }
-    })
-    .context("Failed to set signal handler")?;
-
-    // Create progress reporter
-    let progress = if config.show_progress {
-        Some(ProgressReporter::new())
+    // Run with appropriate walker based on mode
+    let result = if config.hfc_mode {
+        run_async_walker(config)?
     } else {
-        None
+        run_simple_walker(config)?
     };
 
-    if let Some(ref p) = progress {
-        p.set_status("Connecting to NFS server...");
-    }
-
-    // Run the walk with progress updates
-    let result = if let Some(ref p) = progress {
-        let p_clone = p.clone();
-        walker.run_with_progress(move |prog| {
-            let bytes_str = format_size(prog.bytes, BINARY);
-            let rate = prog.files_per_second();
-            let msg = format!(
-                "Dirs: {} | Files: {} | Size: {} | Rate: {:.0}/s | Errors: {}",
-                format_number(prog.dirs),
-                format_number(prog.files),
-                bytes_str,
-                rate,
-                prog.errors,
-            );
-            p_clone.set_status(&msg);
-        })
-        .context("Walk failed")?
-    } else {
-        walker.run()
-            .context("Walk failed")?
-    };
-
-    // Finish progress
-    if let Some(ref p) = progress {
-        if result.completed {
-            p.finish("Walk completed");
-        } else {
-            p.finish("Walk interrupted");
-        }
-    }
+    // Finish progress handled inside run_*_walker functions
 
     // Get database file size
-    let db_size = std::fs::metadata(&config.output_path)
+    let db_size = std::fs::metadata(&output_path)
         .map(|m| m.len())
         .ok();
 
@@ -119,7 +72,7 @@ fn run() -> Result<()> {
         result.bytes,
         result.errors,
         result.duration,
-        &config.output_path.display().to_string(),
+        &output_path.display().to_string(),
         db_size,
     );
 
@@ -142,6 +95,128 @@ fn setup_logging(verbose: bool) -> Result<()> {
         .init();
 
     Ok(())
+}
+
+fn run_simple_walker(config: WalkConfig) -> Result<WalkStats> {
+    let walker = SimpleWalker::new(config.clone());
+
+    // Setup signal handler
+    let shutdown_flag = walker.shutdown_flag();
+    let ctrl_c_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let ctrl_c_count_handler = Arc::clone(&ctrl_c_count);
+    ctrlc::set_handler(move || {
+        let count = ctrl_c_count_handler.fetch_add(1, Ordering::SeqCst);
+        if count == 0 {
+            eprintln!("\nInterrupt received, shutting down gracefully...");
+            eprintln!("Press Ctrl+C again to force exit immediately.");
+            shutdown_flag.store(true, Ordering::SeqCst);
+        } else {
+            eprintln!("\nForced exit!");
+            std::process::exit(130);
+        }
+    })
+    .context("Failed to set signal handler")?;
+
+    let progress = if config.show_progress {
+        Some(ProgressReporter::new())
+    } else {
+        None
+    };
+
+    if let Some(ref p) = progress {
+        p.set_status("Connecting to NFS server...");
+    }
+
+    let result = if let Some(ref p) = progress {
+        let p_clone = p.clone();
+        walker.run_with_progress(move |prog| {
+            let bytes_str = format_size(prog.bytes, BINARY);
+            let rate = prog.files_per_second();
+            let msg = format!(
+                "Dirs: {} | Files: {} | Size: {} | Rate: {:.0}/s | Errors: {}",
+                format_number(prog.dirs),
+                format_number(prog.files),
+                bytes_str,
+                rate,
+                prog.errors,
+            );
+            p_clone.set_status(&msg);
+        })
+        .context("Walk failed")?
+    } else {
+        walker.run().context("Walk failed")?
+    };
+
+    if let Some(ref p) = progress {
+        if result.completed {
+            p.finish("Walk completed");
+        } else {
+            p.finish("Walk interrupted");
+        }
+    }
+
+    Ok(result)
+}
+
+fn run_async_walker(config: WalkConfig) -> Result<WalkStats> {
+    let walker = AsyncWalker::new(config.clone());
+
+    // Setup signal handler
+    let shutdown_flag = walker.shutdown_flag();
+    let ctrl_c_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let ctrl_c_count_handler = Arc::clone(&ctrl_c_count);
+    ctrlc::set_handler(move || {
+        let count = ctrl_c_count_handler.fetch_add(1, Ordering::SeqCst);
+        if count == 0 {
+            eprintln!("\nInterrupt received, shutting down gracefully...");
+            eprintln!("Press Ctrl+C again to force exit immediately.");
+            shutdown_flag.store(true, Ordering::SeqCst);
+        } else {
+            eprintln!("\nForced exit!");
+            std::process::exit(130);
+        }
+    })
+    .context("Failed to set signal handler")?;
+
+    let progress = if config.show_progress {
+        Some(ProgressReporter::new())
+    } else {
+        None
+    };
+
+    if let Some(ref p) = progress {
+        p.set_status("Connecting to NFS server (HFC mode)...");
+    }
+
+    let result = if let Some(ref p) = progress {
+        let p_clone = p.clone();
+        walker.run_with_progress(move |prog| {
+            let bytes_str = format_size(prog.bytes, BINARY);
+            let rate = prog.files_per_second();
+            let msg = format!(
+                "Dirs: {} | Files: {} | Size: {} | Rate: {:.0}/s | Errors: {}",
+                format_number(prog.dirs),
+                format_number(prog.files),
+                bytes_str,
+                rate,
+                prog.errors,
+            );
+            p_clone.set_status(&msg);
+        })
+        .context("Walk failed")?
+    } else {
+        walker.run().context("Walk failed")?
+    };
+
+    if let Some(ref p) = progress {
+        if result.completed {
+            p.finish("Walk completed (HFC)");
+        } else {
+            p.finish("Walk interrupted");
+        }
+    }
+
+    Ok(result)
 }
 
 /// Format a number with thousands separators

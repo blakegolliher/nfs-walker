@@ -57,4 +57,4 @@ pub mod walker;
 
 pub use config::{CliArgs, NfsUrl, WalkConfig};
 pub use error::{Result, WalkerError};
-pub use walker::{SimpleWalker, WalkProgress, WalkStats};
+pub use walker::{AsyncWalker, SimpleWalker, WalkProgress, WalkStats};

@@ -21,6 +21,7 @@ use crate::db::schema::{create_database, create_indexes, keys, optimize_for_read
 use crate::error::{NfsError, NfsResult, Result, WalkerError};
 use crate::nfs::{NfsConnection, NfsConnectionBuilder};
 use crate::nfs::types::{DbEntry, EntryType, NfsStat};
+use super::simple::{WalkStats, WalkProgress};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
 use rusqlite::{params, Connection};
@@ -36,49 +37,26 @@ use tracing::{debug, error, info, warn};
 use crate::nfs::ffi;
 
 /// Maximum concurrent in-flight stat requests per connection
-const MAX_IN_FLIGHT: usize = 128;
+const MAX_IN_FLIGHT: usize = 512;
 
-/// Directory work item
+/// Work item - either a directory to scan or a chunk of names to stat
 #[derive(Debug, Clone)]
-struct DirWork {
-    path: String,
-    depth: u32,
+enum WorkItem {
+    /// Directory to READDIR
+    Directory { path: String, depth: u32 },
+    /// Chunk of names to GETATTR (parent_path, names, depth)
+    NameChunk { parent_path: String, names: Vec<String>, depth: u32 },
 }
 
-/// Result from walk operation
-#[derive(Debug, Clone, Default)]
-pub struct WalkStats {
-    pub dirs: u64,
-    pub files: u64,
-    pub bytes: u64,
-    pub errors: u64,
-    pub duration: Duration,
-    pub completed: bool,
-}
+/// Batch size for streaming READDIR (dispatch chunks as they arrive)
+/// Smaller = faster dispatch to workers, more overlap with GETATTR
+/// 10K entries ≈ 66 RPCs at 8KB buffer, dispatches every ~0.5s
+const READDIR_STREAM_BATCH: u32 = 10_000;
 
-/// Progress information for display
-#[derive(Debug, Clone, Default)]
-pub struct WalkProgress {
-    pub dirs: u64,
-    pub files: u64,
-    pub bytes: u64,
-    pub errors: u64,
-    pub queue_size: usize,
-    pub active_workers: usize,
-    pub total_workers: usize,
-    pub elapsed: Duration,
-}
+/// READDIR RPC buffer size in bytes
+/// Note: Larger values (32KB+) caused hangs with some servers. Stick with default.
+const READDIR_BUFFER_SIZE: u32 = 8192; // 8KB default
 
-impl WalkProgress {
-    pub fn files_per_second(&self) -> f64 {
-        let secs = self.elapsed.as_secs_f64();
-        if secs > 0.0 {
-            (self.files + self.dirs) as f64 / secs
-        } else {
-            0.0
-        }
-    }
-}
 
 /// Async walker using READDIR + pipelined GETATTR
 pub struct AsyncWalker {
@@ -132,20 +110,20 @@ impl AsyncWalker {
         let writer_handle = self.spawn_writer(db, entry_rx);
 
         // Work-stealing deque
-        let injector: Arc<Injector<DirWork>> = Arc::new(Injector::new());
+        let injector: Arc<Injector<WorkItem>> = Arc::new(Injector::new());
         let active_workers = Arc::new(AtomicUsize::new(0));
         let pending_work = Arc::new(AtomicU64::new(1));
 
         // Push root
         let start_path = self.config.nfs_url.walk_start_path();
-        injector.push(DirWork {
+        injector.push(WorkItem::Directory {
             path: start_path.clone(),
             depth: 0,
         });
 
         // Create worker queues
-        let mut workers_local: Vec<DequeWorker<DirWork>> = Vec::new();
-        let mut stealers: Vec<Stealer<DirWork>> = Vec::new();
+        let mut workers_local: Vec<DequeWorker<WorkItem>> = Vec::new();
+        let mut stealers: Vec<Stealer<WorkItem>> = Vec::new();
 
         for _ in 0..self.config.worker_count {
             let w = DequeWorker::new_fifo();
@@ -314,6 +292,7 @@ impl AsyncWalker {
         NfsConnectionBuilder::new(self.config.nfs_url.clone())
             .timeout(timeout)
             .retries(self.config.retry_count)
+            // Note: Don't set readdir_buffer_size - causes hangs with some servers
             .connect()
             .map_err(|e| WalkerError::Nfs(e))
     }
@@ -336,7 +315,7 @@ struct StatResult {
     error: Option<String>,
 }
 
-/// Context for async stat callback
+/// Context for async stat callback - uses indexed results like the proven working implementation
 struct CallbackContext {
     index: usize,
     results_ptr: *mut Vec<StatResult>,
@@ -346,9 +325,10 @@ struct CallbackContext {
 unsafe impl Send for CallbackContext {}
 
 /// Async stat engine that pipelines GETATTR operations
+/// Uses pre-allocated indexed Vec (proven working pattern from previous/async_stat.rs)
 struct AsyncStatEngine {
     nfs: *mut ffi::nfs_context,
-    pending: VecDeque<(String, String)>,
+    pending: VecDeque<(String, String)>,  // (name, full_path)
     in_flight: usize,
     completed: Arc<AtomicU64>,
     results: Vec<StatResult>,
@@ -367,6 +347,7 @@ impl AsyncStatEngine {
         }
     }
 
+    /// Add paths to stat - must be called before run()
     fn add_paths(&mut self, names: Vec<String>, parent_path: &str) {
         for name in names {
             let full_path = if parent_path == "/" {
@@ -378,7 +359,9 @@ impl AsyncStatEngine {
         }
         self.total = self.pending.len();
 
-        // Pre-allocate results
+        // CRITICAL: Pre-allocate results to exact size to prevent reallocation.
+        // The callback contexts store raw pointers to self.results, so if the Vec
+        // reallocates during fire_requests(), those pointers become dangling.
         self.results = Vec::with_capacity(self.total);
         for (name, path) in self.pending.iter() {
             self.results.push(StatResult {
@@ -390,14 +373,16 @@ impl AsyncStatEngine {
         }
     }
 
+    /// Run all stats and return results
     fn run(&mut self) -> NfsResult<Vec<StatResult>> {
-        // Fire initial batch
+        // Fire initial batch of requests
         self.fire_requests()?;
 
         // Poll loop
         while self.in_flight > 0 || !self.pending.is_empty() {
             self.poll_and_service()?;
 
+            // Fire more requests if we have capacity
             if self.in_flight < MAX_IN_FLIGHT && !self.pending.is_empty() {
                 self.fire_requests()?;
             }
@@ -408,6 +393,7 @@ impl AsyncStatEngine {
 
     fn fire_requests(&mut self) -> NfsResult<()> {
         while self.in_flight < MAX_IN_FLIGHT {
+            // Calculate index BEFORE popping - this is the index into pre-allocated results
             let result_index = self.total - self.pending.len();
 
             let (_name, path) = match self.pending.pop_front() {
@@ -420,6 +406,7 @@ impl AsyncStatEngine {
                 reason: "Path contains null bytes".to_string(),
             })?;
 
+            // Create callback context with index into pre-allocated results
             let ctx = Box::new(CallbackContext {
                 index: result_index,
                 results_ptr: &mut self.results as *mut Vec<StatResult>,
@@ -436,6 +423,7 @@ impl AsyncStatEngine {
             };
 
             if ret != 0 {
+                // Mark as error in pre-allocated results slot
                 if let Some(result) = self.results.get_mut(result_index) {
                     result.error = Some("Failed to start async stat".to_string());
                 }
@@ -458,7 +446,7 @@ impl AsyncStatEngine {
             revents: 0,
         };
 
-        let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
+        let ret = unsafe { libc::poll(&mut pfd, 1, 1) };
 
         if ret < 0 {
             return Err(NfsError::Protocol {
@@ -479,6 +467,7 @@ impl AsyncStatEngine {
                 });
             }
 
+            // Update in_flight count based on completions
             let new_completed = self.completed.load(Ordering::Relaxed);
             let just_completed = (new_completed - old_completed) as usize;
             self.in_flight = self.in_flight.saturating_sub(just_completed);
@@ -536,13 +525,13 @@ unsafe extern "C" fn stat_callback(
     ctx.completed.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Worker loop using async pipelined GETATTR
+/// Worker loop using pipelined GETATTR after READDIR completes
 fn async_worker_loop(
     id: usize,
     nfs: NfsConnection,
-    local: DequeWorker<DirWork>,
-    injector: Arc<Injector<DirWork>>,
-    stealers: Arc<Vec<Stealer<DirWork>>>,
+    local: DequeWorker<WorkItem>,
+    injector: Arc<Injector<WorkItem>>,
+    stealers: Arc<Vec<Stealer<WorkItem>>>,
     entry_tx: Sender<Vec<DbEntry>>,
     shutdown: Arc<AtomicBool>,
     dirs_count: Arc<AtomicU64>,
@@ -565,7 +554,7 @@ fn async_worker_loop(
             break;
         }
 
-        // Get work
+        // Get work from local queue, injector, or steal from others
         let work = local.pop().or_else(|| {
             loop {
                 match injector.steal() {
@@ -610,158 +599,341 @@ fn async_worker_loop(
             }
         };
 
-        // Check depth
-        if let Some(max) = max_depth {
-            if work.depth > max as u32 {
-                pending_work.fetch_sub(1, Ordering::SeqCst);
-                active_workers.fetch_sub(1, Ordering::Relaxed);
-                continue;
+        match work {
+            WorkItem::Directory { path, depth } => {
+                process_directory(
+                    id, &nfs, &path, depth, max_depth, dirs_only,
+                    &local, &injector, &entry_tx, &mut batch,
+                    &dirs_count, &files_count, &bytes_count, &errors_count,
+                    &pending_work, &active_workers,
+                );
+            }
+            WorkItem::NameChunk { parent_path, names, depth } => {
+                process_name_chunk(
+                    id, &nfs, &parent_path, names, depth, dirs_only,
+                    &local, &entry_tx, &mut batch,
+                    &dirs_count, &files_count, &bytes_count, &errors_count,
+                    &pending_work, &active_workers,
+                );
             }
         }
-
-        debug!("Worker {} READDIR: {}", id, work.path);
-
-        // Phase 1: Fast READDIR to get names only
-        let names: Vec<String> = match nfs.opendir_names_only(&work.path) {
-            Ok(handle) => {
-                let mut names = Vec::new();
-                while let Some(entry) = handle.readdir() {
-                    if !entry.is_special() {
-                        names.push(entry.name);
-                    }
-                }
-                names
-            }
-            Err(e) => {
-                errors_count.fetch_add(1, Ordering::Relaxed);
-                // Not found errors are common on active filesystems (race condition)
-                if e.to_string().contains("not found") || e.to_string().contains("No such file") {
-                    debug!("Worker {} READDIR not found: {}", id, work.path);
-                } else {
-                    warn!("Worker {} READDIR failed: {} -> {}", id, work.path, e);
-                }
-                pending_work.fetch_sub(1, Ordering::SeqCst);
-                active_workers.fetch_sub(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-
-        let name_count = names.len();
-        debug!("Worker {} READDIR complete: {} -> {} names", id, work.path, name_count);
-
-        if names.is_empty() {
-            dirs_count.fetch_add(1, Ordering::Relaxed);
-            pending_work.fetch_sub(1, Ordering::SeqCst);
-            active_workers.fetch_sub(1, Ordering::Relaxed);
-            continue;
-        }
-
-        // Phase 2: Async pipelined GETATTR
-        let raw_ctx = unsafe { nfs.raw_context() };
-        let mut engine = unsafe { AsyncStatEngine::new(raw_ctx) };
-        engine.add_paths(names, &work.path);
-
-        let results = match engine.run() {
-            Ok(r) => r,
-            Err(e) => {
-                errors_count.fetch_add(1, Ordering::Relaxed);
-                if e.to_string().contains("not found") || e.to_string().contains("No such file") {
-                    debug!("Worker {} async stat not found: {}", id, work.path);
-                } else {
-                    warn!("Worker {} async stat failed: {} -> {}", id, work.path, e);
-                }
-                pending_work.fetch_sub(1, Ordering::SeqCst);
-                active_workers.fetch_sub(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-
-        // Process results
-        let mut subdir_count = 0u64;
-        let mut file_count = 0u64;
-        let mut byte_count = 0u64;
-        let mut error_count = 0u64;
-
-        for result in results {
-            if let Some(ref err) = result.error {
-                error_count += 1;
-                debug!("Worker {} stat error: {} -> {}", id, result.path, err);
-                continue;
-            }
-
-            let stat = match result.stat {
-                Some(s) => s,
-                None => {
-                    error_count += 1;
-                    continue;
-                }
-            };
-
-            let entry_type = stat.entry_type();
-            let is_dir = entry_type == EntryType::Directory;
-
-            if dirs_only && !is_dir {
-                continue;
-            }
-
-            let db_entry = DbEntry {
-                parent_path: Some(work.path.clone()),
-                name: result.name,
-                path: result.path.clone(),
-                entry_type,
-                size: stat.size,
-                mtime: stat.mtime,
-                atime: stat.atime,
-                ctime: stat.ctime,
-                mode: Some(stat.mode),
-                uid: Some(stat.uid),
-                gid: Some(stat.gid),
-                nlink: Some(stat.nlink as u64),
-                inode: stat.inode,
-                depth: work.depth + 1,
-            };
-
-            batch.push(db_entry);
-
-            if is_dir {
-                subdir_count += 1;
-                pending_work.fetch_add(1, Ordering::SeqCst);
-                local.push(DirWork {
-                    path: result.path,
-                    depth: work.depth + 1,
-                });
-            } else {
-                file_count += 1;
-                byte_count += stat.size;
-            }
-
-            if batch.len() >= 1000 {
-                if entry_tx.send(std::mem::replace(&mut batch, Vec::with_capacity(1000))).is_err() {
-                    break;
-                }
-            }
-        }
-
-        dirs_count.fetch_add(1, Ordering::Relaxed);
-        files_count.fetch_add(file_count, Ordering::Relaxed);
-        bytes_count.fetch_add(byte_count, Ordering::Relaxed);
-        errors_count.fetch_add(error_count, Ordering::Relaxed);
-
-        debug!(
-            "Worker {} complete: {} -> {} entries ({} dirs, {} files, {} errors)",
-            id, work.path, name_count, subdir_count, file_count, error_count
-        );
-
-        pending_work.fetch_sub(1, Ordering::SeqCst);
-        active_workers.fetch_sub(1, Ordering::Relaxed);
     }
 
+    // Send any remaining entries
     if !batch.is_empty() {
         let _ = entry_tx.send(batch);
     }
 
     debug!("Async worker {} finished", id);
 }
+
+/// Process a directory: Streaming READDIR with concurrent GETATTR dispatch
+///
+/// Uses streaming batched READDIR to overlap directory listing with GETATTR processing:
+/// 1. Read first batch of names (READDIR_STREAM_BATCH entries)
+/// 2. Dispatch batch to workers for GETATTR while reading next batch
+/// 3. Repeat until EOF
+///
+/// This overlaps READDIR I/O with GETATTR processing for better throughput on large directories.
+fn process_directory(
+    id: usize,
+    nfs: &NfsConnection,
+    path: &str,
+    depth: u32,
+    max_depth: Option<usize>,
+    dirs_only: bool,
+    local: &DequeWorker<WorkItem>,
+    injector: &Arc<Injector<WorkItem>>,
+    entry_tx: &Sender<Vec<DbEntry>>,
+    batch: &mut Vec<DbEntry>,
+    dirs_count: &Arc<AtomicU64>,
+    files_count: &Arc<AtomicU64>,
+    bytes_count: &Arc<AtomicU64>,
+    errors_count: &Arc<AtomicU64>,
+    pending_work: &Arc<AtomicU64>,
+    active_workers: &Arc<AtomicUsize>,
+) {
+    // Check depth limit
+    if let Some(max) = max_depth {
+        if depth > max as u32 {
+            pending_work.fetch_sub(1, Ordering::SeqCst);
+            active_workers.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    info!("Worker {} processing dir (streaming): {}", id, path);
+
+    let readdir_start = Instant::now();
+    let mut cookie: u64 = 0;
+    let mut cookieverf: u64 = 0;
+    let mut total_names: usize = 0;
+    let mut batch_num: usize = 0;
+    let mut first_chunk_for_self: Option<Vec<String>> = None;
+
+    // Streaming READDIR loop - dispatch batches as they arrive
+    loop {
+        info!("Worker {} READDIR RPC: path={} cookie={} verf={} max={}",
+            id, path, cookie, cookieverf, READDIR_STREAM_BATCH);
+
+        // Read a batch of names
+        let dir_handle = match nfs.opendir_names_only_at_cookie(
+            path,
+            cookie,
+            cookieverf,
+            READDIR_STREAM_BATCH,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                errors_count.fetch_add(1, Ordering::Relaxed);
+                if e.to_string().contains("not found") || e.to_string().contains("No such file") {
+                    debug!("Worker {} READDIR not found: {}", id, path);
+                } else {
+                    warn!("Worker {} READDIR failed: {} -> {}", id, path, e);
+                }
+                pending_work.fetch_sub(1, Ordering::SeqCst);
+                active_workers.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        // Collect names from this batch
+        let mut names = Vec::new();
+        while let Some(entry) = dir_handle.readdir() {
+            if !entry.is_special() {
+                names.push(entry.name);
+            }
+        }
+
+        // Get continuation cookie, verifier, and EOF status for next iteration
+        // IMPORTANT: Use get_continuation_cookie(), NOT the last-iterated entry's cookie!
+        // The entries list is in reverse order, so the last-iterated entry has the
+        // SMALLEST cookie. Using it would cause re-reads of the same entries.
+        cookie = dir_handle.get_continuation_cookie();
+        cookieverf = dir_handle.get_cookieverf();
+        let libnfs_eof = dir_handle.is_eof();
+
+        let batch_size = names.len();
+        total_names += batch_size;
+        batch_num += 1;
+
+        // EOF detection: libnfs flag OR we got fewer entries than requested
+        // (if server had more, it would return at least max_entries)
+        let is_eof = libnfs_eof || (batch_size < READDIR_STREAM_BATCH as usize);
+
+        // Debug: log each batch's EOF status
+        info!("Worker {} READDIR batch {}: {} names, total={}, cookie={}, eof={} (libnfs={}, underflow={})",
+            id, batch_num, batch_size, total_names, cookie, is_eof, libnfs_eof,
+            batch_size < READDIR_STREAM_BATCH as usize);
+
+        if batch_size > 0 {
+            if batch_num == 1 && is_eof {
+                // Small directory - single batch, process locally
+                debug!("Worker {} READDIR: {} -> {} names (single batch)", id, path, total_names);
+                do_getattr_chunk(
+                    id, nfs, path, names, depth, dirs_only,
+                    local, entry_tx, batch,
+                    &dirs_count, &files_count, &bytes_count, &errors_count,
+                    &pending_work,
+                );
+            } else if first_chunk_for_self.is_none() {
+                // First batch of a large directory - save for ourselves to process after dispatching
+                first_chunk_for_self = Some(names);
+            } else {
+                // Subsequent batches - dispatch to other workers immediately
+                pending_work.fetch_add(1, Ordering::SeqCst);
+                injector.push(WorkItem::NameChunk {
+                    parent_path: path.to_string(),
+                    names,
+                    depth,
+                });
+            }
+        }
+
+        if is_eof {
+            break;
+        }
+    }
+
+    let readdir_elapsed = readdir_start.elapsed();
+
+    if total_names > 1000 {
+        info!("Worker {} READDIR: {} -> {} names in {} batches, {:.2}s ({:.0} names/sec)",
+            id, path, total_names, batch_num, readdir_elapsed.as_secs_f64(),
+            total_names as f64 / readdir_elapsed.as_secs_f64());
+    }
+
+    // Process the first chunk ourselves (after all others are dispatched)
+    if let Some(my_chunk) = first_chunk_for_self {
+        do_getattr_chunk(
+            id, nfs, path, my_chunk, depth, dirs_only,
+            local, entry_tx, batch,
+            &dirs_count, &files_count, &bytes_count, &errors_count,
+            &pending_work,
+        );
+    }
+
+    // This directory is done
+    dirs_count.fetch_add(1, Ordering::Relaxed);
+    pending_work.fetch_sub(1, Ordering::SeqCst);
+    active_workers.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Process a chunk of names (just GETATTR, no READDIR)
+fn process_name_chunk(
+    id: usize,
+    nfs: &NfsConnection,
+    parent_path: &str,
+    names: Vec<String>,
+    depth: u32,
+    dirs_only: bool,
+    local: &DequeWorker<WorkItem>,
+    entry_tx: &Sender<Vec<DbEntry>>,
+    batch: &mut Vec<DbEntry>,
+    _dirs_count: &Arc<AtomicU64>,
+    files_count: &Arc<AtomicU64>,
+    bytes_count: &Arc<AtomicU64>,
+    errors_count: &Arc<AtomicU64>,
+    pending_work: &Arc<AtomicU64>,
+    active_workers: &Arc<AtomicUsize>,
+) {
+    debug!("Worker {} processing chunk: {} names in {}", id, names.len(), parent_path);
+
+    let dummy_dirs = Arc::new(AtomicU64::new(0));
+    do_getattr_chunk(
+        id, nfs, parent_path, names, depth, dirs_only,
+        local, entry_tx, batch,
+        &dummy_dirs, // Don't count dirs for chunks
+        files_count, bytes_count, errors_count,
+        pending_work,
+    );
+
+    pending_work.fetch_sub(1, Ordering::SeqCst);
+    active_workers.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Do pipelined GETATTR for a list of names
+fn do_getattr_chunk(
+    id: usize,
+    nfs: &NfsConnection,
+    parent_path: &str,
+    names: Vec<String>,
+    depth: u32,
+    dirs_only: bool,
+    local: &DequeWorker<WorkItem>,
+    entry_tx: &Sender<Vec<DbEntry>>,
+    batch: &mut Vec<DbEntry>,
+    dirs_count: &Arc<AtomicU64>,
+    files_count: &Arc<AtomicU64>,
+    bytes_count: &Arc<AtomicU64>,
+    errors_count: &Arc<AtomicU64>,
+    pending_work: &Arc<AtomicU64>,
+) {
+    let name_count = names.len();
+    let getattr_start = Instant::now();
+    let raw_ctx = unsafe { nfs.raw_context() };
+    let mut engine = unsafe { AsyncStatEngine::new(raw_ctx) };
+    engine.add_paths(names, parent_path);
+
+    let results = match engine.run() {
+        Ok(r) => r,
+        Err(e) => {
+            errors_count.fetch_add(name_count as u64, Ordering::Relaxed);
+            warn!("Worker {} async stat failed: {} -> {}", id, parent_path, e);
+            return;
+        }
+    };
+    let getattr_elapsed = getattr_start.elapsed();
+
+    if name_count > 1000 {
+        info!("Worker {} GETATTR: {} ({} names) in {:.2}s ({:.0} stats/sec)",
+            id, parent_path, name_count, getattr_elapsed.as_secs_f64(),
+            name_count as f64 / getattr_elapsed.as_secs_f64());
+    }
+
+    // Process results
+    let mut subdir_count = 0u64;
+    let mut file_count = 0u64;
+    let mut byte_count = 0u64;
+    let mut error_count = 0u64;
+
+    for result in results {
+        if let Some(ref err) = result.error {
+            error_count += 1;
+            debug!("Worker {} stat error: {} -> {}", id, result.path, err);
+            continue;
+        }
+
+        let stat = match result.stat {
+            Some(s) => s,
+            None => {
+                error_count += 1;
+                continue;
+            }
+        };
+
+        let entry_type = stat.entry_type();
+        let is_dir = entry_type == EntryType::Directory;
+
+        if dirs_only && !is_dir {
+            continue;
+        }
+
+        let db_entry = DbEntry {
+            parent_path: Some(parent_path.to_string()),
+            name: result.name,
+            path: result.path.clone(),
+            entry_type,
+            size: stat.size,
+            mtime: stat.mtime,
+            atime: stat.atime,
+            ctime: stat.ctime,
+            mode: Some(stat.mode),
+            uid: Some(stat.uid),
+            gid: Some(stat.gid),
+            nlink: Some(stat.nlink as u64),
+            inode: stat.inode,
+            depth: depth + 1,
+        };
+
+        batch.push(db_entry);
+
+        if is_dir {
+            subdir_count += 1;
+            pending_work.fetch_add(1, Ordering::SeqCst);
+            local.push(WorkItem::Directory {
+                path: result.path,
+                depth: depth + 1,
+            });
+        } else {
+            file_count += 1;
+            byte_count += stat.size;
+        }
+
+        // Send batch if large enough
+        if batch.len() >= 1000 {
+            if entry_tx.send(std::mem::replace(batch, Vec::with_capacity(1000))).is_err() {
+                return;
+            }
+        }
+    }
+
+    // Update global counters
+    if subdir_count > 0 {
+        dirs_count.fetch_add(subdir_count, Ordering::Relaxed);
+    }
+    files_count.fetch_add(file_count, Ordering::Relaxed);
+    bytes_count.fetch_add(byte_count, Ordering::Relaxed);
+    errors_count.fetch_add(error_count, Ordering::Relaxed);
+}
+
+/// Number of columns per row (excluding auto-generated id)
+const DB_COLUMNS: usize = 13;
+/// Max rows per multi-row INSERT (conservative: 100 * 13 = 1300 params)
+/// Smaller chunks = less memory pressure from String clones
+const ROWS_PER_INSERT: usize = 100;
+/// Batch size before writing to DB - reduced to avoid memory pressure
+const WRITER_BATCH_SIZE: usize = 10_000;
 
 /// Writer thread
 fn writer_loop(mut conn: Connection, entry_rx: Receiver<Vec<DbEntry>>) -> Connection {
@@ -770,19 +942,19 @@ fn writer_loop(mut conn: Connection, entry_rx: Receiver<Vec<DbEntry>>) -> Connec
     conn.execute_batch(
         "PRAGMA synchronous = OFF;
          PRAGMA journal_mode = OFF;
-         PRAGMA cache_size = -64000;
-         PRAGMA temp_store = MEMORY;"
+         PRAGMA cache_size = -256000;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA mmap_size = 1073741824;"
     ).expect("Failed to set bulk load pragmas");
 
     let mut total_written = 0u64;
-    let mut pending: Vec<DbEntry> = Vec::with_capacity(20000);
-    let batch_size = 10000;
+    let mut pending: Vec<DbEntry> = Vec::with_capacity(WRITER_BATCH_SIZE + 10000);
 
     while let Ok(entries) = entry_rx.recv() {
         pending.extend(entries);
 
-        if pending.len() >= batch_size {
-            if let Err(e) = write_batch_fast(&mut conn, &pending) {
+        if pending.len() >= WRITER_BATCH_SIZE {
+            if let Err(e) = write_batch_multirow(&mut conn, &pending) {
                 error!("Database write failed: {}", e);
             } else {
                 total_written += pending.len() as u64;
@@ -792,7 +964,7 @@ fn writer_loop(mut conn: Connection, entry_rx: Receiver<Vec<DbEntry>>) -> Connec
     }
 
     if !pending.is_empty() {
-        if let Err(e) = write_batch_fast(&mut conn, &pending) {
+        if let Err(e) = write_batch_multirow(&mut conn, &pending) {
             error!("Final database write failed: {}", e);
         } else {
             total_written += pending.len() as u64;
@@ -805,33 +977,66 @@ fn writer_loop(mut conn: Connection, entry_rx: Receiver<Vec<DbEntry>>) -> Connec
     conn
 }
 
-fn write_batch_fast(conn: &mut Connection, entries: &[DbEntry]) -> Result<()> {
+/// Build a multi-row INSERT statement for N rows
+fn build_multirow_insert(num_rows: usize) -> String {
+    let mut sql = String::with_capacity(100 + num_rows * 60);
+    sql.push_str(
+        "INSERT INTO entries (parent_id, name, path, entry_type, size, mtime, atime, ctime, mode, uid, gid, nlink, inode, depth) VALUES "
+    );
+
+    for i in 0..num_rows {
+        if i > 0 {
+            sql.push(',');
+        }
+        let base = i * DB_COLUMNS;
+        sql.push_str(&format!(
+            "(NULL,?{},?{},?{},?{},?{},?{},?{},?{},?{},?{},?{},?{},?{})",
+            base + 1, base + 2, base + 3, base + 4, base + 5, base + 6, base + 7,
+            base + 8, base + 9, base + 10, base + 11, base + 12, base + 13
+        ));
+    }
+    sql
+}
+
+/// Write entries using multi-row INSERT statements (much faster than row-by-row)
+/// Uses Box<dyn ToSql> to avoid cloning strings while supporting nullable fields
+fn write_batch_multirow(conn: &mut Connection, entries: &[DbEntry]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
     let tx = conn.transaction()
         .map_err(|e| WalkerError::Database(e.into()))?;
 
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO entries (parent_id, name, path, entry_type, size, mtime, atime, ctime, mode, uid, gid, nlink, inode, depth)
-             VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
-        ).map_err(|e| WalkerError::Database(e.into()))?;
+    // Process in chunks of ROWS_PER_INSERT
+    for chunk in entries.chunks(ROWS_PER_INSERT) {
+        let sql = build_multirow_insert(chunk.len());
 
-        for entry in entries {
-            stmt.execute(params![
-                entry.name,
-                entry.path,
-                entry.entry_type.as_db_int(),
-                entry.size as i64,
-                entry.mtime,
-                entry.atime,
-                entry.ctime,
-                entry.mode.map(|m| m as i64),
-                entry.uid.map(|u| u as i64),
-                entry.gid.map(|g| g as i64),
-                entry.nlink.map(|n| n as i64),
-                entry.inode as i64,
-                entry.depth as i64,
-            ]).map_err(|e| WalkerError::Database(e.into()))?;
+        // Build params as boxed trait objects - avoids cloning strings
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(chunk.len() * DB_COLUMNS);
+
+        for entry in chunk {
+            params.push(Box::new(entry.name.as_str()));
+            params.push(Box::new(entry.path.as_str()));
+            params.push(Box::new(entry.entry_type.as_db_int() as i64));
+            params.push(Box::new(entry.size as i64));
+            params.push(Box::new(entry.mtime.map(|v| v as i64)));
+            params.push(Box::new(entry.atime.map(|v| v as i64)));
+            params.push(Box::new(entry.ctime.map(|v| v as i64)));
+            params.push(Box::new(entry.mode.map(|m| m as i64)));
+            params.push(Box::new(entry.uid.map(|u| u as i64)));
+            params.push(Box::new(entry.gid.map(|g| g as i64)));
+            params.push(Box::new(entry.nlink.map(|n| n as i64)));
+            params.push(Box::new(entry.inode as i64));
+            params.push(Box::new(entry.depth as i64));
         }
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter()
+            .map(|p| p.as_ref())
+            .collect();
+
+        tx.execute(&sql, param_refs.as_slice())
+            .map_err(|e| WalkerError::Database(e.into()))?;
     }
 
     tx.commit().map_err(|e| WalkerError::Database(e.into()))?;
