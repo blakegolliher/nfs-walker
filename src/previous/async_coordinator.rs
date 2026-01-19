@@ -1,20 +1,25 @@
 //! Async walk coordinator - orchestrates parallel filesystem walks using tokio
 //!
-//! This coordinator uses an async architecture with a connection pool for
-//! better resource utilization and higher concurrency.
+//! This coordinator uses a simple worker-based model (like the sync version):
+//! - Fixed number of worker tasks pull from a shared channel
+//! - Workers process directories and push results back
+//! - No complex semaphore juggling or per-directory task spawning
+//!
+//! Termination: Walk is complete when all workers are idle and channel is empty.
 
 use crate::config::WalkConfig;
 use crate::db::{UnifiedWriter, UnifiedWriterHandle};
-use crate::error::{Result, WalkerError, WorkerError};
+use crate::error::{Result, WalkerError};
 use crate::nfs::pool::NfsConnectionPool;
 use crate::nfs::types::{DbEntry, DirStats, EntryType};
+use crate::nfs::DnsResolver;
 use crate::walker::queue::DirTask;
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Semaphore};
-use tracing::{debug, error, info, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 /// Statistics collected during the walk
 #[derive(Debug, Default)]
@@ -24,6 +29,7 @@ pub struct AsyncWalkStats {
     pub bytes_found: AtomicU64,
     pub errors: AtomicU64,
     pub skipped: AtomicU64,
+    pub entries_queued: AtomicU64,
 }
 
 impl AsyncWalkStats {
@@ -46,6 +52,10 @@ impl AsyncWalkStats {
     pub fn record_skip(&self) {
         self.skipped.fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn record_queued(&self, count: u64) {
+        self.entries_queued.fetch_add(count, Ordering::Relaxed);
+    }
 }
 
 /// Result of a completed async walk
@@ -67,13 +77,27 @@ pub struct AsyncWalkCoordinator {
     pool: Arc<NfsConnectionPool>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<AsyncWalkStats>,
+    #[allow(dead_code)]
+    dns_resolver: Arc<DnsResolver>,
 }
 
 impl AsyncWalkCoordinator {
     /// Create a new async coordinator
     pub fn new(config: WalkConfig, num_connections: usize) -> Result<Self> {
         let config = Arc::new(config);
-        let pool = Arc::new(NfsConnectionPool::new(Arc::clone(&config), num_connections));
+
+        let dns_resolver = DnsResolver::new(
+            &config.nfs_url.server,
+            config.dns_refresh_secs,
+            !config.disable_dns_lb,
+        );
+
+        let pool = Arc::new(NfsConnectionPool::with_dns_resolver(
+            Arc::clone(&config),
+            num_connections,
+            Arc::clone(&dns_resolver),
+        ));
+
         let shutdown = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(AsyncWalkStats::default());
 
@@ -82,12 +106,18 @@ impl AsyncWalkCoordinator {
             pool,
             shutdown,
             stats,
+            dns_resolver,
         })
     }
 
     /// Get shutdown flag for signal handlers
     pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.shutdown)
+    }
+
+    /// Get a reference to the stats for external progress reporting
+    pub fn stats(&self) -> &Arc<AsyncWalkStats> {
+        &self.stats
     }
 
     /// Run the async filesystem walk
@@ -101,7 +131,7 @@ impl AsyncWalkCoordinator {
             "Starting async filesystem walk"
         );
 
-        // Create output writer (SQLite or Parquet based on config)
+        // Create output writer
         let writer = UnifiedWriter::new(
             &self.config.output_path,
             self.config.batch_size,
@@ -112,101 +142,72 @@ impl AsyncWalkCoordinator {
 
         debug!(start_time = %start_datetime.to_rfc3339(), "Walk started");
 
-        // Create work queue channel - larger buffer for better throughput
-        let (task_tx, mut task_rx) = mpsc::channel::<DirTask>(self.config.queue_size);
+        // Work queue - unbounded sender, bounded receiver isn't needed since workers self-limit
+        let (task_tx, task_rx) = async_channel::unbounded::<DirTask>();
 
-        // Semaphore to limit concurrent directory processing
-        let max_concurrent = self.config.worker_count.max(self.pool.max_connections() * 2);
-        let semaphore = Arc::new(Semaphore::new(max_concurrent));
+        // Track active workers (workers currently processing, not idle)
+        let active_workers = Arc::new(AtomicU64::new(0));
 
-        // Track in-flight tasks
-        let in_flight = Arc::new(AtomicU64::new(0));
+        // Track pending work (directories queued but not yet processed)
+        let pending_count = Arc::new(AtomicU64::new(0));
 
-        info!(max_concurrent = max_concurrent, "Starting async dispatcher");
+        // Number of workers = number of connections (each worker needs a connection)
+        let num_workers = self.pool.max_connections();
+
+        info!(num_workers = num_workers, "Starting async workers");
 
         // Seed with root directory
         let root_path = self.config.nfs_url.walk_start_path();
         let root_entry = DbEntry::root(&root_path);
         writer_handle.send_entry(root_entry)?;
+        self.stats.record_queued(1);
 
         let root_task = DirTask::new(root_path.clone(), None, 0);
-        in_flight.fetch_add(1, Ordering::SeqCst);
+        pending_count.fetch_add(1, Ordering::SeqCst);
         task_tx.send(root_task).await
-            .map_err(|_| WalkerError::Worker(WorkerError::QueueSendFailed))?;
+            .map_err(|_| WalkerError::ChannelClosed)?;
 
-        // Main dispatch loop - receives tasks and spawns processing tasks
-        while !self.shutdown.load(Ordering::Relaxed) {
-            // Check if we're done (no tasks in queue and none in flight)
-            let current_in_flight = in_flight.load(Ordering::SeqCst);
+        // Spawn worker tasks
+        let mut worker_handles = Vec::with_capacity(num_workers);
 
-            // Try to receive with a timeout
-            let task = match tokio::time::timeout(
-                Duration::from_millis(50),
-                task_rx.recv()
-            ).await {
-                Ok(Some(task)) => task,
-                Ok(None) => break, // Channel closed
-                Err(_) => {
-                    // Timeout - check if we're done
-                    if current_in_flight == 0 {
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-            // Acquire semaphore permit to limit concurrency
-            let permit = semaphore.clone().acquire_owned().await
-                .expect("Semaphore closed");
-
-            // Clone everything needed for the spawned task
+        for worker_id in 0..num_workers {
             let pool = Arc::clone(&self.pool);
             let config = Arc::clone(&self.config);
             let stats = Arc::clone(&self.stats);
             let writer = writer_handle.clone();
+            let shutdown = Arc::clone(&self.shutdown);
             let tx = task_tx.clone();
-            let in_flight_clone = Arc::clone(&in_flight);
+            let rx = task_rx.clone();
+            let active = Arc::clone(&active_workers);
+            let pending = Arc::clone(&pending_count);
 
-            // Spawn task to process this directory
-            tokio::spawn(async move {
-                let result = process_directory_task(&pool, &config, &stats, &writer, task).await;
-
-                match result {
-                    Ok(new_tasks) => {
-                        // Queue new directory tasks
-                        let new_count = new_tasks.len() as u64;
-                        if new_count > 0 {
-                            in_flight_clone.fetch_add(new_count, Ordering::SeqCst);
-                        }
-
-                        for new_task in new_tasks {
-                            if tx.send(new_task).await.is_err() {
-                                // Channel closed, decrement
-                                in_flight_clone.fetch_sub(1, Ordering::SeqCst);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Task failed");
-                    }
-                }
-
-                // Mark this task as complete
-                in_flight_clone.fetch_sub(1, Ordering::SeqCst);
-
-                // Drop permit to release semaphore slot
-                drop(permit);
+            let handle = tokio::spawn(async move {
+                worker_loop(
+                    worker_id,
+                    pool,
+                    config,
+                    stats,
+                    writer,
+                    shutdown,
+                    tx,
+                    rx,
+                    active,
+                    pending,
+                ).await
             });
+
+            worker_handles.push(handle);
         }
 
-        // Wait for all in-flight tasks to complete
-        debug!("Waiting for in-flight tasks to complete");
-        while in_flight.load(Ordering::SeqCst) > 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        // Drop our sender so workers can detect completion
+        drop(task_tx);
+
+        // Wait for all workers to complete
+        for handle in worker_handles {
+            let _ = handle.await;
         }
 
-        // Wait for semaphore to be fully available (all tasks done)
-        let _ = semaphore.acquire_many(max_concurrent as u32).await;
+        info!("All workers completed");
 
         // Get final stats
         let dirs = self.stats.dirs_processed.load(Ordering::Relaxed);
@@ -216,8 +217,9 @@ impl AsyncWalkCoordinator {
         let skipped = self.stats.skipped.load(Ordering::Relaxed);
         let entries_written = writer_handle.entries_written();
 
-        // Finish database
+        // Finalize writer
         drop(writer_handle);
+        info!("Finalizing database");
         writer.finish()?;
 
         let duration = start_time.elapsed();
@@ -244,26 +246,110 @@ impl AsyncWalkCoordinator {
     }
 }
 
-/// Process a single directory task
-async fn process_directory_task(
+/// Worker loop - pulls tasks from channel, processes them, pushes results back
+async fn worker_loop(
+    worker_id: usize,
+    pool: Arc<NfsConnectionPool>,
+    config: Arc<WalkConfig>,
+    stats: Arc<AsyncWalkStats>,
+    writer: UnifiedWriterHandle,
+    shutdown: Arc<AtomicBool>,
+    tx: async_channel::Sender<DirTask>,
+    rx: async_channel::Receiver<DirTask>,
+    active_workers: Arc<AtomicU64>,
+    pending_count: Arc<AtomicU64>,
+) {
+    debug!(worker_id = worker_id, "Worker starting");
+
+    loop {
+        // Check shutdown
+        if shutdown.load(Ordering::Relaxed) {
+            debug!(worker_id = worker_id, "Worker shutting down");
+            break;
+        }
+
+        // Try to receive a task with timeout
+        let task = match tokio::time::timeout(
+            Duration::from_millis(100),
+            rx.recv()
+        ).await {
+            Ok(Ok(task)) => task,
+            Ok(Err(_)) => {
+                // Channel closed - check if we should exit
+                if pending_count.load(Ordering::SeqCst) == 0 {
+                    debug!(worker_id = worker_id, "Channel closed, no pending work, exiting");
+                    break;
+                }
+                continue;
+            }
+            Err(_) => {
+                // Timeout - check if all work is done
+                let pending = pending_count.load(Ordering::SeqCst);
+                let active = active_workers.load(Ordering::SeqCst);
+                if pending == 0 && active == 0 {
+                    debug!(worker_id = worker_id, "No pending work and no active workers, exiting");
+                    break;
+                }
+                continue;
+            }
+        };
+
+        // Mark as active
+        active_workers.fetch_add(1, Ordering::SeqCst);
+
+        // Process the directory
+        let new_tasks = process_directory(
+            &pool,
+            &config,
+            &stats,
+            &writer,
+            task,
+            worker_id,
+        ).await;
+
+        // Update pending count: -1 for completed, +N for new directories
+        let new_count = new_tasks.len();
+        if new_count > 0 {
+            pending_count.fetch_add(new_count as u64, Ordering::SeqCst);
+        }
+        pending_count.fetch_sub(1, Ordering::SeqCst);
+
+        // Queue new tasks
+        for new_task in new_tasks {
+            if tx.send(new_task).await.is_err() {
+                // Channel closed
+                pending_count.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        // Mark as inactive
+        active_workers.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    debug!(worker_id = worker_id, "Worker exited");
+}
+
+/// Process a single directory
+async fn process_directory(
     pool: &NfsConnectionPool,
     config: &WalkConfig,
     stats: &AsyncWalkStats,
     writer: &UnifiedWriterHandle,
     task: DirTask,
-) -> Result<Vec<DirTask>> {
+    worker_id: usize,
+) -> Vec<DirTask> {
     // Check depth limit
     if let Some(max_depth) = config.max_depth {
         if task.depth as usize > max_depth {
             stats.record_skip();
-            return Ok(vec![]);
+            return vec![];
         }
     }
 
     // Check exclusions
     if config.is_excluded(&task.path) {
         stats.record_skip();
-        return Ok(vec![]);
+        return vec![];
     }
 
     // Acquire a connection from the pool
@@ -271,7 +357,8 @@ async fn process_directory_task(
         Ok(conn) => conn,
         Err(e) => {
             stats.record_error();
-            return Err(WalkerError::Nfs(e));
+            warn!(worker_id = worker_id, error = %e, path = %task.path, "Failed to acquire connection");
+            return vec![];
         }
     };
 
@@ -292,11 +379,10 @@ async fn process_directory_task(
         Ok(entries) => entries,
         Err(e) => {
             stats.record_error();
-            if e.is_recoverable() {
-                stats.record_skip();
-                return Ok(vec![]);
+            if !e.is_recoverable() {
+                warn!(worker_id = worker_id, error = %e, path = %task.path, "Directory read failed");
             }
-            return Err(WalkerError::Nfs(e));
+            return vec![];
         }
     };
 
@@ -310,10 +396,7 @@ async fn process_directory_task(
             continue;
         }
 
-        // Create database entry
         let db_entry = DbEntry::from_nfs_entry(&entry, &task.path, task.depth + 1);
-
-        // Track directory stats
         dir_stats.add_entry(&entry);
 
         // Queue subdirectories
@@ -332,7 +415,9 @@ async fn process_directory_task(
         // Send to writer
         if !config.dirs_only || entry.entry_type == EntryType::Directory {
             if let Err(e) = writer.send_entry(db_entry) {
-                error!(error = %e, "Failed to send entry to writer");
+                debug!(error = %e, "Failed to send entry to writer");
+            } else {
+                stats.record_queued(1);
             }
         }
     }
@@ -346,5 +431,5 @@ async fn process_directory_task(
         debug!(error = %e, "Failed to send dir stats");
     }
 
-    Ok(new_tasks)
+    new_tasks
 }

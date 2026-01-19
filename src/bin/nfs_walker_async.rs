@@ -1,13 +1,13 @@
-//! nfs-walker - Simple NFS Filesystem Scanner
+//! nfs-walker-async - Async pipelined NFS walker
 //!
-//! Entry point for the CLI application.
+//! Uses READDIR + pipelined GETATTR for potentially faster scanning.
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use humansize::{format_size, BINARY};
 use nfs_walker::config::{CliArgs, WalkConfig};
 use nfs_walker::progress::{print_header, print_summary, ProgressReporter};
-use nfs_walker::walker::SimpleWalker;
+use nfs_walker::walker::AsyncWalker;
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -26,29 +26,24 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    // Parse CLI arguments
     let args = CliArgs::parse();
-
-    // Setup logging
     setup_logging(args.verbose)?;
 
-    // Validate and create config
     let config = WalkConfig::from_args(args.clone())
         .context("Invalid configuration")?;
 
-    // Print header
     if config.show_progress {
         print_header(
             &config.nfs_url.to_display_string(),
             config.worker_count,
             &config.output_path.display().to_string(),
         );
+        println!("  Mode: READDIR + Async Pipelined GETATTR");
+        println!();
     }
 
-    // Create walker
-    let walker = SimpleWalker::new(config.clone());
+    let walker = AsyncWalker::new(config.clone());
 
-    // Setup signal handler for graceful shutdown
     let shutdown_flag = walker.shutdown_flag();
     let ctrl_c_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let ctrl_c_count_handler = Arc::clone(&ctrl_c_count);
@@ -65,7 +60,6 @@ fn run() -> Result<()> {
     })
     .context("Failed to set signal handler")?;
 
-    // Create progress reporter
     let progress = if config.show_progress {
         Some(ProgressReporter::new())
     } else {
@@ -76,7 +70,6 @@ fn run() -> Result<()> {
         p.set_status("Connecting to NFS server...");
     }
 
-    // Run the walk with progress updates
     let result = if let Some(ref p) = progress {
         let p_clone = p.clone();
         walker.run_with_progress(move |prog| {
@@ -98,7 +91,6 @@ fn run() -> Result<()> {
             .context("Walk failed")?
     };
 
-    // Finish progress
     if let Some(ref p) = progress {
         if result.completed {
             p.finish("Walk completed");
@@ -107,12 +99,10 @@ fn run() -> Result<()> {
         }
     }
 
-    // Get database file size
     let db_size = std::fs::metadata(&config.output_path)
         .map(|m| m.len())
         .ok();
 
-    // Print summary
     print_summary(
         result.dirs,
         result.files,
@@ -144,7 +134,6 @@ fn setup_logging(verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// Format a number with thousands separators
 fn format_number(n: u64) -> String {
     let s = n.to_string();
     let bytes: Vec<_> = s.bytes().rev().collect();

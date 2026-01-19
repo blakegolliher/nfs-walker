@@ -179,10 +179,12 @@ impl BatchedParquetWriter {
                 }
             })?;
 
+        let shutdown_clone = Arc::clone(&shutdown);
+
         // Spawn writer thread
         let handle = thread::Builder::new()
             .name("parquet-writer".into())
-            .spawn(move || parquet_writer_thread(arrow_writer, receiver, stats_clone, batch_size))
+            .spawn(move || parquet_writer_thread(arrow_writer, receiver, stats_clone, batch_size, shutdown_clone))
             .map_err(|e| DbError::CreateFailed {
                 path: output_path.to_path_buf(),
                 reason: format!("Failed to spawn writer thread: {}", e),
@@ -203,12 +205,28 @@ impl BatchedParquetWriter {
     pub fn finish(mut self) -> DbResult<()> {
         let _ = self.writer_handle.shutdown();
 
+        // Wait for thread to finish with timeout
         if let Some(handle) = self.handle.take() {
-            match handle.join() {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(DbError::Transaction("Parquet writer thread panicked".into()));
+            let start = std::time::Instant::now();
+            let timeout = Duration::from_secs(60);
+
+            loop {
+                if handle.is_finished() {
+                    match handle.join() {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            tracing::warn!("Parquet writer thread panicked");
+                        }
+                    }
+                    break;
                 }
+
+                if start.elapsed() > timeout {
+                    tracing::warn!("Parquet writer thread did not finish in time");
+                    break;
+                }
+
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
 
@@ -222,10 +240,19 @@ fn parquet_writer_thread(
     receiver: Receiver<ParquetWriterMessage>,
     stats: Arc<ParquetWriterStats>,
     batch_size: usize,
+    shutdown: Arc<AtomicBool>,
 ) -> DbResult<()> {
     let mut entry_buffer: Vec<DbEntry> = Vec::with_capacity(batch_size);
 
     loop {
+        // Check shutdown flag on EVERY iteration - critical for clean exit
+        if shutdown.load(Ordering::Relaxed) {
+            if !entry_buffer.is_empty() {
+                let _ = flush_entries(&mut writer, &mut entry_buffer, &stats);
+            }
+            break;
+        }
+
         match receiver.try_recv() {
             Ok(msg) => match msg {
                 ParquetWriterMessage::Entry(entry) => {

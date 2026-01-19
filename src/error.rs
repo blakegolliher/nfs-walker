@@ -40,6 +40,10 @@ pub enum WalkerError {
     /// Interrupted by signal
     #[error("Operation interrupted by signal")]
     Interrupted,
+
+    /// Channel closed unexpectedly
+    #[error("Channel closed unexpectedly")]
+    ChannelClosed,
 }
 
 /// NFS connection and protocol errors
@@ -193,6 +197,10 @@ pub enum WorkerError {
     /// All workers died
     #[error("All workers have terminated unexpectedly")]
     AllWorkersDead,
+
+    /// NFS error during worker operation
+    #[error("Worker {id} NFS error: {source}")]
+    NfsError { id: usize, source: NfsError },
 }
 
 /// Result type alias for WalkerError

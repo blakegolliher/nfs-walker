@@ -12,7 +12,7 @@
 #   make help          - Show this help
 
 SHELL := /bin/bash
-.PHONY: all build debug test bench clean install-deps check fmt help
+.PHONY: all build debug static test bench clean install-deps install-musl check fmt help
 
 # Project info
 PROJECT_NAME := nfs-walker
@@ -25,6 +25,8 @@ BUILD_DIR := ./build
 TARGET_DIR := ./target
 RELEASE_BIN := $(TARGET_DIR)/release/$(PROJECT_NAME)
 DEBUG_BIN := $(TARGET_DIR)/debug/$(PROJECT_NAME)
+MUSL_TARGET := x86_64-unknown-linux-musl
+MUSL_BIN := $(TARGET_DIR)/$(MUSL_TARGET)/release/$(PROJECT_NAME)
 
 # Output binary names
 RELEASE_BINARY := $(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)
@@ -81,6 +83,55 @@ debug:
 		echo -e "$(RED)✗ Debug build failed$(NC)"; \
 		exit 1; \
 	fi
+
+#------------------------------------------------------------------------------
+# Build static musl binary (fully portable, no dependencies)
+#------------------------------------------------------------------------------
+static:
+	@echo -e "$(BLUE)Building $(PROJECT_NAME) (static musl)...$(NC)"
+	@if ! rustup target list --installed | grep -q $(MUSL_TARGET); then \
+		echo -e "$(YELLOW)Installing musl target...$(NC)"; \
+		rustup target add $(MUSL_TARGET); \
+	fi
+	@mkdir -p $(BUILD_DIR)
+	@RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target $(MUSL_TARGET) 2>&1 | tee $(BUILD_DIR)/build-static.log; \
+	BUILD_STATUS=$${PIPESTATUS[0]}; \
+	if [ $$BUILD_STATUS -eq 0 ]; then \
+		STATIC_BINARY="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-static"; \
+		cp $(MUSL_BIN) $(BUILD_DIR)/$$STATIC_BINARY; \
+		chmod +x $(BUILD_DIR)/$$STATIC_BINARY; \
+		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-static; \
+		ln -s $$STATIC_BINARY $(BUILD_DIR)/$(PROJECT_NAME)-static; \
+		echo -e "$(GREEN)✓ Static build successful$(NC)"; \
+		echo -e "  Binary: $(BUILD_DIR)/$$STATIC_BINARY"; \
+		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-static"; \
+		ls -lh $(BUILD_DIR)/$$STATIC_BINARY | awk '{print "  Size: " $$5}'; \
+		echo -e "  Verify static: ldd $(BUILD_DIR)/$$STATIC_BINARY"; \
+	else \
+		echo -e "$(RED)✗ Static build failed$(NC)"; \
+		echo -e "  See $(BUILD_DIR)/build-static.log for details"; \
+		echo -e "  You may need to run: make install-musl"; \
+		exit 1; \
+	fi
+
+#------------------------------------------------------------------------------
+# Install musl toolchain for static builds
+#------------------------------------------------------------------------------
+install-musl:
+	@echo -e "$(BLUE)Installing musl toolchain...$(NC)"
+	@if command -v apt &> /dev/null; then \
+		echo "  Installing musl-tools via apt"; \
+		sudo apt update && sudo apt install -y musl-tools musl-dev; \
+	elif command -v dnf &> /dev/null; then \
+		echo "  Installing musl via dnf"; \
+		sudo dnf install -y musl musl-devel musl-gcc; \
+	else \
+		echo -e "$(RED)✗ Unsupported package manager$(NC)"; \
+		echo "  Please install musl-tools manually"; \
+		exit 1; \
+	fi
+	@rustup target add $(MUSL_TARGET)
+	@echo -e "$(GREEN)✓ Musl toolchain installed$(NC)"
 
 #------------------------------------------------------------------------------
 # Run tests
@@ -254,6 +305,7 @@ help:
 	@echo ""
 	@echo "Build targets:"
 	@echo "  build        Build release binary with date stamp (default)"
+	@echo "  static       Build static musl binary (portable, no dependencies)"
 	@echo "  debug        Build debug binary"
 	@echo "  clean        Remove all build artifacts and cache"
 	@echo "  clean-cache  Remove only cached objects"
@@ -266,6 +318,7 @@ help:
 	@echo "Utility targets:"
 	@echo "  fmt          Format code with rustfmt"
 	@echo "  install-deps Install system dependencies"
+	@echo "  install-musl Install musl toolchain for static builds"
 	@echo "  info         Show project info"
 	@echo "  list         List available binaries"
 	@echo "  help         Show this help"

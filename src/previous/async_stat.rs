@@ -117,7 +117,21 @@ impl AsyncStatEngine {
             self.pending.push_back((name, full_path));
         }
         self.total = self.pending.len();
-        self.results.reserve(self.total);
+
+        // CRITICAL: Pre-allocate results to exact size to prevent reallocation.
+        // The callback contexts store raw pointers to self.results, so if the Vec
+        // reallocates during fire_requests(), those pointers become dangling.
+        // By reserving exact capacity AND pre-filling with placeholder entries,
+        // we guarantee no reallocation occurs.
+        self.results = Vec::with_capacity(self.total);
+        for (name, path) in self.pending.iter() {
+            self.results.push(StatResult {
+                name: name.clone(),
+                path: path.clone(),
+                stat: None,
+                error: None,
+            });
+        }
     }
 
     /// Run all stats and return results
@@ -182,7 +196,10 @@ impl AsyncStatEngine {
     /// Fire as many requests as we can (up to MAX_IN_FLIGHT)
     fn fire_requests(&mut self) -> NfsResult<()> {
         while self.in_flight < MAX_IN_FLIGHT {
-            let (name, path) = match self.pending.pop_front() {
+            // Calculate index BEFORE popping - this is the index into pre-allocated results
+            let result_index = self.total - self.pending.len();
+
+            let (_name, path) = match self.pending.pop_front() {
                 Some(item) => item,
                 None => break,
             };
@@ -192,20 +209,14 @@ impl AsyncStatEngine {
                 reason: "Path contains null bytes".to_string(),
             })?;
 
-            // Create callback context
+            // Create callback context with index into pre-allocated results
+            // SAFETY: results was pre-allocated to exact size in add_paths() and will
+            // not reallocate, so this pointer remains valid for the lifetime of run().
             let ctx = Box::new(CallbackContext {
-                index: self.results.len(),
+                index: result_index,
                 results_ptr: &mut self.results as *mut Vec<StatResult>,
                 completed: Arc::clone(&self.completed),
                 live_progress: self.live_progress.clone(),
-            });
-
-            // Reserve slot in results
-            self.results.push(StatResult {
-                name,
-                path: path.clone(),
-                stat: None,
-                error: None,
             });
 
             // Fire async stat
@@ -220,8 +231,8 @@ impl AsyncStatEngine {
 
             if ret != 0 {
                 warn!(path = %path, "Failed to start async stat");
-                // Mark as error in results
-                if let Some(result) = self.results.last_mut() {
+                // Mark as error in pre-allocated results slot
+                if let Some(result) = self.results.get_mut(result_index) {
                     result.error = Some("Failed to start async stat".to_string());
                 }
                 self.completed.fetch_add(1, Ordering::Relaxed);

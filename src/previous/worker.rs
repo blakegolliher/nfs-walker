@@ -9,9 +9,9 @@
 
 use crate::config::WalkConfig;
 use crate::db::WriterHandle;
-use crate::error::{WalkOutcome, WorkerError};
+use crate::error::{NfsError, WalkOutcome, WorkerError};
 use crate::nfs::types::{DbEntry, DirStats, EntryType, NfsDirEntry};
-use crate::nfs::{NfsConnection, NfsConnectionBuilder};
+use crate::nfs::{DnsResolver, NfsConnection, NfsConnectionBuilder};
 use crate::walker::parallel_stat::process_directory_parallel;
 use crate::walker::queue::{
     DirTask, EntryQueueReceiver, EntryQueueSender, StatQueueReceiver, StatQueueSender, StatTask,
@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Batch size for skinny streaming reads (entries per RPC call)
 const SKINNY_BATCH_SIZE: u32 = 10_000;
@@ -99,6 +99,7 @@ impl Worker {
         stat_rx: StatQueueReceiver,
         writer: WriterHandle,
         shutdown: Arc<AtomicBool>,
+        dns_resolver: Arc<DnsResolver>,
     ) -> Result<Self, WorkerError> {
         let stats = Arc::new(WorkerStats::default());
         let stats_clone = Arc::clone(&stats);
@@ -108,7 +109,7 @@ impl Worker {
             .spawn(move || {
                 worker_loop(
                     id, config, queue_rx, queue_tx, entry_tx, entry_rx, stat_tx, stat_rx,
-                    writer, shutdown, stats_clone,
+                    writer, shutdown, stats_clone, dns_resolver,
                 )
             })
             .map_err(|e| WorkerError::InitFailed {
@@ -149,6 +150,28 @@ impl Worker {
     }
 }
 
+/// Create an NFS connection for a worker, using DNS resolver for IP assignment
+fn create_worker_connection(
+    id: usize,
+    config: &WalkConfig,
+    dns_resolver: &DnsResolver,
+) -> Result<(NfsConnection, Option<String>), NfsError> {
+    // Get assigned IP from DNS resolver
+    let target_ip = dns_resolver.get_ip_for_worker(id);
+
+    let mut builder = NfsConnectionBuilder::new(config.nfs_url.clone())
+        .timeout(Duration::from_secs(config.timeout_secs as u64))
+        .retries(config.retry_count);
+
+    if let Some(ref ip) = target_ip {
+        debug!(worker = id, ip = %ip, "Connecting to assigned IP");
+        builder = builder.with_ip(ip.clone());
+    }
+
+    let conn = builder.connect()?;
+    Ok((conn, target_ip))
+}
+
 /// Main worker loop
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
@@ -163,16 +186,13 @@ fn worker_loop(
     writer: WriterHandle,
     shutdown: Arc<AtomicBool>,
     stats: Arc<WorkerStats>,
+    dns_resolver: Arc<DnsResolver>,
 ) -> Result<(), WorkerError> {
     debug!(worker = id, "Worker starting");
 
-    // Create NFS connection for this worker
-    let mut nfs = match NfsConnectionBuilder::new(config.nfs_url.clone())
-        .timeout(Duration::from_secs(config.timeout_secs as u64))
-        .retries(config.retry_count)
-        .connect()
-    {
-        Ok(conn) => conn,
+    // Create NFS connection for this worker using DNS resolver
+    let (mut nfs, mut current_ip) = match create_worker_connection(id, &config, &dns_resolver) {
+        Ok(result) => result,
         Err(e) => {
             error!(worker = id, error = %e, "Failed to connect to NFS");
             return Err(WorkerError::InitFailed {
@@ -186,6 +206,7 @@ fn worker_loop(
         worker = id,
         server = nfs.server(),
         export = nfs.export(),
+        ip = ?current_ip,
         "NFS connection established"
     );
 
@@ -218,12 +239,63 @@ fn worker_loop(
             match &outcome {
                 WalkOutcome::Success { entries, .. } => {
                     trace!(worker = id, path = %task.path, entries = entries, "Directory processed");
+                    // Report success to DNS resolver
+                    if let Some(ref ip) = current_ip {
+                        dns_resolver.report_success(ip);
+                    }
                 }
                 WalkOutcome::Skipped { path, reason } => {
                     debug!(worker = id, path = %path, reason = %reason, "Directory skipped");
                 }
                 WalkOutcome::Failed { path, error } => {
                     warn!(worker = id, path = %path, error = %error, "Directory failed");
+
+                    // Check if this error should trigger a reconnect
+                    if error.should_reconnect() {
+                        // Report failure to DNS resolver
+                        if let Some(ref ip) = current_ip {
+                            dns_resolver.report_failure(ip, id);
+                        }
+
+                        // Try to reconnect to a (potentially different) IP
+                        info!(worker = id, "Attempting reconnect after connection failure");
+                        match create_worker_connection(id, &config, &dns_resolver) {
+                            Ok((new_conn, new_ip)) => {
+                                nfs = new_conn;
+                                current_ip = new_ip;
+                                info!(
+                                    worker = id,
+                                    ip = ?current_ip,
+                                    "Reconnected successfully"
+                                );
+
+                                // Re-queue the failed task for retry
+                                let retry_task = DirTask::new(
+                                    task.path.clone(),
+                                    task.entry_id,
+                                    task.depth,
+                                );
+                                if queue_tx.try_send(retry_task).is_err() {
+                                    warn!(
+                                        worker = id,
+                                        path = %task.path,
+                                        "Failed to re-queue task after reconnect"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    worker = id,
+                                    error = %e,
+                                    "Failed to reconnect, worker will exit"
+                                );
+                                return Err(WorkerError::NfsError {
+                                    id,
+                                    source: e,
+                                });
+                            }
+                        }
+                    }
                 }
             }
             continue;
