@@ -28,7 +28,9 @@ CREATE TABLE IF NOT EXISTS entries (
     gid INTEGER,
     nlink INTEGER,
     inode INTEGER,
-    depth INTEGER NOT NULL
+    depth INTEGER NOT NULL,
+    extension TEXT,               -- File extension (without dot, lowercase)
+    blocks INTEGER DEFAULT 0      -- Number of 512-byte blocks allocated
 )
 "#;
 
@@ -51,6 +53,15 @@ const CREATE_WALK_INFO_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS walk_info (
     key TEXT PRIMARY KEY,
     value TEXT
+)
+"#;
+
+/// SQL to create big directories table (for big-dir-hunt mode)
+const CREATE_BIG_DIRS_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS big_directories (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    file_count INTEGER NOT NULL
 )
 "#;
 
@@ -92,6 +103,7 @@ pub fn create_database(conn: &Connection) -> DbResult<()> {
     conn.execute(CREATE_ENTRIES_TABLE, [])?;
     conn.execute(CREATE_DIR_STATS_TABLE, [])?;
     conn.execute(CREATE_WALK_INFO_TABLE, [])?;
+    conn.execute(CREATE_BIG_DIRS_TABLE, [])?;
 
     Ok(())
 }

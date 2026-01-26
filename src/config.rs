@@ -27,27 +27,47 @@ static NFS_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:nfs://)?([^:/]+)(:\d+)?(/[^\s]*)$").expect("Invalid NFS URL regex")
 });
 
-/// Simple NFS filesystem walker with SQLite output
+/// Simple NFS filesystem walker with SQLite/RocksDB output
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "nfs-walker",
     version,
-    about = "Simple NFS filesystem walker with SQLite output",
-    long_about = "Walks an NFS filesystem using direct libnfs access and outputs results to a SQLite database.\n\n\
-                  Uses READDIR for directory names and parallel GETATTR for file attributes.",
+    about = "Simple NFS filesystem walker with SQLite/RocksDB output",
+    long_about = "Walks an NFS filesystem using direct libnfs access and outputs results to a database.\n\n\
+                  Uses READDIR for directory names and parallel GETATTR for file attributes.\n\n\
+                  With RocksDB feature: Default output is RocksDB (.rocks) for fast writes.\n\
+                  Convert to SQLite using the 'convert' subcommand for queries.",
     after_help = "EXAMPLES:\n    \
         nfs-walker nfs://server/export -o scan.db\n    \
         nfs-walker 192.168.1.100:/data -w 8 -p\n    \
-        nfs-walker nfs://cluster/share --exclude '.snapshot' --dirs-only"
+        nfs-walker nfs://cluster/share --exclude '.snapshot' --dirs-only\n    \
+        nfs-walker nfs://server/export -o scan.rocks -p  # RocksDB output (with feature)\n    \
+        nfs-walker convert scan.rocks scan.db --progress  # Convert to SQLite",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
 )]
 pub struct CliArgs {
     /// NFS path to scan (nfs://server/export or server:/export/path)
     #[arg(value_name = "NFS_URL")]
-    pub nfs_url: String,
+    pub nfs_url: Option<String>,
 
-    /// Output SQLite database file
+    /// Subcommand (convert, etc.)
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    /// Output database file (.db for SQLite, .rocks for RocksDB)
     #[arg(short, long, default_value = "walk.db", value_name = "FILE")]
     pub output: PathBuf,
+
+    /// Force SQLite output mode (slower, but single step)
+    #[cfg(feature = "rocksdb")]
+    #[arg(long, help = "Use SQLite directly instead of RocksDB (slower but simpler)")]
+    pub sqlite: bool,
+
+    /// RocksDB baseline for incremental scans
+    #[cfg(feature = "rocksdb")]
+    #[arg(long, value_name = "PATH", help = "RocksDB baseline for incremental scan comparison")]
+    pub baseline: Option<PathBuf>,
 
     /// Number of worker threads for parallel GETATTR
     #[arg(
@@ -59,7 +79,7 @@ pub struct CliArgs {
     pub workers: usize,
 
     /// Work queue size (controls memory usage)
-    #[arg(short = 'q', long, default_value = "10000", value_name = "NUM")]
+    #[arg(long, default_value = "10000", value_name = "NUM")]
     pub queue_size: usize,
 
     /// SQLite batch insert size
@@ -70,9 +90,9 @@ pub struct CliArgs {
     #[arg(short = 'd', long, value_name = "NUM")]
     pub max_depth: Option<usize>,
 
-    /// Show progress during walk
-    #[arg(short = 'p', long)]
-    pub progress: bool,
+    /// Quiet mode - suppress progress output
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
 
     /// Verbose output (show errors and warnings)
     #[arg(short = 'v', long)]
@@ -98,10 +118,116 @@ pub struct CliArgs {
     #[arg(long, default_value = "3", value_name = "NUM")]
     pub retries: u32,
 
-    /// High file count mode: uses READDIR + pipelined async GETATTR
-    /// Optimized for directories with millions of files
+    /// Hunt for directories with more than threshold files (stores only big dirs)
     #[arg(long)]
-    pub hfc: bool,
+    pub big_dir_hunt: bool,
+
+    /// File count threshold for big-dir-hunt mode (default 1M)
+    #[arg(long, default_value = "1000000", value_name = "COUNT")]
+    pub threshold: u64,
+
+    /// Explicit NFS export path (overrides auto-detection from URL)
+    /// Use when the export has multiple path components, e.g., /volumes/uuid
+    #[arg(long, value_name = "PATH")]
+    pub export: Option<String>,
+}
+
+/// Subcommands
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Convert RocksDB database to SQLite
+    #[cfg(feature = "rocksdb")]
+    Convert {
+        /// Input RocksDB directory
+        #[arg(value_name = "INPUT")]
+        input: PathBuf,
+
+        /// Output SQLite file
+        #[arg(value_name = "OUTPUT")]
+        output: PathBuf,
+
+        /// Show conversion progress
+        #[arg(short = 'p', long)]
+        progress: bool,
+    },
+
+    /// Show statistics from a RocksDB database
+    #[cfg(feature = "rocksdb")]
+    Stats {
+        /// RocksDB database path
+        #[arg(value_name = "DB")]
+        db: PathBuf,
+
+        /// Show files grouped by extension
+        #[arg(long)]
+        by_extension: bool,
+
+        /// Show largest files
+        #[arg(long)]
+        largest_files: bool,
+
+        /// Show directories with most files
+        #[arg(long)]
+        largest_dirs: bool,
+
+        /// Show oldest files (by mtime)
+        #[arg(long)]
+        oldest_files: bool,
+
+        /// Show files with most hard links
+        #[arg(long)]
+        most_links: bool,
+
+        /// Show usage by user ID
+        #[arg(long)]
+        by_uid: bool,
+
+        /// Show usage by group ID
+        #[arg(long)]
+        by_gid: bool,
+
+        /// Number of results to show
+        #[arg(short = 'n', long, default_value = "20")]
+        top: usize,
+    },
+}
+
+/// Output format for scan results
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// SQLite database (.db)
+    Sqlite,
+    /// RocksDB directory (.rocks)
+    #[cfg(feature = "rocksdb")]
+    RocksDb,
+}
+
+impl CliArgs {
+    /// Determine output format from file extension and flags
+    pub fn output_format(&self) -> OutputFormat {
+        #[cfg(feature = "rocksdb")]
+        {
+            // --sqlite flag forces SQLite mode
+            if self.sqlite {
+                return OutputFormat::Sqlite;
+            }
+
+            // Check file extension
+            if let Some(ext) = self.output.extension() {
+                if ext == "rocks" {
+                    return OutputFormat::RocksDb;
+                }
+            }
+
+            // Default to RocksDB when feature is enabled
+            OutputFormat::RocksDb
+        }
+
+        #[cfg(not(feature = "rocksdb"))]
+        {
+            OutputFormat::Sqlite
+        }
+    }
 }
 
 fn default_workers() -> usize {
@@ -266,6 +392,13 @@ pub struct WalkConfig {
     /// Output database path
     pub output_path: PathBuf,
 
+    /// Output format (SQLite or RocksDB)
+    pub output_format: OutputFormat,
+
+    /// RocksDB baseline path for incremental scans
+    #[cfg(feature = "rocksdb")]
+    pub baseline_path: Option<PathBuf>,
+
     /// Number of worker threads
     pub worker_count: usize,
 
@@ -299,18 +432,53 @@ pub struct WalkConfig {
     /// Retry count for transient errors
     pub retry_count: u32,
 
-    /// High file count mode (READDIR + pipelined GETATTR)
-    pub hfc_mode: bool,
+    /// Big directory hunt mode (only stores dirs over threshold)
+    pub big_dir_hunt: bool,
+
+    /// File count threshold for big-dir-hunt mode
+    pub big_dir_threshold: u64,
 }
 
 impl WalkConfig {
     /// Create and validate configuration from CLI arguments
     pub fn from_args(args: CliArgs) -> Result<Self, ConfigError> {
-        // Parse NFS URL
-        let nfs_url = NfsUrl::parse(&args.nfs_url).map_err(|e| ConfigError::InvalidOutputPath {
-            path: PathBuf::from(&args.nfs_url),
+        // Parse NFS URL (required for scan command)
+        let nfs_url_str = args.nfs_url.as_ref().ok_or_else(|| ConfigError::InvalidOutputPath {
+            path: PathBuf::from(""),
+            reason: "NFS URL is required for scan".to_string(),
+        })?;
+
+        let mut nfs_url = NfsUrl::parse(nfs_url_str).map_err(|e| ConfigError::InvalidOutputPath {
+            path: PathBuf::from(nfs_url_str),
             reason: e.to_string(),
         })?;
+
+        // Override export path if explicitly specified
+        if let Some(explicit_export) = &args.export {
+            // The explicit export replaces the auto-detected export
+            // Recalculate subpath based on the new export
+            let full_path = nfs_url.full_path();
+            let explicit_export = if explicit_export.starts_with('/') {
+                explicit_export.clone()
+            } else {
+                format!("/{}", explicit_export)
+            };
+
+            // Check if full_path starts with the explicit export
+            if full_path.starts_with(&explicit_export) {
+                nfs_url.export = explicit_export.clone();
+                let remainder = &full_path[explicit_export.len()..];
+                nfs_url.subpath = if remainder.is_empty() {
+                    String::new()
+                } else {
+                    remainder.to_string()
+                };
+            } else {
+                // Just use the explicit export as-is
+                nfs_url.export = explicit_export;
+                nfs_url.subpath = String::new();
+            }
+        }
 
         // Validate worker count
         if args.workers == 0 || args.workers > MAX_WORKERS {
@@ -359,21 +527,38 @@ impl WalkConfig {
             }
         }
 
+        // Validate baseline path if provided
+        #[cfg(feature = "rocksdb")]
+        if let Some(ref baseline) = args.baseline {
+            if !baseline.exists() {
+                return Err(ConfigError::InvalidResumeDb {
+                    path: baseline.clone(),
+                    reason: "Baseline database does not exist".to_string(),
+                });
+            }
+        }
+
+        let output_format = args.output_format();
+
         Ok(Self {
             nfs_url,
             output_path: args.output,
+            output_format,
+            #[cfg(feature = "rocksdb")]
+            baseline_path: args.baseline,
             worker_count: args.workers,
             queue_size: args.queue_size,
             batch_size: args.batch_size,
             max_depth: args.max_depth,
-            show_progress: args.progress,
+            show_progress: !args.quiet,
             verbose: args.verbose,
             dirs_only: args.dirs_only,
             skip_atime: args.no_atime,
             exclude_patterns,
             timeout_secs: args.timeout,
             retry_count: args.retries,
-            hfc_mode: args.hfc,
+            big_dir_hunt: args.big_dir_hunt,
+            big_dir_threshold: args.threshold,
         })
     }
 
@@ -436,6 +621,9 @@ mod tests {
         let config = WalkConfig {
             nfs_url: NfsUrl::parse("nfs://s/e").unwrap(),
             output_path: PathBuf::from("test.db"),
+            output_format: OutputFormat::Sqlite,
+            #[cfg(feature = "rocksdb")]
+            baseline_path: None,
             worker_count: 4,
             queue_size: 1000,
             batch_size: 1000,
@@ -447,7 +635,8 @@ mod tests {
             exclude_patterns: vec![Regex::new(r"\.snapshot").unwrap()],
             timeout_secs: 30,
             retry_count: 3,
-            hfc_mode: false,
+            big_dir_hunt: false,
+            big_dir_threshold: 1_000_000,
         };
 
         assert!(config.is_excluded("/data/.snapshot/hourly.0"));

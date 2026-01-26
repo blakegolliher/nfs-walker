@@ -40,8 +40,8 @@
 //!     .connect()
 //!     .unwrap();
 //!
-//! // Read a directory (names only)
-//! let handle = conn.opendir_names_only("/data").unwrap();
+//! // Read a directory
+//! let handle = conn.opendir("/data").unwrap();
 //! while let Some(entry) = handle.readdir() {
 //!     if !entry.is_special() {
 //!         println!("{}", entry.name);
@@ -49,11 +49,19 @@
 //! }
 //! ```
 
+// Pre-generated FFI bindings for libnfs
+#[allow(non_upper_case_globals)]
+#[allow(non_camel_case_types)]
+#[allow(non_snake_case)]
+#[allow(dead_code)]
+#[allow(clippy::all)]
+pub mod bindings;
+
 pub mod connection;
 pub mod dns_resolver;
 pub mod types;
 
-pub use connection::{resolve_dns, NfsConnection, NfsConnectionBuilder, NfsDirHandle};
+pub use connection::{resolve_dns, BigDirScanResult, NfsConnection, NfsConnectionBuilder, NfsDirHandle, RawRpcContext};
 pub use connection::ffi;
 pub use dns_resolver::{DnsResolver, DEFAULT_DNS_REFRESH_SECS};
 pub use types::{DbEntry, DirStats, EntryType, NfsDirEntry, NfsStat, Permissions};

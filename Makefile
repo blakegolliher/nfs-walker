@@ -1,7 +1,8 @@
 # nfs-walker Makefile
 #
 # Targets:
-#   make / make build  - Build release binary with date stamp
+#   make / make build  - Build release binary with glibc
+#   make release       - Build static musl binary for distribution
 #   make debug         - Build debug binary
 #   make test          - Run all tests
 #   make bench         - Run benchmarks
@@ -12,7 +13,7 @@
 #   make help          - Show this help
 
 SHELL := /bin/bash
-.PHONY: all build debug static test bench clean install-deps install-musl check fmt help
+.PHONY: all build release release-rocks debug static test bench clean install-deps install-musl check fmt help
 
 # Project info
 PROJECT_NAME := nfs-walker
@@ -43,6 +44,76 @@ NC := \033[0m # No Color
 # Default target
 #------------------------------------------------------------------------------
 all: build
+
+#------------------------------------------------------------------------------
+# Release target - produces static musl binary for distribution
+#------------------------------------------------------------------------------
+release:
+	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) release (static musl, no RocksDB)...$(NC)"
+	@if ! rustup target list --installed | grep -q $(MUSL_TARGET); then \
+		echo -e "$(YELLOW)Installing musl target...$(NC)"; \
+		rustup target add $(MUSL_TARGET); \
+	fi
+	@if ! command -v musl-gcc &> /dev/null; then \
+		echo -e "$(RED)✗ musl-gcc not found. Run: make install-musl$(NC)"; \
+		exit 1; \
+	fi
+	@mkdir -p $(BUILD_DIR)
+	@RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target $(MUSL_TARGET) --no-default-features 2>&1 | tee $(BUILD_DIR)/build-release.log; \
+	BUILD_STATUS=$${PIPESTATUS[0]}; \
+	if [ $$BUILD_STATUS -eq 0 ]; then \
+		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)"; \
+		cp $(MUSL_BIN) $(BUILD_DIR)/$$RELEASE_NAME; \
+		chmod +x $(BUILD_DIR)/$$RELEASE_NAME; \
+		rm -f $(LATEST_LINK); \
+		ln -s $$RELEASE_NAME $(LATEST_LINK); \
+		echo -e "$(GREEN)✓ Release build successful$(NC)"; \
+		echo -e "  Binary: $(BUILD_DIR)/$$RELEASE_NAME"; \
+		echo -e "  Symlink: $(LATEST_LINK) -> $$RELEASE_NAME"; \
+		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size: " $$5}'; \
+		echo -e "  Type: Static (musl) - no dependencies"; \
+		file $(BUILD_DIR)/$$RELEASE_NAME | sed 's/^/  /'; \
+	else \
+		echo -e "$(RED)✗ Release build failed$(NC)"; \
+		echo -e "  See $(BUILD_DIR)/build-release.log for details"; \
+		echo -e "  You may need to run: make install-musl"; \
+		exit 1; \
+	fi
+
+#------------------------------------------------------------------------------
+# Release target with RocksDB support - static musl binary
+#------------------------------------------------------------------------------
+release-rocks:
+	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) release with RocksDB (static musl)...$(NC)"
+	@if ! rustup target list --installed | grep -q $(MUSL_TARGET); then \
+		echo -e "$(YELLOW)Installing musl target...$(NC)"; \
+		rustup target add $(MUSL_TARGET); \
+	fi
+	@if ! command -v musl-gcc &> /dev/null; then \
+		echo -e "$(RED)✗ musl-gcc not found. Run: make install-musl$(NC)"; \
+		exit 1; \
+	fi
+	@mkdir -p $(BUILD_DIR)
+	@RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target $(MUSL_TARGET) --features rocksdb 2>&1 | tee $(BUILD_DIR)/build-release-rocks.log; \
+	BUILD_STATUS=$${PIPESTATUS[0]}; \
+	if [ $$BUILD_STATUS -eq 0 ]; then \
+		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-rocks"; \
+		cp $(MUSL_BIN) $(BUILD_DIR)/$$RELEASE_NAME; \
+		chmod +x $(BUILD_DIR)/$$RELEASE_NAME; \
+		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-rocks; \
+		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-rocks; \
+		echo -e "$(GREEN)✓ Release build with RocksDB successful$(NC)"; \
+		echo -e "  Binary: $(BUILD_DIR)/$$RELEASE_NAME"; \
+		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-rocks -> $$RELEASE_NAME"; \
+		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size: " $$5}'; \
+		echo -e "  Type: Static (musl) with RocksDB - no dependencies"; \
+		file $(BUILD_DIR)/$$RELEASE_NAME | sed 's/^/  /'; \
+	else \
+		echo -e "$(RED)✗ Release build with RocksDB failed$(NC)"; \
+		echo -e "  See $(BUILD_DIR)/build-release-rocks.log for details"; \
+		echo -e "  You may need to run: make install-musl"; \
+		exit 1; \
+	fi
 
 #------------------------------------------------------------------------------
 # Build release binary with date stamp
@@ -88,13 +159,13 @@ debug:
 # Build static musl binary (fully portable, no dependencies)
 #------------------------------------------------------------------------------
 static:
-	@echo -e "$(BLUE)Building $(PROJECT_NAME) (static musl)...$(NC)"
+	@echo -e "$(BLUE)Building $(PROJECT_NAME) (static musl, no RocksDB)...$(NC)"
 	@if ! rustup target list --installed | grep -q $(MUSL_TARGET); then \
 		echo -e "$(YELLOW)Installing musl target...$(NC)"; \
 		rustup target add $(MUSL_TARGET); \
 	fi
 	@mkdir -p $(BUILD_DIR)
-	@RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target $(MUSL_TARGET) 2>&1 | tee $(BUILD_DIR)/build-static.log; \
+	@RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target $(MUSL_TARGET) --no-default-features 2>&1 | tee $(BUILD_DIR)/build-static.log; \
 	BUILD_STATUS=$${PIPESTATUS[0]}; \
 	if [ $$BUILD_STATUS -eq 0 ]; then \
 		STATIC_BINARY="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-static"; \
@@ -111,6 +182,41 @@ static:
 		echo -e "$(RED)✗ Static build failed$(NC)"; \
 		echo -e "  See $(BUILD_DIR)/build-static.log for details"; \
 		echo -e "  You may need to run: make install-musl"; \
+		exit 1; \
+	fi
+
+#------------------------------------------------------------------------------
+# Build static binary with RocksDB using Docker (most reliable)
+#------------------------------------------------------------------------------
+docker-release:
+	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) release with RocksDB (Docker)...$(NC)"
+	@mkdir -p $(BUILD_DIR)
+	@if command -v podman &> /dev/null; then \
+		CONTAINER_CMD=podman; \
+	elif command -v docker &> /dev/null; then \
+		CONTAINER_CMD=docker; \
+	else \
+		echo -e "$(RED)✗ Neither podman nor docker found$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "Using $$CONTAINER_CMD..."; \
+	$$CONTAINER_CMD build -f Dockerfile.static-builder -t nfs-walker-builder . 2>&1 | tee $(BUILD_DIR)/build-docker.log; \
+	BUILD_STATUS=$${PIPESTATUS[0]}; \
+	if [ $$BUILD_STATUS -eq 0 ]; then \
+		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-rocks"; \
+		$$CONTAINER_CMD run --rm nfs-walker-builder cat /app/target/release/nfs-walker > $(BUILD_DIR)/$$RELEASE_NAME; \
+		chmod +x $(BUILD_DIR)/$$RELEASE_NAME; \
+		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-rocks; \
+		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-rocks; \
+		echo -e "$(GREEN)✓ Docker build successful$(NC)"; \
+		echo -e "  Binary: $(BUILD_DIR)/$$RELEASE_NAME"; \
+		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-rocks -> $$RELEASE_NAME"; \
+		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size: " $$5}'; \
+		echo -e "  Type: Portable Linux with RocksDB (glibc 2.31+)"; \
+		file $(BUILD_DIR)/$$RELEASE_NAME | sed 's/^/  /'; \
+	else \
+		echo -e "$(RED)✗ Docker build failed$(NC)"; \
+		echo -e "  See $(BUILD_DIR)/build-docker.log for details"; \
 		exit 1; \
 	fi
 
@@ -304,11 +410,12 @@ help:
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  build        Build release binary with date stamp (default)"
-	@echo "  static       Build static musl binary (portable, no dependencies)"
-	@echo "  debug        Build debug binary"
-	@echo "  clean        Remove all build artifacts and cache"
-	@echo "  clean-cache  Remove only cached objects"
+	@echo "  docker-release  Build portable Linux binary with RocksDB via Docker (RECOMMENDED)"
+	@echo "  build           Build native binary with RocksDB (current system)"
+	@echo "  release         Build static musl binary without RocksDB (smallest, most portable)"
+	@echo "  debug           Build debug binary"
+	@echo "  clean           Remove all build artifacts and cache"
+	@echo "  clean-cache     Remove only cached objects"
 	@echo ""
 	@echo "Test targets:"
 	@echo "  test         Run all tests with summary"

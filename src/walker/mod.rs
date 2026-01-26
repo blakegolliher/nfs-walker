@@ -22,7 +22,5 @@
 //! ```
 
 pub mod simple;
-pub mod async_walker;
 
 pub use simple::{SimpleWalker, WalkProgress, WalkStats};
-pub use async_walker::AsyncWalker;

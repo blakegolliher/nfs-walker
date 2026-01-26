@@ -25,6 +25,11 @@ pub enum WalkerError {
     #[error("Database error: {0}")]
     Database(#[from] DbError),
 
+    /// RocksDB errors
+    #[cfg(feature = "rocksdb")]
+    #[error("RocksDB error: {0}")]
+    Rocks(#[from] RocksError),
+
     /// Configuration errors
     #[error("Configuration error: {0}")]
     Config(#[from] ConfigError),
@@ -202,6 +207,35 @@ pub enum WorkerError {
     #[error("Worker {id} NFS error: {source}")]
     NfsError { id: usize, source: NfsError },
 }
+
+/// RocksDB errors
+#[cfg(feature = "rocksdb")]
+#[derive(Error, Debug)]
+pub enum RocksError {
+    /// RocksDB operation failed
+    #[error("RocksDB error: {0}")]
+    Rocks(#[from] rocksdb::Error),
+
+    /// Bincode serialization/deserialization error
+    #[error("Serialization error: {0}")]
+    Bincode(String),
+
+    /// I/O error (file operations)
+    #[error("I/O error: {0}")]
+    Io(String),
+
+    /// Database not found
+    #[error("Database not found: {0}")]
+    NotFound(String),
+
+    /// Invalid database format
+    #[error("Invalid database format: {0}")]
+    InvalidFormat(String),
+}
+
+/// Result type alias for RocksError
+#[cfg(feature = "rocksdb")]
+pub type RocksResult<T> = std::result::Result<T, RocksError>;
 
 /// Result type alias for WalkerError
 pub type Result<T> = std::result::Result<T, WalkerError>;

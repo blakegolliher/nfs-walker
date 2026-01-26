@@ -84,6 +84,8 @@ fn test_db_entry_types() {
         nlink: Some(1),
         inode: 12345,
         depth: 2,
+        extension: Some("txt".to_string()),
+        blocks: 8,
     };
 
     assert!(entry.entry_type.is_file());

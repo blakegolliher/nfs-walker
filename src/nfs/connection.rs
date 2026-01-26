@@ -15,14 +15,8 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 use std::time::Duration;
 
-// Include generated bindings
-#[allow(non_upper_case_globals)]
-#[allow(non_camel_case_types)]
-#[allow(non_snake_case)]
-#[allow(dead_code)]
-pub mod ffi {
-    include!(concat!(env!("OUT_DIR"), "/nfs_bindings.rs"));
-}
+// Use pre-generated bindings from src/nfs/bindings.rs
+pub use super::bindings as ffi;
 
 /// Wrapper around libnfs context providing safe NFS operations
 ///
@@ -231,19 +225,37 @@ impl NfsConnection {
 
         // Open directory
         let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
+        let open_start = std::time::Instant::now();
         let result = unsafe {
             ffi::nfs_opendir(self.context, path_cstr.as_ptr(), &mut dir_handle)
         };
+        let open_elapsed = open_start.elapsed();
 
         if result != 0 {
             return Err(self.translate_error(path, result));
         }
 
+        // Log if opendir was slow (> 100ms) - debug level so it only shows with -v
+        if open_elapsed.as_millis() > 100 {
+            tracing::debug!("nfs_opendir({}) took {:?}", path, open_elapsed);
+        }
+
         let mut total_entries = 0;
         let mut chunk = Vec::with_capacity(chunk_size);
+        let mut first_read = true;
+        let read_start = std::time::Instant::now();
 
         loop {
             let dirent = unsafe { ffi::nfs_readdir(self.context, dir_handle) };
+
+            // Log if first readdir was slow - debug level so it only shows with -v
+            if first_read {
+                let first_read_elapsed = read_start.elapsed();
+                if first_read_elapsed.as_millis() > 100 {
+                    tracing::debug!("first nfs_readdir({}) took {:?}", path, first_read_elapsed);
+                }
+                first_read = false;
+            }
 
             if dirent.is_null() {
                 // End of directory - send final chunk if any
@@ -300,153 +312,6 @@ impl NfsConnection {
         let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
         let result = unsafe {
             ffi::nfs_opendir(self.context, path_cstr.as_ptr(), &mut dir_handle)
-        };
-
-        if result != 0 {
-            return Err(self.translate_error(path, result));
-        }
-
-        Ok(NfsDirHandle {
-            context: self.context,
-            handle: dir_handle,
-            path: path.to_string(),
-        })
-    }
-
-    /// Open a directory starting from a specific NFS cookie position
-    ///
-    /// This enables parallel directory reading by having multiple workers
-    /// start reading from different cookie positions within the same directory.
-    ///
-    /// # Arguments
-    /// * `path` - Directory path to open
-    /// * `cookie` - Starting cookie (0 = beginning, or value from a previous entry's cookie field)
-    /// * `max_entries` - Maximum entries to fetch from server (0 = no limit, read until EOF)
-    ///
-    /// # Note
-    /// The cookieverf is set to zero. Most NFS servers accept this, but some
-    /// may reject non-zero cookies without a valid verifier.
-    pub fn opendir_at_cookie(&self, path: &str, cookie: u64, max_entries: u32) -> NfsResult<NfsDirHandle> {
-        if !self.mounted {
-            return Err(NfsError::ReadDirFailed {
-                path: path.into(),
-                reason: "Not mounted".into(),
-            });
-        }
-
-        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadDirFailed {
-            path: path.into(),
-            reason: "Path contains null bytes".into(),
-        })?;
-
-        let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
-        let result = unsafe {
-            ffi::nfs_opendir_at_cookie(self.context, path_cstr.as_ptr(), cookie, max_entries, &mut dir_handle)
-        };
-
-        if result != 0 {
-            return Err(self.translate_error(path, result));
-        }
-
-        Ok(NfsDirHandle {
-            context: self.context,
-            handle: dir_handle,
-            path: path.to_string(),
-        })
-    }
-
-    /// Open a directory for reading names only (READDIR)
-    ///
-    /// This uses READDIR instead of READDIRPLUS, which is dramatically faster
-    /// for large directories because the server doesn't need to stat() each file.
-    /// libnfs handles cookie management internally - just iterate with readdir().
-    ///
-    /// Returned entries will have:
-    /// - name: populated
-    /// - inode: populated
-    /// - entry_type: Unknown (no attributes fetched)
-    /// - stat: minimal (only inode populated)
-    pub fn opendir_names_only(&self, path: &str) -> NfsResult<NfsDirHandle> {
-        if !self.mounted {
-            return Err(NfsError::ReadDirFailed {
-                path: path.into(),
-                reason: "Not mounted".into(),
-            });
-        }
-
-        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadDirFailed {
-            path: path.into(),
-            reason: "Path contains null bytes".into(),
-        })?;
-
-        let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
-        let result = unsafe {
-            ffi::nfs_opendir_names_only(
-                self.context,
-                path_cstr.as_ptr(),
-                &mut dir_handle,
-            )
-        };
-
-        if result != 0 {
-            return Err(self.translate_error(path, result));
-        }
-
-        Ok(NfsDirHandle {
-            context: self.context,
-            handle: dir_handle,
-            path: path.to_string(),
-        })
-    }
-
-    /// Open a directory for reading names only, starting at a specific cookie position
-    ///
-    /// This uses READDIR instead of READDIRPLUS, which is dramatically faster
-    /// for large directories because the server doesn't need to stat() each file.
-    ///
-    /// Returned entries will have:
-    /// - name: populated
-    /// - inode: populated
-    /// - cookie: populated (use for next batch)
-    /// - entry_type: Unknown (no attributes fetched)
-    /// - stat: minimal (only inode populated)
-    ///
-    /// Use `NfsDirHandle::get_cookieverf()` to get the verifier for the next batch.
-    ///
-    /// # Arguments
-    /// * `path` - Directory path to read
-    /// * `cookie` - Starting position (0 for beginning, or last entry's cookie)
-    /// * `cookieverf` - Cookie verifier from previous batch (0 for first call)
-    /// * `max_entries` - Maximum entries to fetch (batch size)
-    pub fn opendir_names_only_at_cookie(
-        &self,
-        path: &str,
-        cookie: u64,
-        cookieverf: u64,
-        max_entries: u32,
-    ) -> NfsResult<NfsDirHandle> {
-        if !self.mounted {
-            return Err(NfsError::ReadDirFailed {
-                path: path.into(),
-                reason: "Not mounted".into(),
-            });
-        }
-
-        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadDirFailed {
-            path: path.into(),
-            reason: "Path contains null bytes".into(),
-        })?;
-
-        let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
-        let result = unsafe {
-            ffi::nfs_opendir_names_only_at_cookie(
-                self.context,
-                path_cstr.as_ptr(),
-                cookie,
-                cookieverf,
-                max_entries,
-                &mut dir_handle,
-            )
         };
 
         if result != 0 {
@@ -551,7 +416,6 @@ impl NfsConnection {
             entry_type,
             stat,
             inode: d.inode,
-            cookie: d.cookie,
         }
     }
 
@@ -690,37 +554,6 @@ impl NfsDirHandle {
         &self.path
     }
 
-    /// Get the cookie verifier from the last READDIR response
-    ///
-    /// This is required for streaming with `opendir_names_only_at_cookie()`.
-    /// Pass this verifier along with the continuation cookie to resume reading.
-    pub fn get_cookieverf(&self) -> u64 {
-        unsafe { ffi::nfs_readdir_get_cookieverf(self.handle) }
-    }
-
-    /// Get the continuation cookie for streaming READDIR
-    ///
-    /// This returns the cookie of the LAST entry received from the server.
-    /// IMPORTANT: Use this value (not the last-iterated entry's cookie) when calling
-    /// `opendir_names_only_at_cookie()` for the next batch. The entries linked list
-    /// is in reverse order, so iterating through entries and taking the last cookie
-    /// would give you the first entry's cookie, causing re-reads.
-    ///
-    /// NOTE: This is the last entry's cookie, NOT max cookie. With hash-based
-    /// cookies (like VAST), max cookie != last entry and would cause re-reads.
-    pub fn get_continuation_cookie(&self) -> u64 {
-        unsafe { ffi::nfs_readdir_get_continuation_cookie(self.handle) }
-    }
-
-    /// Check if end-of-directory was reached in the last READDIR response
-    ///
-    /// This is the authoritative way to detect end of directory when streaming
-    /// with `opendir_names_only_at_cookie()`. Do NOT rely on empty batches or
-    /// repeated entries to detect EOF - always check this flag.
-    pub fn is_eof(&self) -> bool {
-        unsafe { ffi::nfs_readdir_is_eof(self.handle) != 0 }
-    }
-
     /// Convert a libnfs dirent to our NfsDirEntry (same as NfsConnection::convert_dirent)
     unsafe fn convert_dirent(dirent: *mut ffi::nfsdirent) -> NfsDirEntry {
         let d = &*dirent;
@@ -752,7 +585,6 @@ impl NfsDirHandle {
             entry_type,
             stat,
             inode: d.inode,
-            cookie: d.cookie,
         }
     }
 }
@@ -766,6 +598,644 @@ impl Drop for NfsDirHandle {
             self.handle = ptr::null_mut();
         }
     }
+}
+
+/// Result of a big-dir check operation
+#[derive(Debug, Clone)]
+pub enum BigDirCheckResult {
+    /// Directory has at least `threshold` entries
+    IsBig { count: u64 },
+    /// Directory has fewer than `threshold` entries
+    NotBig { total_count: u64 },
+    /// Error occurred during check
+    Error(String),
+}
+
+/// Result of scanning a directory for big-dir-hunt mode
+#[derive(Debug, Clone)]
+pub struct BigDirScanResult {
+    /// Number of non-directory entries (files, symlinks, etc.)
+    pub file_count: u64,
+    /// Whether we hit the threshold (count may be higher)
+    pub threshold_hit: bool,
+    /// Names of subdirectories found
+    pub subdirs: Vec<String>,
+}
+
+/// Entry info collected during READDIRPLUS
+struct EntryInfo {
+    name: String,
+    is_dir: bool,
+}
+
+/// Context for READDIRPLUS with entry collection
+struct ReaddirplusScanData {
+    completed: bool,
+    status: i32,
+    eof: bool,
+    cookie: u64,
+    cookieverf: [i8; 8],
+    entries: Vec<EntryInfo>,
+}
+
+/// Context passed to RPC callbacks for LOOKUP operations
+struct LookupCallbackData {
+    completed: bool,
+    status: i32,
+    fh_len: usize,
+    fh_data: [u8; 128], // NFS3 max file handle is 64 bytes, but use 128 for safety
+}
+
+/// Context passed to RPC callbacks for READDIRPLUS operations
+struct ReaddirplusCallbackData {
+    completed: bool,
+    status: i32,
+    entry_count: u64,
+    eof: bool,
+    cookie: u64,
+    cookieverf: [i8; 8], // NFS cookieverf is char[8] which is i8 in Rust FFI
+}
+
+/// Callback for LOOKUP RPC
+unsafe extern "C" fn lookup_callback(
+    _rpc: *mut ffi::rpc_context,
+    status: ::std::os::raw::c_int,
+    data: *mut ::std::os::raw::c_void,
+    private_data: *mut ::std::os::raw::c_void,
+) {
+    let cb_data = &mut *(private_data as *mut LookupCallbackData);
+    cb_data.completed = true;
+    cb_data.status = status;
+
+    if status == ffi::RPC_STATUS_SUCCESS as i32 {
+        let res = &*(data as *const ffi::LOOKUP3res);
+        if res.status == 0 {
+            // NFS3_OK
+            let fh = &res.LOOKUP3res_u.resok.object;
+            let len = fh.data.data_len as usize;
+            if len <= cb_data.fh_data.len() {
+                cb_data.fh_len = len;
+                std::ptr::copy_nonoverlapping(
+                    fh.data.data_val as *const u8,
+                    cb_data.fh_data.as_mut_ptr(),
+                    len,
+                );
+            }
+        } else {
+            cb_data.status = -(res.status as i32);
+        }
+    }
+}
+
+/// Callback for READDIRPLUS RPC (counting only)
+unsafe extern "C" fn readdirplus_callback(
+    _rpc: *mut ffi::rpc_context,
+    status: ::std::os::raw::c_int,
+    data: *mut ::std::os::raw::c_void,
+    private_data: *mut ::std::os::raw::c_void,
+) {
+    let cb_data = &mut *(private_data as *mut ReaddirplusCallbackData);
+    cb_data.completed = true;
+    cb_data.status = status;
+
+    if status == ffi::RPC_STATUS_SUCCESS as i32 {
+        let res = &*(data as *const ffi::READDIRPLUS3res);
+        if res.status == 0 {
+            // NFS3_OK
+            let resok = &res.READDIRPLUS3res_u.resok;
+            cb_data.eof = resok.reply.eof != 0;
+
+            // Copy cookieverf for next call
+            cb_data.cookieverf.copy_from_slice(&resok.cookieverf);
+
+            // Count entries and get last cookie
+            let mut entry_ptr = resok.reply.entries;
+            while !entry_ptr.is_null() {
+                let entry = &*entry_ptr;
+                cb_data.entry_count += 1;
+                cb_data.cookie = entry.cookie;
+                entry_ptr = entry.nextentry;
+            }
+        } else {
+            cb_data.status = -(res.status as i32);
+        }
+    }
+}
+
+/// Callback for READDIRPLUS RPC (scanning with entry collection)
+unsafe extern "C" fn readdirplus_scan_callback(
+    _rpc: *mut ffi::rpc_context,
+    status: ::std::os::raw::c_int,
+    data: *mut ::std::os::raw::c_void,
+    private_data: *mut ::std::os::raw::c_void,
+) {
+    let cb_data = &mut *(private_data as *mut ReaddirplusScanData);
+    cb_data.completed = true;
+    cb_data.status = status;
+
+    if status == ffi::RPC_STATUS_SUCCESS as i32 {
+        let res = &*(data as *const ffi::READDIRPLUS3res);
+        if res.status == 0 {
+            // NFS3_OK
+            let resok = &res.READDIRPLUS3res_u.resok;
+            cb_data.eof = resok.reply.eof != 0;
+
+            // Copy cookieverf for next call
+            cb_data.cookieverf.copy_from_slice(&resok.cookieverf);
+
+            // Collect entries
+            let mut entry_ptr = resok.reply.entries;
+            while !entry_ptr.is_null() {
+                let entry = &*entry_ptr;
+                cb_data.cookie = entry.cookie;
+
+                // Get entry name
+                let name = if entry.name.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(entry.name).to_string_lossy().into_owned()
+                };
+
+                // Skip . and ..
+                if name != "." && name != ".." {
+                    // Check if it's a directory from attributes
+                    let is_dir = if entry.name_attributes.attributes_follow != 0 {
+                        // fattr3.type: NF3DIR = 2
+                        entry.name_attributes.post_op_attr_u.attributes.type_ == 2
+                    } else {
+                        false // Conservative: if no attrs, assume not a dir
+                    };
+
+                    cb_data.entries.push(EntryInfo { name, is_dir });
+                }
+
+                entry_ptr = entry.nextentry;
+            }
+        } else {
+            cb_data.status = -(res.status as i32);
+        }
+    }
+}
+
+/// Wait for an RPC operation to complete by polling
+///
+/// The `completed` pointer points to a bool that is set by the RPC callback.
+/// This function keeps polling until either the callback is called or timeout.
+///
+/// # Safety
+/// The `completed` pointer must remain valid for the duration of this call.
+fn wait_for_rpc_completion(
+    rpc: *mut ffi::rpc_context,
+    completed: *const bool,
+    timeout_ms: i32,
+) -> Result<(), String> {
+    use std::os::unix::io::RawFd;
+
+    let fd: RawFd = unsafe { ffi::rpc_get_fd(rpc) };
+    if fd < 0 {
+        return Err("Invalid RPC fd".to_string());
+    }
+
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(timeout_ms as u64);
+    let mut iteration = 0u32;
+
+    while !unsafe { *completed } {
+        if start.elapsed() > timeout {
+            tracing::debug!(
+                "RPC timeout after {} iterations, fd={}, elapsed={:?}",
+                iteration, fd, start.elapsed()
+            );
+            return Err("RPC timeout".to_string());
+        }
+
+        let events = unsafe { ffi::rpc_which_events(rpc) };
+
+        // Log first few iterations for debugging
+        if iteration < 5 {
+            tracing::debug!(
+                "RPC wait iter={}, events={:#x} (POLLIN={}, POLLOUT={})",
+                iteration,
+                events,
+                events & libc::POLLIN as i32,
+                events & libc::POLLOUT as i32
+            );
+        }
+
+        // If no events needed and not completed, something is wrong
+        if events == 0 {
+            // Try servicing with 0 events to process any internal state
+            let service_ret = unsafe { ffi::rpc_service(rpc, 0) };
+            if service_ret < 0 {
+                return Err("rpc_service failed (no events)".to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            iteration += 1;
+            continue;
+        }
+
+        let mut pfd = libc::pollfd {
+            fd,
+            events: events as i16,
+            revents: 0,
+        };
+
+        let poll_timeout = 100; // 100ms poll intervals
+        let ret = unsafe { libc::poll(&mut pfd, 1, poll_timeout) };
+
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue; // EINTR - retry
+            }
+            return Err(format!("poll failed: {}", err));
+        }
+
+        if ret > 0 {
+            if iteration < 5 {
+                tracing::debug!(
+                    "RPC poll returned: ret={}, revents={:#x}",
+                    ret, pfd.revents
+                );
+            }
+            // Process whatever events we got
+            let revents = if pfd.revents != 0 { pfd.revents as i32 } else { events };
+            let service_ret = unsafe { ffi::rpc_service(rpc, revents) };
+            if service_ret < 0 {
+                tracing::debug!("rpc_service returned {}", service_ret);
+                return Err(format!("rpc_service failed: {}", service_ret));
+            }
+        }
+
+        iteration += 1;
+    }
+
+    tracing::debug!("RPC completed after {} iterations", iteration);
+    Ok(())
+}
+
+/// Process any pending events on the RPC context to ensure it's in a clean state
+fn drain_pending_events(rpc: *mut ffi::rpc_context) {
+    use std::os::unix::io::RawFd;
+
+    let fd: RawFd = unsafe { ffi::rpc_get_fd(rpc) };
+    if fd < 0 {
+        return;
+    }
+
+    // Do a few rounds of non-blocking poll/service to drain any pending state
+    for _ in 0..3 {
+        let events = unsafe { ffi::rpc_which_events(rpc) };
+        if events == 0 {
+            break;
+        }
+
+        let mut pfd = libc::pollfd {
+            fd,
+            events: events as i16,
+            revents: 0,
+        };
+
+        // Non-blocking poll
+        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if ret > 0 && pfd.revents != 0 {
+            unsafe { ffi::rpc_service(rpc, pfd.revents as i32) };
+        } else {
+            break;
+        }
+    }
+}
+
+impl NfsConnection {
+    /// Check if a directory is "big" (has at least `threshold` non-directory entries)
+    ///
+    /// This uses raw NFS RPC calls to efficiently count directory entries without
+    /// buffering the entire directory. It makes READDIRPLUS calls with small
+    /// maxcount to minimize network traffic and stops as soon as threshold is reached.
+    ///
+    /// Returns:
+    /// - `BigDirCheckResult::IsBig` if count >= threshold (count is approximate lower bound)
+    /// - `BigDirCheckResult::NotBig` if directory has fewer than threshold entries
+    /// - `BigDirCheckResult::Error` if an error occurred
+    pub fn check_big_dir(&self, path: &str, threshold: u64) -> BigDirCheckResult {
+        if !self.mounted {
+            return BigDirCheckResult::Error("Not mounted".to_string());
+        }
+
+        // Get RPC context
+        let rpc = unsafe { ffi::nfs_get_rpc_context(self.context) };
+        if rpc.is_null() {
+            return BigDirCheckResult::Error("Failed to get RPC context".to_string());
+        }
+
+        // Get root file handle
+        let root_fh = unsafe { ffi::nfs_get_rootfh(self.context) };
+        if root_fh.is_null() {
+            return BigDirCheckResult::Error("Failed to get root file handle".to_string());
+        }
+
+        // Walk path to get directory file handle
+        let dir_fh = match self.lookup_path(rpc, root_fh, path) {
+            Ok(fh) => fh,
+            Err(e) => return BigDirCheckResult::Error(e),
+        };
+
+        // Now do READDIRPLUS calls to count entries
+        let mut total_count: u64 = 0;
+        let mut cookie: u64 = 0;
+        let mut cookieverf: [i8; 8] = [0; 8];
+
+        // Use small maxcount to get ~100-1000 entries per call
+        // Each entry is roughly 100-200 bytes (name + attributes)
+        // 32KB should give us ~200-300 entries per call
+        let dircount: u32 = 32768;
+        let maxcount: u32 = 65536;
+
+        loop {
+            let mut cb_data = ReaddirplusCallbackData {
+                completed: false,
+                status: 0,
+                entry_count: 0,
+                eof: false,
+                cookie: 0,
+                cookieverf: [0i8; 8],
+            };
+
+            // Build READDIRPLUS args
+            let mut args: ffi::READDIRPLUS3args = unsafe { std::mem::zeroed() };
+            args.dir.data.data_len = dir_fh.len as u32;
+            args.dir.data.data_val = dir_fh.data.as_ptr() as *mut i8;
+            args.cookie = cookie;
+            args.cookieverf = cookieverf;
+            args.dircount = dircount;
+            args.maxcount = maxcount;
+
+            let pdu = unsafe {
+                ffi::rpc_nfs3_readdirplus_task(
+                    rpc,
+                    Some(readdirplus_callback),
+                    &mut args,
+                    &mut cb_data as *mut _ as *mut std::ffi::c_void,
+                )
+            };
+
+            if pdu.is_null() {
+                return BigDirCheckResult::Error("Failed to queue READDIRPLUS".to_string());
+            }
+
+            // Wait for completion - pass pointer to completed flag
+            if let Err(e) = wait_for_rpc_completion(rpc, &cb_data.completed, 30000) {
+                return BigDirCheckResult::Error(format!("READDIRPLUS failed: {}", e));
+            }
+
+            // cb_data.completed is guaranteed true here since wait_for_rpc_completion returned Ok
+
+            if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
+                return BigDirCheckResult::Error(format!(
+                    "READDIRPLUS error: status={}",
+                    cb_data.status
+                ));
+            }
+
+            total_count += cb_data.entry_count;
+
+            // Check if we've hit the threshold
+            if total_count >= threshold {
+                return BigDirCheckResult::IsBig { count: total_count };
+            }
+
+            // Check if we've read all entries
+            if cb_data.eof {
+                return BigDirCheckResult::NotBig {
+                    total_count,
+                };
+            }
+
+            // Prepare for next call
+            cookie = cb_data.cookie;
+            cookieverf = cb_data.cookieverf;
+        }
+    }
+
+    /// Scan a directory for big-dir-hunt mode
+    ///
+    /// This uses raw NFS RPC calls to efficiently count directory entries and
+    /// discover subdirectories without buffering the entire directory.
+    /// It stops counting non-directory entries once threshold is reached,
+    /// but continues to read all entries to discover subdirectories.
+    ///
+    /// Returns a BigDirScanResult with:
+    /// - file_count: number of non-directory entries (capped at threshold if threshold_hit)
+    /// - threshold_hit: true if we stopped counting because threshold was reached
+    /// - subdirs: names of all subdirectories found
+    pub fn scan_big_dir(&self, path: &str, threshold: u64) -> Result<BigDirScanResult, String> {
+        if !self.mounted {
+            return Err("Not mounted".to_string());
+        }
+
+        // Get RPC context
+        let rpc = unsafe { ffi::nfs_get_rpc_context(self.context) };
+        if rpc.is_null() {
+            return Err("Failed to get RPC context".to_string());
+        }
+
+        // Drain any pending events to ensure clean state
+        drain_pending_events(rpc);
+
+        // Get root file handle
+        let root_fh = unsafe { ffi::nfs_get_rootfh(self.context) };
+        if root_fh.is_null() {
+            return Err("Failed to get root file handle".to_string());
+        }
+
+        // Walk path to get directory file handle
+        let dir_fh = self.lookup_path(rpc, root_fh, path)?;
+
+        // Now do READDIRPLUS calls to scan entries
+        let mut file_count: u64 = 0;
+        let mut threshold_hit = false;
+        let mut subdirs: Vec<String> = Vec::new();
+        let mut cookie: u64 = 0;
+        let mut cookieverf: [i8; 8] = [0; 8];
+
+        // Use reasonable maxcount for scanning
+        // We want to minimize calls while not getting too much data
+        let dircount: u32 = 65536;  // 64KB
+        let maxcount: u32 = 131072; // 128KB
+
+        loop {
+            let mut cb_data = ReaddirplusScanData {
+                completed: false,
+                status: 0,
+                eof: false,
+                cookie: 0,
+                cookieverf: [0i8; 8],
+                entries: Vec::with_capacity(1000),
+            };
+
+            // Build READDIRPLUS args
+            let mut args: ffi::READDIRPLUS3args = unsafe { std::mem::zeroed() };
+            args.dir.data.data_len = dir_fh.len as u32;
+            args.dir.data.data_val = dir_fh.data.as_ptr() as *mut i8;
+            args.cookie = cookie;
+            args.cookieverf = cookieverf;
+            args.dircount = dircount;
+            args.maxcount = maxcount;
+
+            let pdu = unsafe {
+                ffi::rpc_nfs3_readdirplus_task(
+                    rpc,
+                    Some(readdirplus_scan_callback),
+                    &mut args,
+                    &mut cb_data as *mut _ as *mut std::ffi::c_void,
+                )
+            };
+
+            if pdu.is_null() {
+                return Err("Failed to queue READDIRPLUS".to_string());
+            }
+
+            // Wait for completion - pass pointer to completed flag
+            wait_for_rpc_completion(rpc, &cb_data.completed, 30000)?;
+
+            // cb_data.completed is guaranteed true here
+
+            if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
+                return Err(format!("READDIRPLUS error: status={}", cb_data.status));
+            }
+
+            // Process collected entries
+            for entry in cb_data.entries {
+                if entry.is_dir {
+                    subdirs.push(entry.name);
+                } else if !threshold_hit {
+                    file_count += 1;
+                    if file_count >= threshold {
+                        threshold_hit = true;
+                        // Continue to collect subdirs
+                    }
+                }
+            }
+
+            // Check if we've read all entries
+            if cb_data.eof {
+                break;
+            }
+
+            // Prepare for next call
+            cookie = cb_data.cookie;
+            cookieverf = cb_data.cookieverf;
+        }
+
+        Ok(BigDirScanResult {
+            file_count,
+            threshold_hit,
+            subdirs,
+        })
+    }
+
+    /// Walk a path starting from a file handle, returning the final file handle
+    fn lookup_path(
+        &self,
+        rpc: *mut ffi::rpc_context,
+        start_fh: *const ffi::nfs_fh,
+        path: &str,
+    ) -> Result<FileHandle, String> {
+        let start_fh = unsafe { &*start_fh };
+
+        // Start with the given file handle
+        let mut current_fh = FileHandle {
+            len: start_fh.len as usize,
+            data: [0u8; 128],
+        };
+        if current_fh.len > 128 {
+            return Err("File handle too large".to_string());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                start_fh.val as *const u8,
+                current_fh.data.as_mut_ptr(),
+                current_fh.len,
+            );
+        }
+
+        // If path is "/" or empty, return root handle
+        let path = path.trim_start_matches('/');
+        if path.is_empty() {
+            return Ok(current_fh);
+        }
+
+        // Walk each component
+        for component in path.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+
+            current_fh = self.lookup_single(rpc, &current_fh, component)?;
+        }
+
+        Ok(current_fh)
+    }
+
+    /// Do a single LOOKUP operation
+    fn lookup_single(
+        &self,
+        rpc: *mut ffi::rpc_context,
+        dir_fh: &FileHandle,
+        name: &str,
+    ) -> Result<FileHandle, String> {
+        let name_cstr = CString::new(name).map_err(|_| "Invalid name".to_string())?;
+
+        let mut cb_data = LookupCallbackData {
+            completed: false,
+            status: 0,
+            fh_len: 0,
+            fh_data: [0; 128],
+        };
+
+        // Build LOOKUP args
+        let mut args: ffi::LOOKUP3args = unsafe { std::mem::zeroed() };
+        args.what.dir.data.data_len = dir_fh.len as u32;
+        args.what.dir.data.data_val = dir_fh.data.as_ptr() as *mut i8;
+        args.what.name = name_cstr.as_ptr() as *mut i8;
+
+        let pdu = unsafe {
+            ffi::rpc_nfs3_lookup_task(
+                rpc,
+                Some(lookup_callback),
+                &mut args,
+                &mut cb_data as *mut _ as *mut std::ffi::c_void,
+            )
+        };
+
+        if pdu.is_null() {
+            return Err(format!("Failed to queue LOOKUP for '{}'", name));
+        }
+
+        // Wait for completion - pass pointer to completed flag
+        wait_for_rpc_completion(rpc, &cb_data.completed, 10000)?;
+
+        // cb_data.completed is guaranteed true here
+
+        if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
+            return Err(format!("LOOKUP '{}' failed: status={}", name, cb_data.status));
+        }
+
+        if cb_data.fh_len == 0 {
+            return Err(format!("LOOKUP '{}' returned empty handle", name));
+        }
+
+        Ok(FileHandle {
+            len: cb_data.fh_len,
+            data: cb_data.fh_data,
+        })
+    }
+}
+
+/// Internal file handle representation
+struct FileHandle {
+    len: usize,
+    data: [u8; 128],
 }
 
 /// Builder for NFS connections with retry support
@@ -933,6 +1403,568 @@ pub fn resolve_dns_with_attempts(hostname: &str, attempts: usize) -> Vec<String>
         let mut ips: Vec<String> = all_ips.into_iter().collect();
         ips.sort();
         ips
+    }
+}
+
+/// A raw RPC context for big-dir scanning that maintains its own connection.
+///
+/// This creates a completely separate RPC context that doesn't share state
+/// with any `NfsConnection`. This avoids issues where mixing sync and async
+/// operations on the same context causes callbacks to never fire.
+///
+/// Usage:
+/// 1. Create with `RawRpcContext::connect()`
+/// 2. Call `scan_big_dir()` to scan directories
+/// 3. Drop when done (automatically cleans up)
+pub struct RawRpcContext {
+    /// The RPC context pointer
+    rpc: *mut ffi::rpc_context,
+    /// Root file handle from MOUNT
+    root_fh: FileHandle,
+    /// Server name (for logging/debugging)
+    #[allow(dead_code)]
+    server: String,
+    /// Export path (for logging/debugging)
+    #[allow(dead_code)]
+    export: String,
+}
+
+// RawRpcContext owns its RPC context and can be sent between threads
+unsafe impl Send for RawRpcContext {}
+
+/// Callback data for simple RPC operations
+struct SimpleCallbackData {
+    completed: bool,
+    status: i32,
+    error_msg: Option<String>,
+}
+
+/// Callback data for MOUNT operation
+struct MountCallbackData {
+    completed: bool,
+    status: i32,
+    fh_len: usize,
+    fh_data: [u8; 128],
+    error_msg: Option<String>,
+}
+
+/// Generic RPC callback for connection
+unsafe extern "C" fn connect_callback(
+    _rpc: *mut ffi::rpc_context,
+    status: ::std::os::raw::c_int,
+    data: *mut ::std::os::raw::c_void,
+    private_data: *mut ::std::os::raw::c_void,
+) {
+    let cb_data = &mut *(private_data as *mut SimpleCallbackData);
+    cb_data.completed = true;
+    cb_data.status = status;
+
+    if status == ffi::RPC_STATUS_ERROR as i32 && !data.is_null() {
+        let err_str = CStr::from_ptr(data as *const i8);
+        cb_data.error_msg = Some(err_str.to_string_lossy().into_owned());
+    }
+}
+
+/// Callback for MOUNT3/MNT operation
+unsafe extern "C" fn mount_callback(
+    _rpc: *mut ffi::rpc_context,
+    status: ::std::os::raw::c_int,
+    data: *mut ::std::os::raw::c_void,
+    private_data: *mut ::std::os::raw::c_void,
+) {
+    let cb_data = &mut *(private_data as *mut MountCallbackData);
+    cb_data.completed = true;
+    cb_data.status = status;
+
+    if status == ffi::RPC_STATUS_SUCCESS as i32 {
+        let res = &*(data as *const ffi::mountres3);
+        if res.fhs_status == ffi::mountstat3_MNT3_OK {
+            // Extract file handle
+            let fh = &res.mountres3_u.mountinfo.fhandle;
+            let len = fh.fhandle3_len as usize;
+            if len <= cb_data.fh_data.len() {
+                cb_data.fh_len = len;
+                std::ptr::copy_nonoverlapping(
+                    fh.fhandle3_val as *const u8,
+                    cb_data.fh_data.as_mut_ptr(),
+                    len,
+                );
+            } else {
+                cb_data.error_msg = Some(format!("File handle too large: {}", len));
+            }
+        } else {
+            cb_data.error_msg = Some(format!("MOUNT failed: status={}", res.fhs_status as i32));
+        }
+    } else if status == ffi::RPC_STATUS_ERROR as i32 && !data.is_null() {
+        let err_str = CStr::from_ptr(data as *const i8);
+        cb_data.error_msg = Some(err_str.to_string_lossy().into_owned());
+    }
+}
+
+impl RawRpcContext {
+    /// NFS program number
+    const NFS_PROGRAM: i32 = 100003;
+    /// NFS version 3
+    const NFS_V3: i32 = 3;
+    /// MOUNT program number
+    const MOUNT_PROGRAM: i32 = 100005;
+    /// MOUNT version 3
+    const MOUNT_V3: i32 = 3;
+
+    /// Connect to an NFS server and mount the export using raw RPC.
+    ///
+    /// This creates a fresh RPC context, connects to the MOUNT service,
+    /// gets the root file handle, then reconnects to the NFS service.
+    pub fn connect(server: &str, export: &str, timeout_ms: i32) -> Result<Self, String> {
+        // Create a fresh RPC context
+        let rpc = unsafe { ffi::rpc_init_context() };
+        if rpc.is_null() {
+            return Err("Failed to create RPC context".to_string());
+        }
+
+        // Set uid/gid for auth
+        unsafe {
+            let uid = libc::getuid() as i32;
+            let gid = libc::getgid() as i32;
+            ffi::rpc_set_uid(rpc, uid);
+            ffi::rpc_set_gid(rpc, gid);
+            ffi::rpc_set_timeout(rpc, timeout_ms);
+        }
+
+        // Step 1: Connect to MOUNT service and get root file handle
+        let root_fh = Self::do_mount(rpc, server, export, timeout_ms)?;
+
+        // Step 2: Disconnect from MOUNT and reconnect to NFS
+        // Note: rpc_disconnect doesn't exist in the way we'd expect - we just connect to a new program
+        // Actually we need to create a new context for NFS since we're done with MOUNT
+        unsafe { ffi::rpc_destroy_context(rpc); }
+
+        // Create new context for NFS
+        let rpc = unsafe { ffi::rpc_init_context() };
+        if rpc.is_null() {
+            return Err("Failed to create NFS RPC context".to_string());
+        }
+
+        // Set uid/gid and timeout again
+        unsafe {
+            let uid = libc::getuid() as i32;
+            let gid = libc::getgid() as i32;
+            ffi::rpc_set_uid(rpc, uid);
+            ffi::rpc_set_gid(rpc, gid);
+            ffi::rpc_set_timeout(rpc, timeout_ms);
+        }
+
+        // Connect to NFS service
+        Self::connect_to_nfs(rpc, server, timeout_ms)?;
+
+        Ok(Self {
+            rpc,
+            root_fh,
+            server: server.to_string(),
+            export: export.to_string(),
+        })
+    }
+
+    /// Connect to MOUNT service and get the root file handle
+    fn do_mount(rpc: *mut ffi::rpc_context, server: &str, export: &str, timeout_ms: i32) -> Result<FileHandle, String> {
+        let server_cstr = CString::new(server).map_err(|_| "Invalid server name")?;
+        let export_cstr = CString::new(export).map_err(|_| "Invalid export path")?;
+
+        // Connect to MOUNT service using portmapper
+        let mut cb_data = SimpleCallbackData {
+            completed: false,
+            status: 0,
+            error_msg: None,
+        };
+
+        let ret = unsafe {
+            ffi::rpc_connect_program_async(
+                rpc,
+                server_cstr.as_ptr(),
+                Self::MOUNT_PROGRAM,
+                Self::MOUNT_V3,
+                Some(connect_callback),
+                &mut cb_data as *mut _ as *mut std::ffi::c_void,
+            )
+        };
+
+        if ret != 0 {
+            return Err(format!("Failed to initiate MOUNT connection: ret={}", ret));
+        }
+
+        // Wait for connection
+        Self::wait_for_completion(rpc, &cb_data.completed, timeout_ms)?;
+
+        if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
+            let msg = cb_data.error_msg.unwrap_or_else(|| "Unknown error".to_string());
+            return Err(format!("MOUNT connection failed: {}", msg));
+        }
+
+        // Now do the actual MOUNT call
+        let mut mount_data = MountCallbackData {
+            completed: false,
+            status: 0,
+            fh_len: 0,
+            fh_data: [0; 128],
+            error_msg: None,
+        };
+
+        let pdu = unsafe {
+            ffi::rpc_mount3_mnt_task(
+                rpc,
+                Some(mount_callback),
+                export_cstr.as_ptr() as *mut i8,
+                &mut mount_data as *mut _ as *mut std::ffi::c_void,
+            )
+        };
+
+        if pdu.is_null() {
+            return Err("Failed to queue MOUNT RPC".to_string());
+        }
+
+        // Wait for MOUNT to complete
+        Self::wait_for_completion(rpc, &mount_data.completed, timeout_ms)?;
+
+        if mount_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
+            let msg = mount_data.error_msg.unwrap_or_else(|| "Unknown error".to_string());
+            return Err(format!("MOUNT failed: {}", msg));
+        }
+
+        if mount_data.fh_len == 0 {
+            let msg = mount_data.error_msg.unwrap_or_else(|| "Empty file handle".to_string());
+            return Err(format!("MOUNT returned invalid handle: {}", msg));
+        }
+
+        Ok(FileHandle {
+            len: mount_data.fh_len,
+            data: mount_data.fh_data,
+        })
+    }
+
+    /// Connect to the NFS service
+    fn connect_to_nfs(rpc: *mut ffi::rpc_context, server: &str, timeout_ms: i32) -> Result<(), String> {
+        let server_cstr = CString::new(server).map_err(|_| "Invalid server name")?;
+
+        let mut cb_data = SimpleCallbackData {
+            completed: false,
+            status: 0,
+            error_msg: None,
+        };
+
+        let ret = unsafe {
+            ffi::rpc_connect_program_async(
+                rpc,
+                server_cstr.as_ptr(),
+                Self::NFS_PROGRAM,
+                Self::NFS_V3,
+                Some(connect_callback),
+                &mut cb_data as *mut _ as *mut std::ffi::c_void,
+            )
+        };
+
+        if ret != 0 {
+            return Err(format!("Failed to initiate NFS connection: ret={}", ret));
+        }
+
+        Self::wait_for_completion(rpc, &cb_data.completed, timeout_ms)?;
+
+        if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
+            let msg = cb_data.error_msg.unwrap_or_else(|| "Unknown error".to_string());
+            return Err(format!("NFS connection failed: {}", msg));
+        }
+
+        Ok(())
+    }
+
+    /// Wait for an RPC operation to complete
+    fn wait_for_completion(rpc: *mut ffi::rpc_context, completed: *const bool, timeout_ms: i32) -> Result<(), String> {
+        use std::os::unix::io::RawFd;
+
+        let fd: RawFd = unsafe { ffi::rpc_get_fd(rpc) };
+        if fd < 0 {
+            return Err(format!("Invalid RPC fd: {}", fd));
+        }
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(timeout_ms as u64);
+        let mut iteration = 0u32;
+
+        while !unsafe { *completed } {
+            if start.elapsed() > timeout {
+                return Err(format!("RPC timeout after {} iterations", iteration));
+            }
+
+            let events = unsafe { ffi::rpc_which_events(rpc) };
+
+            if iteration < 3 {
+                tracing::debug!(
+                    "RawRPC wait: iter={}, fd={}, events={:#x} (POLLIN={}, POLLOUT={})",
+                    iteration, fd, events,
+                    events & libc::POLLIN as i32,
+                    events & libc::POLLOUT as i32
+                );
+            }
+
+            if events == 0 {
+                // Service with 0 events to process internal state
+                let ret = unsafe { ffi::rpc_service(rpc, 0) };
+                if ret < 0 {
+                    let err_msg = unsafe {
+                        let err_ptr = ffi::rpc_get_error(rpc);
+                        if err_ptr.is_null() {
+                            "unknown".to_string()
+                        } else {
+                            CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+                        }
+                    };
+                    return Err(format!("rpc_service failed (no events): ret={}, err={}", ret, err_msg));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                iteration += 1;
+                continue;
+            }
+
+            let mut pfd = libc::pollfd {
+                fd,
+                events: events as i16,
+                revents: 0,
+            };
+
+            let poll_timeout = std::cmp::min(100, (timeout - start.elapsed()).as_millis() as i32);
+            let ret = unsafe { libc::poll(&mut pfd, 1, poll_timeout) };
+
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(format!("poll failed: {}", err));
+            }
+
+            // Process events (or timeout)
+            let revents = if pfd.revents != 0 { pfd.revents as i32 } else { 0 };
+
+            if iteration < 3 {
+                tracing::debug!(
+                    "RawRPC service: iter={}, poll_ret={}, revents={:#x}",
+                    iteration, ret, revents
+                );
+            }
+
+            let service_ret = unsafe { ffi::rpc_service(rpc, revents) };
+            if service_ret < 0 {
+                let err_msg = unsafe {
+                    let err_ptr = ffi::rpc_get_error(rpc);
+                    if err_ptr.is_null() {
+                        "unknown".to_string()
+                    } else {
+                        CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+                    }
+                };
+                return Err(format!("rpc_service failed: ret={}, revents={:#x}, err={}", service_ret, revents, err_msg));
+            }
+
+            iteration += 1;
+        }
+
+        tracing::debug!("RawRPC completed after {} iterations", iteration);
+        Ok(())
+    }
+
+    /// Scan a directory for big-dir-hunt mode using raw NFS RPCs.
+    ///
+    /// This is much faster than nfs_opendir for huge directories because it:
+    /// 1. Uses raw READDIRPLUS RPCs directly
+    /// 2. Processes entries as they arrive (no buffering)
+    /// 3. Stops immediately once threshold is reached (early exit)
+    ///
+    /// If `early_exit` is true, stops reading as soon as threshold is hit.
+    /// This is much faster for huge directories but may miss some subdirectories.
+    pub fn scan_big_dir(&self, path: &str, threshold: u64) -> Result<BigDirScanResult, String> {
+        self.scan_big_dir_impl(path, threshold, true) // Default to early exit
+    }
+
+    /// Internal implementation with configurable early exit
+    fn scan_big_dir_impl(&self, path: &str, threshold: u64, early_exit: bool) -> Result<BigDirScanResult, String> {
+        // Walk path to get directory file handle
+        let dir_fh = self.lookup_path(path)?;
+
+        // Now do READDIRPLUS calls to scan entries
+        let mut file_count: u64 = 0;
+        let mut threshold_hit = false;
+        let mut subdirs: Vec<String> = Vec::new();
+        let mut cookie: u64 = 0;
+        let mut cookieverf: [i8; 8] = [0; 8];
+
+        // Use small maxcount to avoid TCP fragmentation issues in raw RPC mode
+        // libnfs raw RPC doesn't handle fragmented responses well
+        // 8KB maxcount should give us ~50-100 entries per call
+        let dircount: u32 = 4096;   // 4KB
+        let maxcount: u32 = 8192;   // 8KB
+
+        loop {
+            let mut cb_data = ReaddirplusScanData {
+                completed: false,
+                status: 0,
+                eof: false,
+                cookie: 0,
+                cookieverf: [0i8; 8],
+                entries: Vec::with_capacity(1000),
+            };
+
+            // Build READDIRPLUS args
+            let mut args: ffi::READDIRPLUS3args = unsafe { std::mem::zeroed() };
+            args.dir.data.data_len = dir_fh.len as u32;
+            args.dir.data.data_val = dir_fh.data.as_ptr() as *mut i8;
+            args.cookie = cookie;
+            args.cookieverf = cookieverf;
+            args.dircount = dircount;
+            args.maxcount = maxcount;
+
+            let pdu = unsafe {
+                ffi::rpc_nfs3_readdirplus_task(
+                    self.rpc,
+                    Some(readdirplus_scan_callback),
+                    &mut args,
+                    &mut cb_data as *mut _ as *mut std::ffi::c_void,
+                )
+            };
+
+            if pdu.is_null() {
+                return Err("Failed to queue READDIRPLUS".to_string());
+            }
+
+            // Wait for completion
+            Self::wait_for_completion(self.rpc, &cb_data.completed, 30000)?;
+
+            if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
+                return Err(format!("READDIRPLUS error: status={}", cb_data.status));
+            }
+
+            // Process collected entries
+            for entry in cb_data.entries {
+                if entry.is_dir {
+                    subdirs.push(entry.name);
+                } else {
+                    file_count += 1;
+                    if file_count >= threshold {
+                        threshold_hit = true;
+                        if early_exit {
+                            // Stop immediately - we found a big directory
+                            return Ok(BigDirScanResult {
+                                file_count,
+                                threshold_hit: true,
+                                subdirs,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Check if we've read all entries
+            if cb_data.eof {
+                break;
+            }
+
+            // Prepare for next call
+            cookie = cb_data.cookie;
+            cookieverf = cb_data.cookieverf;
+        }
+
+        Ok(BigDirScanResult {
+            file_count,
+            threshold_hit,
+            subdirs,
+        })
+    }
+
+    /// Walk a path starting from root, returning the final file handle
+    fn lookup_path(&self, path: &str) -> Result<FileHandle, String> {
+        // Start with root handle
+        let mut current_fh = self.root_fh.clone();
+
+        // If path is "/" or empty, return root handle
+        let path = path.trim_start_matches('/');
+        if path.is_empty() {
+            return Ok(current_fh);
+        }
+
+        // Walk each component
+        for component in path.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            current_fh = self.lookup_single(&current_fh, component)?;
+        }
+
+        Ok(current_fh)
+    }
+
+    /// Do a single LOOKUP operation
+    fn lookup_single(&self, dir_fh: &FileHandle, name: &str) -> Result<FileHandle, String> {
+        let name_cstr = CString::new(name).map_err(|_| "Invalid name")?;
+
+        let mut cb_data = LookupCallbackData {
+            completed: false,
+            status: 0,
+            fh_len: 0,
+            fh_data: [0; 128],
+        };
+
+        // Build LOOKUP args
+        let mut args: ffi::LOOKUP3args = unsafe { std::mem::zeroed() };
+        args.what.dir.data.data_len = dir_fh.len as u32;
+        args.what.dir.data.data_val = dir_fh.data.as_ptr() as *mut i8;
+        args.what.name = name_cstr.as_ptr() as *mut i8;
+
+        let pdu = unsafe {
+            ffi::rpc_nfs3_lookup_task(
+                self.rpc,
+                Some(lookup_callback),
+                &mut args,
+                &mut cb_data as *mut _ as *mut std::ffi::c_void,
+            )
+        };
+
+        if pdu.is_null() {
+            return Err(format!("Failed to queue LOOKUP for '{}'", name));
+        }
+
+        Self::wait_for_completion(self.rpc, &cb_data.completed, 10000)?;
+
+        if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
+            return Err(format!("LOOKUP '{}' failed: status={}", name, cb_data.status));
+        }
+
+        if cb_data.fh_len == 0 {
+            return Err(format!("LOOKUP '{}' returned empty handle", name));
+        }
+
+        Ok(FileHandle {
+            len: cb_data.fh_len,
+            data: cb_data.fh_data,
+        })
+    }
+}
+
+impl Drop for RawRpcContext {
+    fn drop(&mut self) {
+        if !self.rpc.is_null() {
+            unsafe {
+                ffi::rpc_destroy_context(self.rpc);
+            }
+            self.rpc = ptr::null_mut();
+        }
+    }
+}
+
+// Implement Clone for FileHandle so we can copy it
+impl Clone for FileHandle {
+    fn clone(&self) -> Self {
+        FileHandle {
+            len: self.len,
+            data: self.data,
+        }
     }
 }
 

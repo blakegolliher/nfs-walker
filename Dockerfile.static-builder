@@ -1,0 +1,57 @@
+# Build nfs-walker with RocksDB as a portable Linux binary
+#
+# Uses Debian with static linking where possible. The resulting binary
+# is compatible with any Linux system with glibc 2.31+.
+#
+# Usage:
+#   podman build -f Dockerfile.static-builder -t nfs-walker-builder .
+#   podman run --rm nfs-walker-builder cat /app/target/release/nfs-walker > nfs-walker
+#   chmod +x nfs-walker
+
+FROM docker.io/library/rust:1.83.0-bookworm as builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    git \
+    autoconf \
+    automake \
+    libtool \
+    clang \
+    libclang-dev \
+    llvm-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Build libnfs from source as a static library
+RUN git clone https://github.com/sahlberg/libnfs.git && \
+    cd libnfs && \
+    git checkout libnfs-5.0.3 && \
+    ./bootstrap && \
+    ./configure --prefix=/usr/local --disable-examples --disable-utils --disable-shared --enable-static && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd .. && \
+    rm -rf libnfs
+
+# Set environment variables
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+
+# Copy project source code
+COPY . .
+
+# Clean any stale Cargo.lock
+RUN rm -f Cargo.lock
+
+# Build the release binary with RocksDB (default features)
+# Use LTO and static linking where possible
+RUN cargo build --release
+
+# Strip the binary for smaller size
+RUN strip /app/target/release/nfs-walker
+
+# The final binary is at:
+# /app/target/release/nfs-walker

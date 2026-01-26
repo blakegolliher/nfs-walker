@@ -63,6 +63,18 @@ impl Default for ProgressReporter {
     }
 }
 
+/// Format a duration as human-readable elapsed time
+pub fn format_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 /// Format a number with thousands separators
 fn format_number(n: u64) -> String {
     let s = n.to_string();
@@ -112,6 +124,58 @@ pub fn print_summary(
     println!("  {} {}", style("Total Size:").bold(), bytes_str);
     println!(
         "  {} {:.1}s ({:.0} files/sec)",
+        style("Duration:").bold(),
+        duration_secs,
+        rate
+    );
+    if errors > 0 {
+        println!(
+            "  {} {}",
+            style("Errors:").yellow().bold(),
+            format_number(errors)
+        );
+    }
+    // Show database path with size if available
+    if let Some(size) = db_size {
+        let db_size_str = format_size(size, BINARY);
+        println!("  {} {} ({})", style("Database:").bold(), db_path, db_size_str);
+    } else {
+        println!("  {} {}", style("Database:").bold(), db_path);
+    }
+    println!();
+}
+
+/// Print a summary for big-dir-hunt mode
+pub fn print_big_dir_hunt_summary(
+    dirs_scanned: u64,
+    big_dirs_found: u64,
+    errors: u64,
+    duration: Duration,
+    db_path: &str,
+    db_size: Option<u64>,
+) {
+    let duration_secs = duration.as_secs_f64();
+    let rate = if duration_secs > 0.0 {
+        dirs_scanned as f64 / duration_secs
+    } else {
+        0.0
+    };
+
+    println!();
+    println!("{}", style("Big-Dir Hunt Complete").green().bold());
+    println!("{}", style("─".repeat(50)).dim());
+    println!(
+        "  {} {}",
+        style("Directories scanned:").bold(),
+        format_number(dirs_scanned)
+    );
+    println!(
+        "  {} {}",
+        style("Big directories found:").bold(),
+        style(format_number(big_dirs_found)).yellow()
+    );
+    println!(
+        "  {} {:.1}s ({:.0} dirs/sec)",
         style("Duration:").bold(),
         duration_secs,
         rate

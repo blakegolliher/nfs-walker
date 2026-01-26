@@ -1,0 +1,5 @@
+[target.x86_64-unknown-linux-musl]
+# Mount the libnfs directory so the container can read the .a file
+mounts = [
+  "/home/vastdata/projects/libnfs:/home/vastdata/projects/libnfs"
+]

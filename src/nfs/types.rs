@@ -28,6 +28,20 @@ pub enum EntryType {
 }
 
 impl EntryType {
+    /// Convert from u8 (database value)
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => EntryType::File,
+            1 => EntryType::Directory,
+            2 => EntryType::Symlink,
+            3 => EntryType::BlockDevice,
+            4 => EntryType::CharDevice,
+            5 => EntryType::Fifo,
+            6 => EntryType::Socket,
+            _ => EntryType::Unknown,
+        }
+    }
+
     /// Convert from libnfs file type constant
     pub fn from_nfs_type(nfs_type: u32) -> Self {
         // libnfs uses standard Unix type values
@@ -185,9 +199,6 @@ pub struct NfsDirEntry {
 
     /// Inode number (always available)
     pub inode: u64,
-
-    /// NFS directory cookie (position marker for parallel reads)
-    pub cookie: u64,
 }
 
 impl NfsDirEntry {
@@ -245,6 +256,20 @@ impl NfsDirEntry {
     pub fn nlink(&self) -> Option<u64> {
         self.stat.as_ref().map(|s| s.nlink)
     }
+
+    /// Get blocks (512-byte blocks allocated)
+    pub fn blocks(&self) -> u64 {
+        self.stat.as_ref().map(|s| s.blocks).unwrap_or(0)
+    }
+}
+
+/// Entry for big directory hunting mode
+#[derive(Debug, Clone)]
+pub struct BigDirEntry {
+    /// Full path of the directory
+    pub path: String,
+    /// Number of files (non-directory entries) in this directory
+    pub file_count: u64,
 }
 
 /// Statistics collected while walking a directory
@@ -336,6 +361,12 @@ pub struct DbEntry {
 
     /// Directory depth from root
     pub depth: u32,
+
+    /// File extension (without dot, lowercase)
+    pub extension: Option<String>,
+
+    /// Number of 512-byte blocks allocated
+    pub blocks: u64,
 }
 
 impl DbEntry {
@@ -358,6 +389,15 @@ impl DbEntry {
             Some(parent_path.to_string())
         };
 
+        // Extract extension from filename (for files only)
+        let extension = if dir_entry.entry_type == EntryType::File {
+            dir_entry.name.rsplit('.').next()
+                .filter(|ext| ext.len() < 10 && !ext.contains('/'))
+                .map(|s| s.to_lowercase())
+        } else {
+            None
+        };
+
         Self {
             parent_path: parent,
             name: dir_entry.name.clone(),
@@ -373,6 +413,8 @@ impl DbEntry {
             nlink: dir_entry.nlink(),
             inode: dir_entry.inode,
             depth,
+            extension,
+            blocks: dir_entry.blocks(),
         }
     }
 
@@ -396,11 +438,22 @@ impl DbEntry {
             Some("/".to_string())
         };
 
+        let entry_type = stat.entry_type();
+
+        // Extract extension from filename (for files only)
+        let extension = if entry_type == EntryType::File {
+            name.rsplit('.').next()
+                .filter(|ext| ext.len() < 10 && !ext.contains('/'))
+                .map(|s| s.to_lowercase())
+        } else {
+            None
+        };
+
         Self {
             parent_path: parent,
             name: name.to_string(),
             path: full_path.to_string(),
-            entry_type: stat.entry_type(),
+            entry_type,
             size: stat.size,
             mtime: stat.mtime,
             atime: stat.atime,
@@ -411,6 +464,8 @@ impl DbEntry {
             nlink: Some(stat.nlink),
             inode: stat.inode,
             depth,
+            extension,
+            blocks: stat.blocks,
         }
     }
 
@@ -431,6 +486,8 @@ impl DbEntry {
             nlink: None,
             inode: 0,
             depth: 0,
+            extension: None,
+            blocks: 0,
         }
     }
 
@@ -484,7 +541,6 @@ mod tests {
                 ..Default::default()
             }),
             inode: 1,
-            cookie: 0,
         };
 
         let dir_entry = NfsDirEntry {
@@ -492,7 +548,6 @@ mod tests {
             entry_type: EntryType::Directory,
             stat: None,
             inode: 2,
-            cookie: 0,
         };
 
         stats.add_entry(&file_entry);
@@ -511,7 +566,6 @@ mod tests {
             entry_type: EntryType::File,
             stat: None,
             inode: 123,
-            cookie: 0,
         };
 
         let db_entry = DbEntry::from_nfs_entry(&nfs_entry, "/data/subdir", 2);
@@ -535,7 +589,6 @@ mod tests {
             entry_type: EntryType::Directory,
             stat: None,
             inode: 1,
-            cookie: 0,
         };
         let child = DbEntry::from_nfs_entry(&nfs_entry, "/data", 2);
         assert_eq!(child.path, "/data/subdir");
