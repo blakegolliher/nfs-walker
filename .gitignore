@@ -44,5 +44,9 @@ prompt.md
 *.db-shm
 *.db-wal
 *.db-journal
-docs/
+# Local planning docs (not committed)
+docs/product_ideas.md
+docs/INCREMENTAL_SCAN_SPEC.md
+docs/HANDOFF_INCREMENTAL_SCAN.md
+
 vendor/libnfs
