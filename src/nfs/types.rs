@@ -199,6 +199,10 @@ pub struct NfsDirEntry {
 
     /// Inode number (always available)
     pub inode: u64,
+
+    /// File handle from READDIRPLUS name_handle (for directories)
+    /// Used to skip LOOKUP RPCs when opening subdirectories
+    pub file_handle: Option<Vec<u8>>,
 }
 
 impl NfsDirEntry {
@@ -541,6 +545,7 @@ mod tests {
                 ..Default::default()
             }),
             inode: 1,
+            file_handle: None,
         };
 
         let dir_entry = NfsDirEntry {
@@ -548,6 +553,7 @@ mod tests {
             entry_type: EntryType::Directory,
             stat: None,
             inode: 2,
+            file_handle: None,
         };
 
         stats.add_entry(&file_entry);
@@ -566,6 +572,7 @@ mod tests {
             entry_type: EntryType::File,
             stat: None,
             inode: 123,
+            file_handle: None,
         };
 
         let db_entry = DbEntry::from_nfs_entry(&nfs_entry, "/data/subdir", 2);
@@ -589,6 +596,7 @@ mod tests {
             entry_type: EntryType::Directory,
             stat: None,
             inode: 1,
+            file_handle: None,
         };
         let child = DbEntry::from_nfs_entry(&nfs_entry, "/data", 2);
         assert_eq!(child.path, "/data/subdir");

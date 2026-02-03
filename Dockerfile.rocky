@@ -1,0 +1,96 @@
+# Build nfs-walker with RocksDB for RHEL/Rocky 9+ compatibility
+#
+# Uses Rocky Linux 9 as base to ensure glibc 2.34 compatibility.
+# Statically links libstdc++ to eliminate C++ runtime dependency.
+# Result works on Rocky 9, RHEL 9, AlmaLinux 9, and newer distros.
+#
+# Usage:
+#   podman build -f Dockerfile.rocky -t nfs-walker-rocky .
+#   podman run --rm nfs-walker-rocky cat /build/nfs-walker > nfs-walker
+#   chmod +x nfs-walker
+
+FROM docker.io/rockylinux/rockylinux:9 AS builder
+
+# Install build dependencies
+RUN dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y --allowerasing \
+        gcc \
+        gcc-c++ \
+        make \
+        cmake \
+        git \
+        autoconf \
+        automake \
+        libtool \
+        pkgconfig \
+        clang \
+        llvm-devel \
+        clang-devel \
+        lz4-devel \
+        libzstd-devel \
+        snappy-devel \
+        bzip2-devel \
+        zlib-devel \
+        zlib-static \
+        glibc-static \
+        libstdc++-static \
+        openssl-devel \
+        perl \
+        curl && \
+    dnf clean all
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.83.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /build
+
+# Build libnfs from source as a static library with PIC
+# Note: Must use master branch - the _task functions were added after 5.0.3
+RUN git clone https://github.com/sahlberg/libnfs.git && \
+    cd libnfs && \
+    git checkout master && \
+    ./bootstrap && \
+    CFLAGS="-fPIC" ./configure --prefix=/usr/local --disable-examples --disable-utils --disable-shared --enable-static --without-libkrb5 && \
+    make -j$(nproc) && \
+    make install && \
+    cd .. && \
+    rm -rf libnfs
+
+# Verify libnfs installation
+RUN echo "=== libnfs installation ===" && \
+    find /usr/local -name "libnfs*" -o -name "nfs.pc" 2>/dev/null && \
+    cat /usr/local/lib/pkgconfig/libnfs.pc 2>/dev/null || true
+
+# Set environment for static C++ linking
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+ENV LIBCLANG_PATH=/usr/lib64
+# Static link libstdc++ and libnfs
+# Must wrap libnfs in -Bstatic/-Bdynamic to link statically
+ENV RUSTFLAGS="-C link-arg=-static-libstdc++ -C link-arg=-Wl,-Bstatic -C link-arg=-L/usr/local/lib -C link-arg=-lnfs -C link-arg=-Wl,-Bdynamic"
+
+# Copy project source
+COPY . /build/src
+WORKDIR /build/src
+
+# Clean any stale artifacts
+RUN rm -f Cargo.lock
+
+# Build release binary with RocksDB
+RUN cargo build --release --features rocksdb
+
+# Strip for smaller size
+RUN strip /build/src/target/release/nfs-walker
+
+# Copy final binary to predictable location
+RUN cp /build/src/target/release/nfs-walker /build/nfs-walker
+
+# Verify the binary
+RUN echo "=== Binary info ===" && \
+    ls -lh /build/nfs-walker && \
+    file /build/nfs-walker && \
+    echo "=== Library dependencies ===" && \
+    ldd /build/nfs-walker && \
+    echo "=== GLIBC version requirements ===" && \
+    objdump -T /build/nfs-walker | grep GLIBC | sed 's/.*GLIBC_/GLIBC_/' | sort -u

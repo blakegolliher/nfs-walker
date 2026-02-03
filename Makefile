@@ -13,7 +13,7 @@
 #   make help          - Show this help
 
 SHELL := /bin/bash
-.PHONY: all build release release-rocks debug static test bench clean install-deps install-musl check fmt help
+.PHONY: all build release release-rocks debug static test bench clean install-deps install-musl check fmt help docker-rocky docker-musl docker-release
 
 # Project info
 PROJECT_NAME := nfs-walker
@@ -182,6 +182,79 @@ static:
 		echo -e "$(RED)✗ Static build failed$(NC)"; \
 		echo -e "  See $(BUILD_DIR)/build-static.log for details"; \
 		echo -e "  You may need to run: make install-musl"; \
+		exit 1; \
+	fi
+
+#------------------------------------------------------------------------------
+# Build RocksDB binary for RHEL/Rocky 9+ using Docker (RECOMMENDED)
+#------------------------------------------------------------------------------
+docker-rocky:
+	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) for Rocky/RHEL 9+ with RocksDB (Docker)...$(NC)"
+	@mkdir -p $(BUILD_DIR)
+	@if command -v podman &> /dev/null; then \
+		CONTAINER_CMD=podman; \
+	elif command -v docker &> /dev/null; then \
+		CONTAINER_CMD=docker; \
+	else \
+		echo -e "$(RED)✗ Neither podman nor docker found$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "Using $$CONTAINER_CMD..."; \
+	$$CONTAINER_CMD build -f Dockerfile.rocky -t nfs-walker-rocky . 2>&1 | tee $(BUILD_DIR)/build-rocky.log; \
+	BUILD_STATUS=$${PIPESTATUS[0]}; \
+	if [ $$BUILD_STATUS -eq 0 ]; then \
+		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-el9-rocks"; \
+		$$CONTAINER_CMD run --rm nfs-walker-rocky cat /build/nfs-walker > $(BUILD_DIR)/$$RELEASE_NAME; \
+		chmod +x $(BUILD_DIR)/$$RELEASE_NAME; \
+		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-rocks; \
+		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-rocks; \
+		echo -e "$(GREEN)✓ Rocky 9 build successful$(NC)"; \
+		echo -e "  Binary: $(BUILD_DIR)/$$RELEASE_NAME"; \
+		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-rocks -> $$RELEASE_NAME"; \
+		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size: " $$5}'; \
+		echo -e "  Compatible with: Rocky/RHEL/Alma 9+, Ubuntu 22.04+, Debian 12+"; \
+		file $(BUILD_DIR)/$$RELEASE_NAME | sed 's/^/  /'; \
+		echo "  Dependencies:"; \
+		ldd $(BUILD_DIR)/$$RELEASE_NAME 2>&1 | sed 's/^/    /'; \
+	else \
+		echo -e "$(RED)✗ Docker Rocky build failed$(NC)"; \
+		echo -e "  See $(BUILD_DIR)/build-rocky.log for details"; \
+		exit 1; \
+	fi
+
+#------------------------------------------------------------------------------
+# Build fully static musl binary with RocksDB using Docker (works on ANY Linux)
+#------------------------------------------------------------------------------
+docker-musl:
+	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) static musl+RocksDB (Docker)...$(NC)"
+	@mkdir -p $(BUILD_DIR)
+	@if command -v podman &> /dev/null; then \
+		CONTAINER_CMD=podman; \
+	elif command -v docker &> /dev/null; then \
+		CONTAINER_CMD=docker; \
+	else \
+		echo -e "$(RED)✗ Neither podman nor docker found$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "Using $$CONTAINER_CMD..."; \
+	$$CONTAINER_CMD build -f Dockerfile.musl -t nfs-walker-musl . 2>&1 | tee $(BUILD_DIR)/build-musl.log; \
+	BUILD_STATUS=$${PIPESTATUS[0]}; \
+	if [ $$BUILD_STATUS -eq 0 ]; then \
+		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-musl-rocks"; \
+		$$CONTAINER_CMD run --rm nfs-walker-musl cat /app/target/x86_64-unknown-linux-musl/release/nfs-walker > $(BUILD_DIR)/$$RELEASE_NAME; \
+		chmod +x $(BUILD_DIR)/$$RELEASE_NAME; \
+		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-static-rocks; \
+		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-static-rocks; \
+		echo -e "$(GREEN)✓ Static musl build successful$(NC)"; \
+		echo -e "  Binary: $(BUILD_DIR)/$$RELEASE_NAME"; \
+		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-static-rocks -> $$RELEASE_NAME"; \
+		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size: " $$5}'; \
+		echo -e "  Type: Fully static (musl) with RocksDB - works on ANY Linux"; \
+		file $(BUILD_DIR)/$$RELEASE_NAME | sed 's/^/  /'; \
+		ldd $(BUILD_DIR)/$$RELEASE_NAME 2>&1 | sed 's/^/  /'; \
+	else \
+		echo -e "$(RED)✗ Docker musl build failed$(NC)"; \
+		echo -e "  See $(BUILD_DIR)/build-musl.log for details"; \
 		exit 1; \
 	fi
 
@@ -410,9 +483,10 @@ help:
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  docker-release  Build portable Linux binary with RocksDB via Docker (RECOMMENDED)"
+	@echo "  docker-rocky    Build RocksDB binary for Rocky/RHEL 9+ via Docker (RECOMMENDED)"
+	@echo "  docker-release  Build RocksDB binary for Ubuntu 20.04+ via Docker"
 	@echo "  build           Build native binary with RocksDB (current system)"
-	@echo "  release         Build static musl binary without RocksDB (smallest, most portable)"
+	@echo "  release         Build static musl binary without RocksDB (smallest)"
 	@echo "  debug           Build debug binary"
 	@echo "  clean           Remove all build artifacts and cache"
 	@echo "  clean-cache     Remove only cached objects"

@@ -290,6 +290,275 @@ impl NfsConnection {
         Ok(total_entries)
     }
 
+    /// Read a directory using direct RPC, returning entries with file handles
+    ///
+    /// Unlike readdir_plus_chunked which uses the libnfs high-level API (which
+    /// doesn't expose file handles), this function uses direct RPC calls to
+    /// extract file handles from the READDIRPLUS response.
+    ///
+    /// The callback receives NfsDirEntry with file_handle populated for directories,
+    /// enabling cached access to subdirectories without LOOKUP RPCs.
+    pub fn readdir_plus_with_fh<F>(
+        &self,
+        path: &str,
+        chunk_size: usize,
+        callback: F,
+    ) -> NfsResult<usize>
+    where
+        F: FnMut(Vec<NfsDirEntry>) -> bool,
+    {
+        if !self.mounted {
+            return Err(NfsError::ReadDirFailed {
+                path: path.into(),
+                reason: "Not mounted".into(),
+            });
+        }
+
+        // Get RPC context from libnfs
+        let rpc = unsafe { ffi::nfs_get_rpc_context(self.context) };
+        if rpc.is_null() {
+            return Err(NfsError::ReadDirFailed {
+                path: path.into(),
+                reason: "Failed to get RPC context".into(),
+            });
+        }
+
+        // Drain any pending events to ensure clean state
+        drain_pending_events(rpc);
+
+        // Get root file handle
+        let root_fh_ptr = unsafe { ffi::nfs_get_rootfh(self.context) };
+        if root_fh_ptr.is_null() {
+            return Err(NfsError::ReadDirFailed {
+                path: path.into(),
+                reason: "Failed to get root file handle".into(),
+            });
+        }
+
+        // Walk path to get directory file handle (this does the LOOKUP RPCs)
+        // Note: nfs_fh (libnfs type) has `len` and `val` fields, not `data.data_len`
+        let root_fh = unsafe {
+            let fh = &*root_fh_ptr;
+            let mut data = [0u8; 128];
+            let len = (fh.len as usize).min(128);
+            std::ptr::copy_nonoverlapping(fh.val as *const u8, data.as_mut_ptr(), len);
+            (len, data)
+        };
+
+        // Resolve path to file handle
+        let dir_fh = self.lookup_path_internal(rpc, &root_fh.1[..root_fh.0], path)?;
+
+        // Now use the file handle version
+        self.readdir_plus_by_fh(&dir_fh, chunk_size, callback)
+    }
+
+    /// Internal helper to walk a path and get the file handle
+    fn lookup_path_internal(
+        &self,
+        rpc: *mut ffi::rpc_context,
+        root_fh: &[u8],
+        path: &str,
+    ) -> NfsResult<Vec<u8>> {
+        let path = path.trim_start_matches('/');
+        if path.is_empty() {
+            return Ok(root_fh.to_vec());
+        }
+
+        let mut current_fh = root_fh.to_vec();
+
+        for component in path.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+
+            let name_cstr = CString::new(component).map_err(|_| NfsError::ReadDirFailed {
+                path: path.into(),
+                reason: format!("Invalid path component: {}", component),
+            })?;
+
+            let mut cb_data = LookupCallbackData {
+                completed: false,
+                status: 0,
+                fh_len: 0,
+                fh_data: [0; 128],
+            };
+
+            // Build LOOKUP args
+            let mut args: ffi::LOOKUP3args = unsafe { std::mem::zeroed() };
+            args.what.dir.data.data_len = current_fh.len() as u32;
+            args.what.dir.data.data_val = current_fh.as_ptr() as *mut i8;
+            args.what.name = name_cstr.as_ptr() as *mut i8;
+
+            let pdu = unsafe {
+                ffi::rpc_nfs3_lookup_task(
+                    rpc,
+                    Some(lookup_callback),
+                    &mut args,
+                    &mut cb_data as *mut _ as *mut std::ffi::c_void,
+                )
+            };
+
+            if pdu.is_null() {
+                return Err(NfsError::ReadDirFailed {
+                    path: path.into(),
+                    reason: format!("Failed to queue LOOKUP for '{}'", component),
+                });
+            }
+
+            if let Err(e) = wait_for_rpc_completion(rpc, &cb_data.completed, 10000) {
+                return Err(NfsError::ReadDirFailed {
+                    path: path.into(),
+                    reason: format!("LOOKUP '{}' failed: {}", component, e),
+                });
+            }
+
+            if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
+                return Err(NfsError::ReadDirFailed {
+                    path: path.into(),
+                    reason: format!("LOOKUP '{}' error: status={}", component, cb_data.status),
+                });
+            }
+
+            if cb_data.fh_len == 0 {
+                return Err(NfsError::ReadDirFailed {
+                    path: path.into(),
+                    reason: format!("LOOKUP '{}' returned empty handle", component),
+                });
+            }
+
+            current_fh = cb_data.fh_data[..cb_data.fh_len].to_vec();
+        }
+
+        Ok(current_fh)
+    }
+
+    /// Read a directory using direct RPC with a cached file handle
+    ///
+    /// This bypasses the libnfs high-level API and uses the file handle directly,
+    /// eliminating all LOOKUP RPCs that would otherwise be needed to resolve the path.
+    /// This is critical for narrow-deep directory trees where path resolution
+    /// causes O(n²) LOOKUP RPCs.
+    ///
+    /// The callback receives chunks of NfsDirEntry which include file handles
+    /// for subdirectories, enabling recursive cached access.
+    pub fn readdir_plus_by_fh<F>(
+        &self,
+        file_handle: &[u8],
+        chunk_size: usize,
+        mut callback: F,
+    ) -> NfsResult<usize>
+    where
+        F: FnMut(Vec<NfsDirEntry>) -> bool, // Return false to stop early
+    {
+        if !self.mounted {
+            return Err(NfsError::ReadDirFailed {
+                path: "(by file handle)".into(),
+                reason: "Not mounted".into(),
+            });
+        }
+
+        // Get RPC context from libnfs
+        let rpc = unsafe { ffi::nfs_get_rpc_context(self.context) };
+        if rpc.is_null() {
+            return Err(NfsError::ReadDirFailed {
+                path: "(by file handle)".into(),
+                reason: "Failed to get RPC context".into(),
+            });
+        }
+
+        // Drain any pending events to ensure clean state
+        drain_pending_events(rpc);
+
+        let mut total_entries = 0;
+        let mut cookie: u64 = 0;
+        let mut cookieverf: [i8; 8] = [0; 8];
+
+        // Use reasonably large buffer sizes for efficiency
+        let dircount: u32 = 65536;  // 64KB
+        let maxcount: u32 = 131072; // 128KB
+
+        loop {
+            let mut cb_data = ReaddirplusFullData {
+                completed: false,
+                status: 0,
+                eof: false,
+                cookie: 0,
+                cookieverf: [0i8; 8],
+                entries: Vec::with_capacity(chunk_size),
+            };
+
+            // Build READDIRPLUS args with the cached file handle
+            let mut args: ffi::READDIRPLUS3args = unsafe { std::mem::zeroed() };
+            args.dir.data.data_len = file_handle.len() as u32;
+            args.dir.data.data_val = file_handle.as_ptr() as *mut i8;
+            args.cookie = cookie;
+            args.cookieverf = cookieverf;
+            args.dircount = dircount;
+            args.maxcount = maxcount;
+
+            let pdu = unsafe {
+                ffi::rpc_nfs3_readdirplus_task(
+                    rpc,
+                    Some(readdirplus_full_callback),
+                    &mut args,
+                    &mut cb_data as *mut _ as *mut std::ffi::c_void,
+                )
+            };
+
+            if pdu.is_null() {
+                return Err(NfsError::ReadDirFailed {
+                    path: "(by file handle)".into(),
+                    reason: "Failed to queue READDIRPLUS RPC".into(),
+                });
+            }
+
+            // Wait for completion
+            if let Err(e) = wait_for_rpc_completion(rpc, &cb_data.completed, 30000) {
+                return Err(NfsError::ReadDirFailed {
+                    path: "(by file handle)".into(),
+                    reason: format!("READDIRPLUS failed: {}", e),
+                });
+            }
+
+            if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
+                return Err(NfsError::ReadDirFailed {
+                    path: "(by file handle)".into(),
+                    reason: format!("READDIRPLUS error: status={}", cb_data.status),
+                });
+            }
+
+            total_entries += cb_data.entries.len();
+
+            // Send entries to callback in chunks
+            let mut chunk = Vec::with_capacity(chunk_size);
+            for entry in cb_data.entries {
+                chunk.push(entry);
+                if chunk.len() >= chunk_size {
+                    if !callback(std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size))) {
+                        return Ok(total_entries);
+                    }
+                }
+            }
+            // Send remaining entries
+            if !chunk.is_empty() {
+                if !callback(chunk) {
+                    return Ok(total_entries);
+                }
+            }
+
+            // Check if we're done
+            if cb_data.eof {
+                break;
+            }
+
+            // Prepare for next call
+            cookie = cb_data.cookie;
+            cookieverf = cb_data.cookieverf;
+        }
+
+        Ok(total_entries)
+    }
+
     /// Open a directory for manual iteration with seek support
     ///
     /// This allows for cookie-based parallel reading:
@@ -416,6 +685,7 @@ impl NfsConnection {
             entry_type,
             stat,
             inode: d.inode,
+            file_handle: None, // libnfs high-level API doesn't expose file handles
         }
     }
 
@@ -585,6 +855,7 @@ impl NfsDirHandle {
             entry_type,
             stat,
             inode: d.inode,
+            file_handle: None, // libnfs high-level API doesn't expose file handles
         }
     }
 }
@@ -767,6 +1038,122 @@ unsafe extern "C" fn readdirplus_scan_callback(
                     };
 
                     cb_data.entries.push(EntryInfo { name, is_dir });
+                }
+
+                entry_ptr = entry.nextentry;
+            }
+        } else {
+            cb_data.status = -(res.status as i32);
+        }
+    }
+}
+
+/// Context for READDIRPLUS with full entry collection including file handles
+struct ReaddirplusFullData {
+    completed: bool,
+    status: i32,
+    eof: bool,
+    cookie: u64,
+    cookieverf: [i8; 8],
+    entries: Vec<NfsDirEntry>,
+}
+
+/// Callback for READDIRPLUS RPC (full entry collection with file handles)
+///
+/// This callback extracts complete NfsDirEntry structs including file handles
+/// from the raw READDIRPLUS response, enabling cache-based directory access.
+unsafe extern "C" fn readdirplus_full_callback(
+    _rpc: *mut ffi::rpc_context,
+    status: ::std::os::raw::c_int,
+    data: *mut ::std::os::raw::c_void,
+    private_data: *mut ::std::os::raw::c_void,
+) {
+    let cb_data = &mut *(private_data as *mut ReaddirplusFullData);
+    cb_data.completed = true;
+    cb_data.status = status;
+
+    if status == ffi::RPC_STATUS_SUCCESS as i32 {
+        let res = &*(data as *const ffi::READDIRPLUS3res);
+        if res.status == 0 {
+            // NFS3_OK
+            let resok = &res.READDIRPLUS3res_u.resok;
+            cb_data.eof = resok.reply.eof != 0;
+
+            // Copy cookieverf for next call
+            cb_data.cookieverf.copy_from_slice(&resok.cookieverf);
+
+            // Collect entries with full attributes and file handles
+            let mut entry_ptr = resok.reply.entries;
+            while !entry_ptr.is_null() {
+                let entry = &*entry_ptr;
+                cb_data.cookie = entry.cookie;
+
+                // Get entry name
+                let name = if entry.name.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(entry.name).to_string_lossy().into_owned()
+                };
+
+                // Skip . and ..
+                if name != "." && name != ".." {
+                    // Extract file type and attributes
+                    let (entry_type, stat) = if entry.name_attributes.attributes_follow != 0 {
+                        let attrs = &entry.name_attributes.post_op_attr_u.attributes;
+                        let et = match attrs.type_ {
+                            1 => EntryType::File,      // NF3REG
+                            2 => EntryType::Directory, // NF3DIR
+                            5 => EntryType::Symlink,   // NF3LNK
+                            3 => EntryType::BlockDevice, // NF3BLK
+                            4 => EntryType::CharDevice,  // NF3CHR
+                            6 => EntryType::Socket,    // NF3SOCK
+                            7 => EntryType::Fifo,      // NF3FIFO
+                            _ => EntryType::Unknown,
+                        };
+                        let s = NfsStat {
+                            size: attrs.size,
+                            inode: attrs.fileid,
+                            nlink: attrs.nlink as u64,
+                            uid: attrs.uid,
+                            gid: attrs.gid,
+                            mode: attrs.mode,
+                            atime: Some(attrs.atime.seconds as i64),
+                            mtime: Some(attrs.mtime.seconds as i64),
+                            ctime: Some(attrs.ctime.seconds as i64),
+                            blksize: 4096, // NFS3 doesn't provide blksize
+                            blocks: (attrs.used + 511) / 512, // Convert used bytes to 512-byte blocks
+                        };
+                        (et, Some(s))
+                    } else {
+                        (EntryType::Unknown, None)
+                    };
+
+                    // Extract file handle (for directories, to enable cached access)
+                    let file_handle = if entry.name_handle.handle_follows != 0 {
+                        let fh = &entry.name_handle.post_op_fh3_u.handle;
+                        let len = fh.data.data_len as usize;
+                        if len > 0 && len <= 128 {
+                            let mut fh_data = vec![0u8; len];
+                            std::ptr::copy_nonoverlapping(
+                                fh.data.data_val as *const u8,
+                                fh_data.as_mut_ptr(),
+                                len,
+                            );
+                            Some(fh_data)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    cb_data.entries.push(NfsDirEntry {
+                        name,
+                        entry_type,
+                        stat,
+                        inode: entry.fileid,
+                        file_handle,
+                    });
                 }
 
                 entry_ptr = entry.nextentry;

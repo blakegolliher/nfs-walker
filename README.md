@@ -32,14 +32,13 @@ sqlite3 scan.db "SELECT path, size FROM entries ORDER BY size DESC LIMIT 10"
 ## Installation
 
 ```bash
-# Install dependencies (Ubuntu/Debian)
-sudo apt install build-essential pkg-config libsqlite3-dev libnfs-dev libclang-dev
+# Build portable binary with RocksDB (requires Docker or Podman)
+make docker-rocky
 
-# Build with RocksDB support
-make release-rocks
+# Binary output: ./build/nfs-walker-rocks
 ```
 
-See [docs/BUILDING.md](docs/BUILDING.md) for detailed build instructions.
+See [docs/BUILDING.md](docs/BUILDING.md) for detailed build instructions and alternative methods.
 
 ## Usage
 
@@ -113,26 +112,28 @@ Stats Options:
 
 ## Performance
 
-### Benchmark: 43 Million Files
+### Benchmark Results
+
+Tested against `dust` (a fast directory analyzer) over NFS:
+
+| Workload | Files | nfs-walker | dust | Speedup |
+|----------|-------|------------|------|---------|
+| **Mixed tree** | 500,000 | 2.8s (181k/sec) | 18.3s | **6.5×** |
+| **Narrow-deep** | 7,000 | 1.1s | 6.4s | **5.8×** |
+| **Single huge dir** | 500,000 | 9.1s (55k/sec) | 15.2s | **1.7×** |
+| **Wide-shallow** | 1,000,000 | 22.0s (45k/sec) | 31.1s | **1.4×** |
+
+*Mixed tree (10K dirs, 50 files each) shows peak performance at 180,785 files/sec.*
+
+### Large-Scale Production
 
 | Metric | Result |
 |--------|--------|
+| Files scanned | 43 million |
 | Throughput | **48,401 files/sec** |
 | Duration | 14.8 minutes |
 | Peak Memory | ~5 GB |
 | Database Size | 4.0 GiB |
-
-### vs Traditional Tools
-
-| Tool | Time | Relative |
-|------|------|----------|
-| `find` | 12m 13s | 1× |
-| `ls -lR` | 9m 24s | 1.3× |
-| `rsync --list-only` | 1m 54s | 6× |
-| `tree` | 1m 26s | 8× |
-| **nfs-walker** | **33s** | **22×** |
-
-*Benchmark: 2.1M files over NFS*
 
 ### Why So Fast?
 

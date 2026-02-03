@@ -40,6 +40,17 @@ fn main() {
         );
     }
 
+    // Check for static libnfs at common paths (Docker builds)
+    // Rocky/RHEL may use lib64, others use lib
+    for local_lib_path in &["/usr/local/lib", "/usr/local/lib64"] {
+        if std::path::Path::new(&format!("{}/libnfs.a", local_lib_path)).exists() {
+            println!("cargo:rustc-link-search=native={}", local_lib_path);
+            println!("cargo:rustc-link-lib=static=nfs");
+            eprintln!("Using static libnfs from {}", local_lib_path);
+            return;
+        }
+    }
+
     // For non-musl targets, use pkg-config
     let lib = pkg_config::Config::new()
         .statik(true)  // Prefer static linking

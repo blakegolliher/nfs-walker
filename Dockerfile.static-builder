@@ -26,11 +26,12 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Build libnfs from source as a static library
+# Note: Must use master branch - the _task functions were added after 5.0.3
 RUN git clone https://github.com/sahlberg/libnfs.git && \
     cd libnfs && \
-    git checkout libnfs-5.0.3 && \
+    git checkout master && \
     ./bootstrap && \
-    ./configure --prefix=/usr/local --disable-examples --disable-utils --disable-shared --enable-static && \
+    ./configure --prefix=/usr/local --disable-examples --disable-utils --disable-shared --enable-static --without-libkrb5 && \
     make -j$(nproc) && \
     make install && \
     ldconfig && \

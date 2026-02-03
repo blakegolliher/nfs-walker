@@ -41,6 +41,9 @@ use tracing::{debug, error, info, warn};
 struct DirWork {
     path: String,
     depth: u32,
+    /// Cached file handle from parent's READDIRPLUS response
+    /// When set, we can skip LOOKUP RPCs and use this handle directly
+    file_handle: Option<Vec<u8>>,
 }
 
 /// Result from walk operation
@@ -415,11 +418,12 @@ impl SimpleWalker {
         let active_workers = Arc::new(AtomicUsize::new(0));
         let pending_work = Arc::new(AtomicU64::new(1)); // Start with 1 for root
 
-        // Push root directory
+        // Push root directory (no cached file handle - will do path lookup)
         let start_path = self.config.nfs_url.walk_start_path();
         injector.push(DirWork {
             path: start_path.clone(),
             depth: 0,
+            file_handle: None,
         });
 
         // Create worker local queues and stealers
@@ -567,11 +571,12 @@ impl SimpleWalker {
         let active_workers = Arc::new(AtomicUsize::new(0));
         let pending_work = Arc::new(AtomicU64::new(1)); // Start with 1 for root
 
-        // Push root directory
+        // Push root directory (no cached file handle - will do path lookup)
         let start_path = self.config.nfs_url.walk_start_path();
         injector.push(DirWork {
             path: start_path.clone(),
             depth: 0,
+            file_handle: None,
         });
 
         // Create worker local queues and stealers
@@ -928,18 +933,30 @@ fn worker_loop(
             }
         }
 
-        debug!("Worker {} READDIRPLUS: {}", id, work.path);
+        // Log whether we're using cached file handle or path
+        if work.file_handle.is_some() {
+            debug!("Worker {} READDIRPLUS (cached FH): {}", id, work.path);
+        } else {
+            debug!("Worker {} READDIRPLUS (path lookup): {}", id, work.path);
+        }
 
         // Read directory with READDIRPLUS in chunks for immediate processing
         // This ensures entries start flowing to the DB immediately, even for
         // directories with millions of files. Progress counters are updated
         // incrementally so the UI shows real-time progress.
+        //
+        // OPTIMIZATION: When we have a cached file handle from the parent's
+        // READDIRPLUS response, we use it directly to avoid LOOKUP RPCs.
+        // This is critical for narrow-deep trees where path resolution
+        // would cause O(n²) LOOKUPs.
         let mut subdir_count = 0usize;
         let mut chunk_file_count = 0u64;
         let mut chunk_byte_count = 0u64;
         let mut channel_broken = false;
 
-        let result = nfs.readdir_plus_chunked(&work.path, batch_size, |chunk| {
+        // Define the callback that processes directory entries
+        // This is used by both readdir_plus_by_fh and readdir_plus_with_fh
+        let mut process_entries = |chunk: Vec<crate::nfs::types::NfsDirEntry>| -> bool {
             for nfs_entry in chunk {
                 // Skip . and ..
                 if nfs_entry.name == "." || nfs_entry.name == ".." {
@@ -991,12 +1008,13 @@ fn worker_loop(
                 batch.push(db_entry);
 
                 if is_dir {
-                    // Queue subdirectory for processing
+                    // Queue subdirectory for processing with cached file handle
                     subdir_count += 1;
                     pending_work.fetch_add(1, Ordering::SeqCst);
                     local.push(DirWork {
                         path: full_path,
                         depth: work.depth + 1,
+                        file_handle: nfs_entry.file_handle.clone(),
                     });
                 } else {
                     chunk_file_count += 1;
@@ -1018,7 +1036,14 @@ fn worker_loop(
                 }
             }
             !channel_broken // Continue reading if channel is OK
-        });
+        };
+
+        // Use cached file handle if available, otherwise resolve path
+        let result = if let Some(ref fh) = work.file_handle {
+            nfs.readdir_plus_by_fh(fh, batch_size, &mut process_entries)
+        } else {
+            nfs.readdir_plus_with_fh(&work.path, batch_size, &mut process_entries)
+        };
 
         match result {
             Ok(entry_count) => {
@@ -1344,6 +1369,7 @@ fn big_dir_worker_loop(
                     local.push(DirWork {
                         path: full_path,
                         depth: work.depth + 1,
+                        file_handle: None, // big-dir-hunt mode doesn't have cached handles
                     });
                 }
 

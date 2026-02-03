@@ -1,41 +1,77 @@
 # Building nfs-walker
 
-## Requirements
+## Quick Start (Recommended)
 
-- Linux (Ubuntu 22.04+ recommended)
-- Rust 1.82+
-- libnfs-dev
-- For RocksDB builds: libclang-dev, clang
-
-## Quick Start
+Build a portable binary with RocksDB that works on Rocky/RHEL 9+, Ubuntu 22.04+, Debian 12+:
 
 ```bash
-# Install dependencies
+make docker-rocky
+```
+
+Output: `./build/nfs-walker-rocks`
+
+This is the recommended method. It requires only Docker or Podman - no local dependencies needed.
+
+**Build time:** ~5 minutes first build, ~1-2 minutes with cache
+
+---
+
+## Build Methods
+
+### 1. Docker Build (Recommended)
+
+Builds in a Rocky Linux 9 container. Produces a portable binary with RocksDB.
+
+```bash
+make docker-rocky
+```
+
+**Requirements:** Docker or Podman
+**Build time:** ~5 minutes (first build), ~2 minutes (cached)
+**Output:** `./build/nfs-walker-VERSION-el9-rocks`
+**Compatible with:** Rocky/RHEL/Alma 9+, Ubuntu 22.04+, Debian 12+
+
+### 2. Native Build
+
+Build directly on your system. Requires local dependencies.
+
+```bash
+# Install dependencies (Ubuntu/Debian)
 make install-deps
 
-# Build with RocksDB (recommended)
-make release-rocks
+# Build with RocksDB
+make build
+```
 
-# Build without RocksDB (SQLite only, smaller binary)
+**Requirements:** Rust 1.82+, libnfs-dev, libclang-dev, clang
+**Output:** `./build/nfs-walker-rocks`
+
+### 3. SQLite-Only Build
+
+Smaller binary without RocksDB. Fully static, runs on any Linux.
+
+```bash
 make release
 ```
 
-Binary output: `./build/nfs-walker`
+**Requirements:** Rust 1.82+, musl toolchain
+**Output:** `./build/nfs-walker-static`
+**Limitations:** No RocksDB output, no `convert` or `stats` commands
 
 ---
 
 ## Build Targets
 
-| Target | Description | Output |
-|--------|-------------|--------|
-| `make build` | Debug build with RocksDB | `target/debug/nfs-walker` |
-| `make release` | Release build, SQLite only | `build/nfs-walker-VERSION` |
-| `make release-rocks` | Release build with RocksDB | `build/nfs-walker-VERSION-rocks` |
-| `make docker-release` | Static build via Docker | `build/nfs-walker-VERSION-rocks` |
+| Target | Description | RocksDB | Portable |
+|--------|-------------|---------|----------|
+| `make docker-rocky` | Docker build for RHEL/Rocky 9+ | Yes | glibc 2.34+ |
+| `make build` | Native build with RocksDB | Yes | No |
+| `make release` | Static musl build | No | Any Linux |
+| `make debug` | Debug build | Yes | No |
 
 ---
 
-## Dependencies
+## Dependencies (Native Build)
 
 ### Ubuntu/Debian
 
@@ -57,7 +93,8 @@ If your distro doesn't have libnfs-dev:
 ```bash
 git clone https://github.com/sahlberg/libnfs.git
 cd libnfs
-git checkout libnfs-5.0.3
+# Must use master branch - nfs-walker requires _task functions added after 5.0.3
+git checkout master
 ./bootstrap
 ./configure --prefix=/usr/local
 make -j$(nproc)
@@ -67,69 +104,11 @@ sudo ldconfig
 
 ---
 
-## Build Configurations
-
-### Standard Build (with RocksDB)
-
-```bash
-cargo build --release --features rocksdb
-```
-
-Produces a dynamically linked binary. Requires:
-- libnfs.so
-- librocksdb.so (or statically linked)
-- glibc
-
-### SQLite-Only Build
-
-```bash
-cargo build --release --no-default-features
-```
-
-Smaller binary, no RocksDB dependency. Limitations:
-- No RocksDB output format
-- No `stats` subcommand
-- No `convert` subcommand
-
-### Static Build (Docker)
-
-For portable binaries that run on any Linux:
-
-```bash
-make docker-release
-```
-
-This builds in a Docker container with all dependencies statically linked.
-
----
-
-## Cross-Compilation
-
-### musl (Alpine Linux)
-
-```bash
-# Install musl toolchain
-sudo apt install musl-tools
-
-# Build libnfs for musl
-CC=musl-gcc cmake -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX=/usr/local/musl ..
-
-# Build nfs-walker
-cargo build --release --target x86_64-unknown-linux-musl --no-default-features
-```
-
-Note: RocksDB doesn't compile easily with musl. Use `--no-default-features` for musl builds.
-
----
-
 ## Development
 
 ```bash
 # Run tests
 make test
-
-# Run tests with RocksDB
-cargo test --features rocksdb
 
 # Format code
 make fmt
@@ -139,23 +118,9 @@ make check
 
 # Clean build artifacts
 make clean
-```
 
----
-
-## Makefile Reference
-
-```makefile
-install-deps    # Install build dependencies (Ubuntu/Debian)
-build           # Debug build
-release         # Release build (SQLite only)
-release-rocks   # Release build with RocksDB
-docker-release  # Static build via Docker
-test            # Run tests
-fmt             # Format code
-check           # Run clippy
-clean           # Clean build artifacts
-list            # List built binaries
+# List built binaries
+make list
 ```
 
 ---
@@ -185,20 +150,28 @@ RocksDB requires clang for compilation:
 sudo apt install clang libclang-dev
 ```
 
-For musl targets, skip RocksDB:
+If native builds are problematic, use the Docker build instead:
 ```bash
-cargo build --release --no-default-features --target x86_64-unknown-linux-musl
+make docker-rocky
 ```
 
-### libstdc++ not found
+### Binary doesn't run on target system
 
-Add the GCC library path:
-```bash
-export LIBRARY_PATH=/usr/lib/gcc/x86_64-linux-gnu/13:$LIBRARY_PATH
+```
+./nfs-walker: /lib64/libc.so.6: version `GLIBC_2.38' not found
 ```
 
-Or add to `.cargo/config.toml`:
-```toml
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-L/usr/lib/gcc/x86_64-linux-gnu/13"]
+The binary was built on a newer system than the target. Use `make docker-rocky` which builds on Rocky 9 (glibc 2.34) for maximum compatibility.
+
+### Docker/Podman build fails with disk space error
+
+```
+no space left on device
+```
+
+Clean up container images:
+```bash
+podman system prune -af
+# or
+docker system prune -af
 ```
