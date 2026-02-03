@@ -478,9 +478,11 @@ impl NfsConnection {
         let mut cookie: u64 = 0;
         let mut cookieverf: [i8; 8] = [0; 8];
 
-        // Use reasonably large buffer sizes for efficiency
-        let dircount: u32 = 65536;  // 64KB
-        let maxcount: u32 = 131072; // 128KB
+        // Use smaller buffer sizes - large buffers cause timeouts on huge directories
+        // because the server takes too long to prepare the response.
+        // Smaller buffers = more RPCs but each completes quickly.
+        let dircount: u32 = 8192;   // 8KB
+        let maxcount: u32 = 16384;  // 16KB
 
         loop {
             let mut cb_data = ReaddirplusFullData {
