@@ -34,6 +34,9 @@ pub struct NfsConnection {
 
     /// Whether we're currently mounted
     mounted: bool,
+
+    /// RPC timeout in milliseconds (used for wait_for_rpc_completion)
+    rpc_timeout_ms: i32,
 }
 
 // NfsConnection can be sent between threads but not shared
@@ -74,6 +77,7 @@ impl NfsConnection {
             server: url.server.clone(),
             export: url.export.clone(),
             mounted: false,
+            rpc_timeout_ms: 30000, // Default 30 seconds, updated by connect()
         })
     }
 
@@ -97,6 +101,7 @@ impl NfsConnection {
 
         // Set timeout (in milliseconds)
         let timeout_ms = timeout.as_millis() as i32;
+        self.rpc_timeout_ms = timeout_ms;
         unsafe {
             ffi::nfs_set_timeout(self.context, timeout_ms);
         }
@@ -405,7 +410,7 @@ impl NfsConnection {
                 });
             }
 
-            if let Err(e) = wait_for_rpc_completion(rpc, &cb_data.completed, 10000) {
+            if let Err(e) = wait_for_rpc_completion(rpc, &cb_data.completed, self.rpc_timeout_ms) {
                 return Err(NfsError::ReadDirFailed {
                     path: path.into(),
                     reason: format!("LOOKUP '{}' failed: {}", component, e),
@@ -513,7 +518,7 @@ impl NfsConnection {
             }
 
             // Wait for completion
-            if let Err(e) = wait_for_rpc_completion(rpc, &cb_data.completed, 30000) {
+            if let Err(e) = wait_for_rpc_completion(rpc, &cb_data.completed, self.rpc_timeout_ms) {
                 return Err(NfsError::ReadDirFailed {
                     path: "(by file handle)".into(),
                     reason: format!("READDIRPLUS failed: {}", e),
@@ -1371,7 +1376,7 @@ impl NfsConnection {
             }
 
             // Wait for completion - pass pointer to completed flag
-            if let Err(e) = wait_for_rpc_completion(rpc, &cb_data.completed, 30000) {
+            if let Err(e) = wait_for_rpc_completion(rpc, &cb_data.completed, self.rpc_timeout_ms) {
                 return BigDirCheckResult::Error(format!("READDIRPLUS failed: {}", e));
             }
 
@@ -1483,7 +1488,7 @@ impl NfsConnection {
             }
 
             // Wait for completion - pass pointer to completed flag
-            wait_for_rpc_completion(rpc, &cb_data.completed, 30000)?;
+            wait_for_rpc_completion(rpc, &cb_data.completed, self.rpc_timeout_ms)?;
 
             // cb_data.completed is guaranteed true here
 
@@ -1600,7 +1605,7 @@ impl NfsConnection {
         }
 
         // Wait for completion - pass pointer to completed flag
-        wait_for_rpc_completion(rpc, &cb_data.completed, 10000)?;
+        wait_for_rpc_completion(rpc, &cb_data.completed, self.rpc_timeout_ms)?;
 
         // cb_data.completed is guaranteed true here
 
@@ -1814,6 +1819,8 @@ pub struct RawRpcContext {
     /// Export path (for logging/debugging)
     #[allow(dead_code)]
     export: String,
+    /// RPC timeout in milliseconds
+    rpc_timeout_ms: i32,
 }
 
 // RawRpcContext owns its RPC context and can be sent between threads
@@ -1949,6 +1956,7 @@ impl RawRpcContext {
             root_fh,
             server: server.to_string(),
             export: export.to_string(),
+            rpc_timeout_ms: timeout_ms,
         })
     }
 
@@ -2222,7 +2230,7 @@ impl RawRpcContext {
             }
 
             // Wait for completion
-            Self::wait_for_completion(self.rpc, &cb_data.completed, 30000)?;
+            Self::wait_for_completion(self.rpc, &cb_data.completed, self.rpc_timeout_ms)?;
 
             if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
                 return Err(format!("READDIRPLUS error: status={}", cb_data.status));
@@ -2317,7 +2325,7 @@ impl RawRpcContext {
             return Err(format!("Failed to queue LOOKUP for '{}'", name));
         }
 
-        Self::wait_for_completion(self.rpc, &cb_data.completed, 10000)?;
+        Self::wait_for_completion(self.rpc, &cb_data.completed, self.rpc_timeout_ms)?;
 
         if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
             return Err(format!("LOOKUP '{}' failed: status={}", name, cb_data.status));

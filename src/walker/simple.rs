@@ -481,6 +481,7 @@ impl SimpleWalker {
             let max_depth = self.config.max_depth;
             let threshold = self.config.big_dir_threshold;
             let worker_count = self.config.worker_count;
+            let timeout_secs = self.config.timeout_secs;
 
             let handle = thread::Builder::new()
                 .name(format!("big-dir-{}", id))
@@ -503,6 +504,7 @@ impl SimpleWalker {
                         max_depth,
                         threshold,
                         worker_count,
+                        timeout_secs,
                     );
                 })
                 .expect("Failed to spawn big-dir worker thread");
@@ -1235,6 +1237,7 @@ fn big_dir_worker_loop(
     max_depth: Option<usize>,
     threshold: u64,
     _worker_count: usize,
+    timeout_secs: u32,
 ) {
     use crate::nfs::types::EntryType;
 
@@ -1242,7 +1245,7 @@ fn big_dir_worker_loop(
 
     // Create NfsConnection for this worker using the full NfsUrl config
     let conn = match NfsConnectionBuilder::new(nfs_url)
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(timeout_secs as u64))
         .retries(3)
         .connect()
     {
