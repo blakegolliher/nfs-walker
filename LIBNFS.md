@@ -1,22 +1,35 @@
 # Custom libnfs Dependency
 
-**Important:** nfs-walker requires libnfs built from `master` branch (not the 5.0.3 release).
+**Important:** nfs-walker requires a patched version of libnfs with VAST extensions for high-performance directory scanning.
 
-## Why Custom Build?
+## VAST Extensions
 
-The `_task` async functions used by nfs-walker were added after the 5.0.3 release:
-- `nfs_opendir_task()` / `nfs_opendir_task_async()`
-- `nfs_readdirplus_task()` / `nfs_readdirplus_task_async()`
-- `nfs_closedir_task()`
+The patch in `patches/libnfs-vast-extensions.patch` adds the following functions:
 
-These are required for the async pipelining that gives nfs-walker its performance.
+| Function | Purpose |
+|----------|---------|
+| `nfs_opendir_at_cookie_async()` | Start READDIRPLUS at specific cookie position with entry limit |
+| `nfs_opendir_names_only_async()` | Use READDIR (no stat) - 10x+ faster for large directories |
+| `nfs_opendir_names_only_at_cookie_async()` | Combined: fast enumeration + streaming + cookie positioning |
+| `nfs_readdir_get_cookieverf()` | Get cookie verifier for resuming across batches |
+
+These enable:
+- **Parallel directory reading**: Start from different cookie positions
+- **Streaming large directories**: Fetch in batches with entry limits
+- **Fast enumeration**: READDIR without server-side stat() per file
+- **Proper resume**: Cookie verifier handling for NFS3
 
 ## Building libnfs
 
 ```bash
+# Clone upstream libnfs
 git clone https://github.com/sahlberg/libnfs.git
 cd libnfs
-git checkout master   # Must use master, not a release tag
+
+# Apply VAST extensions
+patch -p1 < /path/to/nfs-walker/patches/libnfs-vast-extensions.patch
+
+# Build
 ./bootstrap
 ./configure --prefix=/usr/local
 make -j$(nproc)
@@ -26,22 +39,27 @@ sudo ldconfig
 
 ## Docker Builds
 
-The Docker builds (Dockerfile.rocky, Dockerfile.musl) automatically build libnfs from master, so no manual steps are needed when using:
-
-```bash
-make docker-rocky
-```
+The Dockerfiles should be updated to apply the patch. Current builds use upstream without patches (may work for basic functionality but lack streaming optimizations).
 
 ## Verification
 
-Check that the task functions are available:
+Check that the VAST extension functions are available:
 
 ```bash
-nm -D /usr/local/lib/libnfs.so | grep nfs_opendir_task
+nm -D /usr/local/lib/libnfs.so | grep nfs_opendir_at_cookie
 ```
 
 Should show symbols like:
 ```
-0000000000012345 T nfs_opendir_task
-0000000000012350 T nfs_opendir_task_async
+0000000000... T nfs_opendir_at_cookie
+0000000000... T nfs_opendir_at_cookie_async
+0000000000... T nfs_opendir_names_only
+0000000000... T nfs_opendir_names_only_async
+0000000000... T nfs_opendir_names_only_at_cookie
+0000000000... T nfs_opendir_names_only_at_cookie_async
+0000000000... T nfs_readdir_get_cookieverf
 ```
+
+## Source Location
+
+The patched libnfs source is at `/home/vastdata/projects/libnfs-src` with uncommitted changes. The patch was extracted from there on 2026-02-04.
