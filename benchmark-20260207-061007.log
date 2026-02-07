@@ -1,0 +1,126 @@
+==============================================
+  NFS Walker Benchmark
+==============================================
+
+NFS Mount: /mnt/syncengine-demo
+NFS URL:   nfs://main.selab-var203.selab.vastdata.com/syncengine-demo
+Workers:   32
+Log file:  benchmark-20260207-061007.log
+
+
+[0;32m=== 1. fd-find (fast file search) ===[0m
+
+4150639
+
+real	3m42.709s
+user	0m36.471s
+sys	4m31.656s
+
+[0;32m=== 2. dust (fast du alternative) ===[0m
+
+[31m1.3T[0m ┌── [1;34msyncengine-demo[0m│████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████ │ 100%
+
+real	0m45.442s
+user	0m10.291s
+sys	1m41.122s
+
+[0;32m=== 3. rsync --dry-run (file enumeration) ===[0m
+
+Number of files: 4,150,640 (reg: 4,132,721, dir: 17,919)
+Number of created files: 4,150,639 (reg: 4,132,721, dir: 17,918)
+Number of deleted files: 0
+Number of regular files transferred: 4,132,721
+Total file size: 1,451,190,831,020 bytes
+Total transferred file size: 1,451,190,831,020 bytes
+Literal data: 0 bytes
+Matched data: 0 bytes
+Total bytes sent: 111,382,783
+Total bytes received: 12,484,070
+sent 111,382,783 bytes  received 12,484,070 bytes  636,847.57 bytes/sec
+
+real	3m14.681s
+user	0m18.959s
+sys	1m26.868s
+
+[0;32m=== 4. find (count files) ===[0m
+
+4132721
+
+real	28m19.666s
+user	0m16.679s
+sys	4m54.106s
+
+[0;32m=== 5. hunt (fast file search) ===[0m
+
+0
+
+real	0m0.020s
+user	0m0.001s
+sys	0m0.008s
+
+[0;32m=== 6. du (disk usage) ===[0m
+
+1.4T	/mnt/syncengine-demo
+
+real	28m51.848s
+user	0m9.701s
+sys	4m52.596s
+
+[0;32m=== 7. nfs-walker (SQLite output) ===[0m
+
+
+nfs-walker 0.1.0
+──────────────────────────────────────────────────
+  Source: nfs://main.selab-var203.selab.vastdata.com/syncengine-demo
+  Workers: 32
+  Output: /tmp/bench.db
+
+Mode: READDIRPLUS (SQLite)
+
+Walk Complete
+──────────────────────────────────────────────────
+  Directories: 17,919
+  Files: 4,132,850
+  Total Size: 1.32 TiB
+  Duration: 62.9s (65731 files/sec)
+  Database: /tmp/bench.db (1.11 GiB)
+
+
+real	1m3.338s
+user	0m0.004s
+sys	0m0.029s
+
+[0;32m=== 8. nfs-walker (RocksDB output) ===[0m
+
+
+nfs-walker 0.1.0
+──────────────────────────────────────────────────
+  Source: nfs://main.selab-var203.selab.vastdata.com/syncengine-demo
+  Workers: 32
+  Output: /tmp/bench.rocks
+
+Mode: READDIRPLUS (RocksDB)
+
+Walk Complete
+──────────────────────────────────────────────────
+  Directories: 17,919
+  Files: 4,132,850
+  Total Size: 1.32 TiB
+  Duration: 34.5s (119883 files/sec)
+  Database: /tmp/bench.rocks (742.29 MiB)
+
+
+real	0m35.138s
+user	0m0.007s
+sys	0m0.037s
+
+[0;32m=== Output File Sizes ===[0m
+
+-rw-r--r-- 1 root root 1.2G Feb  7 07:18 /tmp/bench.db
+743M	/tmp/bench.rocks
+
+==============================================
+  Benchmark Complete
+==============================================
+
+Log saved to: benchmark-20260207-061007.log

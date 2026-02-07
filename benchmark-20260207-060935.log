@@ -1,0 +1,11 @@
+==============================================
+  NFS Walker Benchmark
+==============================================
+
+NFS Mount: /mnt/syncengine-demo
+NFS URL:   nfs://main.selab-var203.selab.vastdata.com/syncengine-demo
+Workers:   32
+Log file:  benchmark-20260207-060935.log
+
+rm: cannot remove '/tmp/bench.rocks': Is a directory
+rm: cannot remove '/tmp/bench.db': Operation not permitted

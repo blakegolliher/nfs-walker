@@ -9,8 +9,13 @@ set -e
 NFS_MOUNT="/mnt/syncengine-demo"
 NFS_URL="nfs://main.selab-var203.selab.vastdata.com/syncengine-demo"
 WALKER="./build/nfs-walker"
-CONNECTIONS=32
+FD="/home/vastdata/.cargo/bin/fd"
+WORKERS=32
 OUTPUT_DIR="/tmp"
+LOG_FILE="benchmark-$(date +%Y%m%d-%H%M%S).log"
+
+# Log everything to file and screen
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 # Colors
 GREEN='\033[0;32m'
@@ -51,60 +56,61 @@ echo "=============================================="
 echo ""
 echo "NFS Mount: $NFS_MOUNT"
 echo "NFS URL:   $NFS_URL"
-echo "Connections: $CONNECTIONS"
+echo "Workers:   $WORKERS"
+echo "Log file:  $LOG_FILE"
 echo ""
 
 # Cleanup
-rm -f ${OUTPUT_DIR}/bench.parquet ${OUTPUT_DIR}/bench.db
+rm -f ${OUTPUT_DIR}/bench.rocks ${OUTPUT_DIR}/bench.db
+rm -rf /tmp/rsync-null && mkdir -p /tmp/rsync-null
 
 #############################################
 # Traditional Tools (via kernel NFS client)
 #############################################
 
-print_header "1. find (count files only)"
+print_header "1. fd-find (fast file search)"
+clear_cache
+time $FD . "$NFS_MOUNT" 2>/dev/null | wc -l
+
+print_header "2. dust (fast du alternative)"
+clear_cache
+time dust -d 0 "$NFS_MOUNT" 2>/dev/null
+
+print_header "3. rsync --dry-run (file enumeration)"
+clear_cache
+time rsync -an --stats "$NFS_MOUNT/" /tmp/rsync-null/ 2>&1 | grep -E "(files|bytes)"
+
+print_header "4. find (count files)"
 clear_cache
 time find "$NFS_MOUNT" -type f 2>/dev/null | wc -l
 
-print_header "2. find with stat (path + size + mtime)"
+print_header "5. du (disk usage)"
 clear_cache
-time find "$NFS_MOUNT" -type f -printf '%s %T@ %p\n' 2>/dev/null | wc -l
-
-print_header "3. ls -lR (recursive listing)"
-clear_cache
-time ls -lR "$NFS_MOUNT" 2>/dev/null | wc -l
-
-print_header "4. du (disk usage)"
-clear_cache
-time du -s "$NFS_MOUNT" 2>/dev/null
-
-print_header "5. tree (directory tree)"
-clear_cache
-time tree -a "$NFS_MOUNT" 2>/dev/null | tail -3
-
-print_header "6. rsync --dry-run (file enumeration)"
-clear_cache
-time rsync -an --stats "$NFS_MOUNT/" /dev/null 2>/dev/null | tail -5
+time du -sh "$NFS_MOUNT" 2>/dev/null
 
 #############################################
 # nfs-walker (direct NFS protocol)
 #############################################
 
-print_header "7. nfs-walker (SQLite output)"
+print_header "6. nfs-walker (SQLite output)"
 clear_cache
-time sudo "$WALKER" "$NFS_URL" -o ${OUTPUT_DIR}/bench.db --connections $CONNECTIONS
+time sudo "$WALKER" "$NFS_URL" --sqlite -o ${OUTPUT_DIR}/bench.db -w $WORKERS
 
-print_header "8. nfs-walker (Parquet output)"
+print_header "7. nfs-walker (RocksDB output)"
 clear_cache
-time sudo "$WALKER" "$NFS_URL" --format parquet -o ${OUTPUT_DIR}/bench.parquet --connections $CONNECTIONS
+time sudo "$WALKER" "$NFS_URL" -o ${OUTPUT_DIR}/bench.rocks -w $WORKERS
 
 #############################################
 # Summary
 #############################################
 
 print_header "Output File Sizes"
-ls -lh ${OUTPUT_DIR}/bench.db ${OUTPUT_DIR}/bench.parquet 2>/dev/null
+ls -lh ${OUTPUT_DIR}/bench.db 2>/dev/null
+du -sh ${OUTPUT_DIR}/bench.rocks 2>/dev/null
 
 echo ""
 echo "=============================================="
 echo "  Benchmark Complete"
 echo "=============================================="
+echo ""
+echo "Log saved to: $LOG_FILE"

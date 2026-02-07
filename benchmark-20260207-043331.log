@@ -1,0 +1,102 @@
+==============================================
+  NFS Walker Benchmark
+==============================================
+
+NFS Mount: /mnt/syncengine-demo
+NFS URL:   nfs://main.selab-var203.selab.vastdata.com/syncengine-demo
+Workers:   32
+Log file:  benchmark-20260207-043331.log
+
+
+[0;32m=== 1. fd-find (fast file search) ===[0m
+
+4150463
+
+real	3m43.727s
+user	0m32.925s
+sys	4m31.832s
+
+[0;32m=== 2. dust (fast du alternative) ===[0m
+
+[31m1.3T[0m ┌── [1;34msyncengine-demo[0m│███████████████████████████████████████████████████████████████████████████████████████ │ 100%
+
+real	0m40.195s
+user	0m9.795s
+sys	1m40.811s
+
+[0;32m=== 3. rsync --dry-run (file enumeration) ===[0m
+
+Number of files: 4,150,464 (reg: 4,132,545, dir: 17,919)
+Number of created files: 4,150,463 (reg: 4,132,545, dir: 17,918)
+Number of deleted files: 0
+Number of regular files transferred: 4,132,545
+Total file size: 1,451,361,018,007 bytes
+Total transferred file size: 1,451,361,018,007 bytes
+Literal data: 0 bytes
+Matched data: 0 bytes
+Total bytes sent: 111,370,919
+Total bytes received: 12,483,542
+sent 111,370,919 bytes  received 12,483,542 bytes  627,111.19 bytes/sec
+
+real	3m17.453s
+user	0m19.052s
+sys	1m27.324s
+
+[0;32m=== 4. nfs-walker (SQLite output) ===[0m
+
+
+nfs-walker 0.1.0
+──────────────────────────────────────────────────
+  Source: nfs://main.selab-var203.selab.vastdata.com/syncengine-demo
+  Workers: 32
+  Output: /tmp/bench.db
+
+Mode: READDIRPLUS (SQLite)
+
+Walk Complete
+──────────────────────────────────────────────────
+  Directories: 17,919
+  Files: 4,132,545
+  Total Size: 1.32 TiB
+  Duration: 62.9s (65675 files/sec)
+  Database: /tmp/bench.db (1.11 GiB)
+
+
+real	1m3.342s
+user	0m0.008s
+sys	0m0.034s
+
+[0;32m=== 5. nfs-walker (RocksDB output) ===[0m
+
+
+nfs-walker 0.1.0
+──────────────────────────────────────────────────
+  Source: nfs://main.selab-var203.selab.vastdata.com/syncengine-demo
+  Workers: 32
+  Output: /tmp/bench.rocks
+
+Mode: READDIRPLUS (RocksDB)
+
+Walk Complete
+──────────────────────────────────────────────────
+  Directories: 17,919
+  Files: 4,132,545
+  Total Size: 1.32 TiB
+  Duration: 35.7s (115609 files/sec)
+  Database: /tmp/bench.rocks (747.10 MiB)
+
+
+real	0m36.637s
+user	0m0.006s
+sys	0m0.038s
+
+[0;32m=== Output File Sizes ===[0m
+
+-rw-r--r-- 1 root root 1.2G Feb  7 04:43 /tmp/bench.db
+748M	/tmp/bench.rocks
+
+==============================================
+  Benchmark Complete
+==============================================
+
+Log saved to: benchmark-20260207-043331.log

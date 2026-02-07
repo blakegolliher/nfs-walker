@@ -114,16 +114,19 @@ Stats Options:
 
 ### Benchmark Results
 
-Tested against `dust` (a fast directory analyzer) over NFS:
+Tested on a real NFS export: **4.1M files, 17,919 directories, 1.32 TiB** over NFS.
 
-| Workload | Files | nfs-walker | dust | Speedup |
-|----------|-------|------------|------|---------|
-| **Mixed tree** | 500,000 | 2.8s (181k/sec) | 18.3s | **6.5×** |
-| **Narrow-deep** | 7,000 | 1.1s | 6.4s | **5.8×** |
-| **Single huge dir** | 500,000 | 9.1s (55k/sec) | 15.2s | **1.7×** |
-| **Wide-shallow** | 1,000,000 | 22.0s (45k/sec) | 31.1s | **1.4×** |
+| Rank | Tool | Time | Files/sec | vs nfs-walker |
+|------|------|------|-----------|---------------|
+| 1 | **nfs-walker (RocksDB)** | **35.1s** | **119,883** | — |
+| 2 | dust | 45.4s | ~91K | 1.3× slower |
+| 3 | nfs-walker (SQLite) | 63.3s | 65,731 | 1.8× slower |
+| 4 | rsync --dry-run | 3m 15s | ~21K | **5.6× slower** |
+| 5 | fd-find | 3m 43s | ~18.6K | **6.3× slower** |
+| 6 | find | 28m 20s | ~2.4K | **48× slower** |
+| 7 | du | 28m 52s | ~2.4K | **49× slower** |
 
-*Mixed tree (10K dirs, 50 files each) shows peak performance at 180,785 files/sec.*
+*All kernel-client tools (rsync, fd, find, du) use the standard NFS mount. nfs-walker bypasses the kernel and speaks NFS protocol directly.*
 
 ### Large-Scale Production
 
