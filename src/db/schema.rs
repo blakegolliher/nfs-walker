@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS entries (
     inode INTEGER,
     depth INTEGER NOT NULL,
     extension TEXT,               -- File extension (without dot, lowercase)
-    blocks INTEGER DEFAULT 0      -- Number of 512-byte blocks allocated
+    blocks INTEGER DEFAULT 0,     -- Number of 512-byte blocks allocated
+    checksum TEXT,                -- gxhash checksum (hex string)
+    file_type TEXT                -- Detected MIME type from magic bytes
 )
 "#;
 
@@ -73,6 +75,8 @@ const CREATE_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_entries_type ON entries(entry_type)",
     "CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path)",
     "CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries(mtime) WHERE entry_type = 0",
+    "CREATE INDEX IF NOT EXISTS idx_entries_checksum ON entries(checksum) WHERE checksum IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_entries_file_type ON entries(file_type) WHERE file_type IS NOT NULL",
 ];
 
 /// SQLite pragmas for optimal write performance

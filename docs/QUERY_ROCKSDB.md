@@ -159,6 +159,72 @@ Usage by Group ID (top 10):
 ...
 ```
 
+### Duplicate Files by Checksum
+
+*Requires scan with `-c` (checksum) flag.*
+
+```bash
+nfs-walker stats scan.rocks --duplicates -n 10
+nfs-walker stats scan.rocks --duplicates --min-size 1048576  # Only files > 1MB
+```
+
+Output:
+```
+Duplicate Files (top 10):
+─────────────────────────────────────────────────
+Checksum: a1b2c3d4e5f6...
+  Size: 456.78 MiB × 3 copies (wasted: 913.56 MiB)
+    /data/project-a/dataset.bin
+    /data/project-b/dataset.bin
+    /data/archive/dataset.bin
+
+Checksum: f6e5d4c3b2a1...
+  Size: 123.45 MiB × 2 copies (wasted: 123.45 MiB)
+    /home/user1/report.pdf
+    /home/user2/report.pdf
+...
+```
+
+### File Type Distribution
+
+*Requires scan with `-t` (file type) flag.*
+
+```bash
+nfs-walker stats scan.rocks --by-file-type -n 15
+```
+
+Output:
+```
+File Types (top 15):
+─────────────────────────────────────────────────
+MIME Type                    Count        Total Size
+---------                    -----        ----------
+application/octet-stream   345,678      234.56 GiB
+image/jpeg                 123,456       45.67 GiB
+application/pdf             45,678       12.34 GiB
+video/mp4                   12,345       89.01 GiB
+...
+```
+
+### Hard Link Groups
+
+```bash
+nfs-walker stats scan.rocks --hardlink-groups -n 10
+```
+
+Output:
+```
+Hard Link Groups (top 10):
+─────────────────────────────────────────────────
+Inode: 12345678  (nlink=5, size=1.23 GiB)
+    /data/shared/common-lib.so
+    /data/app1/lib/common-lib.so
+    /data/app2/lib/common-lib.so
+    /data/app3/lib/common-lib.so
+    /data/backup/common-lib.so
+...
+```
+
 ---
 
 ## Combining Queries
@@ -182,6 +248,10 @@ nfs-walker stats scan.rocks --by-extension --by-uid --largest-files -n 10
 | `--most-links` | Files with most hard links (nlink) |
 | `--by-uid` | Usage breakdown by user ID |
 | `--by-gid` | Usage breakdown by group ID |
+| `--duplicates` | Files with identical checksums (requires `-c` scan) |
+| `--by-file-type` | Files grouped by MIME type (requires `-t` scan) |
+| `--hardlink-groups` | Groups of paths sharing the same inode |
+| `--min-size N` | Minimum file size for `--duplicates` (default: 1024) |
 | `-n N`, `--top N` | Limit results to top N (default: 20) |
 
 ---

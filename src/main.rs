@@ -116,8 +116,8 @@ fn handle_command(cmd: &Command) -> Result<()> {
         Command::Convert { input, output, progress } => {
             run_convert(input, output, *progress)
         }
-        Command::Stats { db, by_extension, largest_files, largest_dirs, oldest_files, most_links, by_uid, by_gid, top } => {
-            run_stats(db, *by_extension, *largest_files, *largest_dirs, *oldest_files, *most_links, *by_uid, *by_gid, *top)
+        Command::Stats { db, by_extension, largest_files, largest_dirs, oldest_files, most_links, by_uid, by_gid, duplicates, by_file_type, hardlink_groups, min_size, top } => {
+            run_stats(db, *by_extension, *largest_files, *largest_dirs, *oldest_files, *most_links, *by_uid, *by_gid, *duplicates, *by_file_type, *hardlink_groups, *min_size, *top)
         }
     }
 }
@@ -133,16 +133,22 @@ fn run_stats(
     most_links: bool,
     by_uid: bool,
     by_gid: bool,
+    duplicates: bool,
+    by_file_type: bool,
+    hardlink_groups: bool,
+    min_size: u64,
     top: usize,
 ) -> Result<()> {
     use nfs_walker::rocksdb::{
-        compute_stats, largest_directories, largest_files, most_hardlinks, oldest_files,
-        stats_by_extension, stats_by_gid, stats_by_uid,
+        compute_stats, find_duplicates, find_hardlink_groups, largest_directories, largest_files,
+        most_hardlinks, oldest_files, stats_by_extension, stats_by_file_type, stats_by_gid,
+        stats_by_uid,
     };
 
     // If no specific query requested, show overall stats
     let show_overview = !by_extension && !largest_files_flag && !largest_dirs
-        && !oldest_files_flag && !most_links && !by_uid && !by_gid;
+        && !oldest_files_flag && !most_links && !by_uid && !by_gid
+        && !duplicates && !by_file_type && !hardlink_groups;
 
     if show_overview {
         let stats = compute_stats(db).context("Failed to compute stats")?;
@@ -270,6 +276,80 @@ fn run_stats(
             );
         }
         println!();
+    }
+
+    if duplicates {
+        let groups = find_duplicates(db, min_size, top).context("Failed to find duplicates")?;
+        if groups.is_empty() {
+            println!();
+            println!("No duplicate files found (min size: {})", format_size(min_size, BINARY));
+            println!("Note: Requires --checksum flag during scan.");
+            println!();
+        } else {
+            println!();
+            println!("Duplicate Files (top {} groups, min size {}):", top, format_size(min_size, BINARY));
+            println!("─────────────────────────────────────────────────");
+            for group in groups {
+                println!();
+                println!("  Checksum: {}  Size: {}  Wasted: {}",
+                    &group.checksum[..16], // Show first 16 chars of checksum
+                    format_size(group.file_size, BINARY),
+                    format_size(group.wasted_bytes, BINARY));
+                for path in &group.paths {
+                    println!("    {}", path);
+                }
+            }
+            println!();
+        }
+    }
+
+    if by_file_type {
+        let stats = stats_by_file_type(db, top).context("Failed to get file type stats")?;
+        if stats.is_empty() || (stats.len() == 1 && stats[0].mime_type == "unknown") {
+            println!();
+            println!("No file type data available.");
+            println!("Note: Requires --file-type flag during scan.");
+            println!();
+        } else {
+            println!();
+            println!("Files by Detected Type (top {}):", top);
+            println!("─────────────────────────────────────────────────");
+            println!("{:<40} {:>12} {:>14}", "MIME Type", "Count", "Size");
+            println!("{:<40} {:>12} {:>14}", "---------", "-----", "----");
+            for stat in stats {
+                println!(
+                    "{:<40} {:>12} {:>14}",
+                    stat.mime_type,
+                    format_number(stat.count),
+                    format_size(stat.total_bytes, BINARY),
+                );
+            }
+            println!();
+        }
+    }
+
+    if hardlink_groups {
+        let groups = find_hardlink_groups(db, 2, top).context("Failed to find hardlink groups")?;
+        if groups.is_empty() {
+            println!();
+            println!("No hard link groups found.");
+            println!();
+        } else {
+            println!();
+            println!("Hard Link Groups (top {}):", top);
+            println!("─────────────────────────────────────────────────");
+            for group in groups {
+                println!();
+                println!("  Inode: {}  Links: {}  Size: {}",
+                    group.inode,
+                    group.nlink,
+                    format_size(group.size, BINARY));
+                for path in &group.paths {
+                    println!("    {}", path);
+                }
+            }
+            println!();
+        }
     }
 
     Ok(())

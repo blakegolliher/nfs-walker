@@ -130,6 +130,19 @@ pub struct CliArgs {
     /// Use when the export has multiple path components, e.g., /volumes/uuid
     #[arg(long, value_name = "PATH")]
     pub export: Option<String>,
+
+    /// Calculate gxhash checksum for each file (reads full file content)
+    #[arg(long, short = 'c')]
+    pub checksum: bool,
+
+    /// Detect file type using magic bytes (reads first 8KB of each file)
+    #[arg(long, short = 't')]
+    pub file_type: bool,
+
+    /// Maximum file size for checksum calculation (default: 1GB)
+    /// Files larger than this will have checksum set to None
+    #[arg(long, default_value = "1073741824", value_name = "BYTES")]
+    pub max_checksum_size: u64,
 }
 
 /// Subcommands
@@ -185,6 +198,22 @@ pub enum Command {
         /// Show usage by group ID
         #[arg(long)]
         by_gid: bool,
+
+        /// Find duplicate files by checksum
+        #[arg(long)]
+        duplicates: bool,
+
+        /// Show file type distribution (by detected MIME type)
+        #[arg(long)]
+        by_file_type: bool,
+
+        /// Find hard link groups (files sharing same inode)
+        #[arg(long)]
+        hardlink_groups: bool,
+
+        /// Minimum file size for duplicate detection (default: 1KB)
+        #[arg(long, default_value = "1024")]
+        min_size: u64,
 
         /// Number of results to show
         #[arg(short = 'n', long, default_value = "20")]
@@ -437,6 +466,15 @@ pub struct WalkConfig {
 
     /// File count threshold for big-dir-hunt mode
     pub big_dir_threshold: u64,
+
+    /// Calculate gxhash checksum for files
+    pub compute_checksum: bool,
+
+    /// Detect file type using magic bytes
+    pub detect_file_type: bool,
+
+    /// Maximum file size for checksum calculation
+    pub max_checksum_size: u64,
 }
 
 impl WalkConfig {
@@ -559,6 +597,9 @@ impl WalkConfig {
             retry_count: args.retries,
             big_dir_hunt: args.big_dir_hunt,
             big_dir_threshold: args.threshold,
+            compute_checksum: args.checksum,
+            detect_file_type: args.file_type,
+            max_checksum_size: args.max_checksum_size,
         })
     }
 
@@ -637,6 +678,9 @@ mod tests {
             retry_count: 3,
             big_dir_hunt: false,
             big_dir_threshold: 1_000_000,
+            compute_checksum: false,
+            detect_file_type: false,
+            max_checksum_size: 1_073_741_824,
         };
 
         assert!(config.is_excluded("/data/.snapshot/hourly.0"));

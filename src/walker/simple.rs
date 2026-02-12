@@ -19,6 +19,7 @@
 use crate::config::WalkConfig;
 #[cfg(feature = "rocksdb")]
 use crate::config::OutputFormat;
+use crate::content::{checksum::compute_gxhash, filetype::detect_file_type as detect_mime_type};
 use crate::db::schema::{create_database, create_indexes, keys, optimize_for_reads, set_walk_info};
 use crate::error::{Result, WalkerError};
 use crate::nfs::{resolve_dns, NfsConnection, NfsConnectionBuilder};
@@ -627,6 +628,9 @@ impl SimpleWalker {
             let dirs_only = self.config.dirs_only;
             let worker_count = self.config.worker_count;
             let batch_size = self.config.batch_size;
+            let compute_checksum = self.config.compute_checksum;
+            let detect_file_type = self.config.detect_file_type;
+            let max_checksum_size = self.config.max_checksum_size;
 
             let handle = thread::Builder::new()
                 .name(format!("walker-{}", id))
@@ -649,6 +653,9 @@ impl SimpleWalker {
                         dirs_only,
                         worker_count,
                         batch_size,
+                        compute_checksum,
+                        detect_file_type,
+                        max_checksum_size,
                     );
                 })
                 .expect("Failed to spawn worker thread");
@@ -864,6 +871,9 @@ fn worker_loop(
     dirs_only: bool,
     _worker_count: usize,
     batch_size: usize,
+    compute_checksum: bool,
+    detect_file_type: bool,
+    max_checksum_size: u64,
 ) {
     debug!("Worker {} started", id);
 
@@ -956,6 +966,11 @@ fn worker_loop(
         let mut chunk_byte_count = 0u64;
         let mut channel_broken = false;
 
+        // Track files that need content analysis (path, batch_index, size)
+        // We'll process them after the directory walk completes
+        let needs_content = compute_checksum || detect_file_type;
+        let mut files_for_content: Vec<(String, usize, u64)> = Vec::new();
+
         // Define the callback that processes directory entries
         // This is used by both readdir_plus_by_fh and readdir_plus_with_fh
         let mut process_entries = |chunk: Vec<crate::nfs::types::NfsDirEntry>| -> bool {
@@ -1005,8 +1020,12 @@ fn worker_loop(
                     depth: work.depth + 1,
                     extension,
                     blocks: nfs_entry.blocks(),
+                    checksum: None,
+                    file_type: None,
                 };
 
+                // Track index before pushing (for content analysis)
+                let entry_idx = batch.len();
                 batch.push(db_entry);
 
                 if is_dir {
@@ -1021,10 +1040,16 @@ fn worker_loop(
                 } else {
                     chunk_file_count += 1;
                     chunk_byte_count += nfs_entry.size();
+
+                    // Track files for content analysis (will process after dir walk)
+                    if needs_content {
+                        let file_size = nfs_entry.size();
+                        files_for_content.push((full_path.clone(), entry_idx, file_size));
+                    }
                 }
 
-                // Send batch if full
-                if batch.len() >= batch_size {
+                // Send batch if full (skip if content analysis needed - process after walk)
+                if batch.len() >= batch_size && !needs_content {
                     if entry_tx.send(std::mem::replace(&mut batch, Vec::with_capacity(batch_size))).is_err() {
                         channel_broken = true;
                         return false; // Stop reading if channel is broken
@@ -1049,6 +1074,56 @@ fn worker_loop(
 
         match result {
             Ok(entry_count) => {
+                // Process content analysis for files if enabled
+                // This happens AFTER the directory walk completes so nfs is no longer borrowed
+                if needs_content && !files_for_content.is_empty() {
+                    for (path, idx, size) in files_for_content.drain(..) {
+                        if idx >= batch.len() {
+                            continue; // Safety check
+                        }
+
+                        // Determine what content we need to read
+                        let need_full_file = compute_checksum && size <= max_checksum_size;
+                        let need_header = detect_file_type && !need_full_file;
+
+                        // Read content
+                        let content = if need_full_file {
+                            // Read entire file for checksum (also use for file type)
+                            match nfs.read_file_content(&path, max_checksum_size) {
+                                Ok(Some(data)) => Some(data),
+                                Ok(None) => None, // File too large
+                                Err(e) => {
+                                    debug!("Failed to read file content {}: {}", path, e);
+                                    None
+                                }
+                            }
+                        } else if need_header {
+                            // Only read header for file type detection
+                            match nfs.read_file_header(&path, 8192) {
+                                Ok(data) => Some(data),
+                                Err(e) => {
+                                    debug!("Failed to read file header {}: {}", path, e);
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        // Compute checksum and/or file type
+                        if let Some(data) = content {
+                            if compute_checksum && data.len() as u64 == size {
+                                // Only set checksum if we read the full file
+                                batch[idx].checksum = Some(compute_gxhash(&data));
+                            }
+                            if detect_file_type {
+                                let header_len = std::cmp::min(data.len(), 8192);
+                                batch[idx].file_type = detect_mime_type(&data[..header_len]);
+                            }
+                        }
+                    }
+                }
+
                 // Update directory count and any remaining files from final partial batch
                 dirs_count.fetch_add(1, Ordering::Relaxed);
                 files_count.fetch_add(chunk_file_count, Ordering::Relaxed);
@@ -1058,6 +1133,14 @@ fn worker_loop(
                     "Worker {} READDIRPLUS complete: {} -> {} entries ({} subdirs)",
                     id, work.path, entry_count, subdir_count
                 );
+
+                // Send batch now if content analysis was enabled (deferred sending)
+                if needs_content && !batch.is_empty() {
+                    if entry_tx.send(std::mem::replace(&mut batch, Vec::with_capacity(batch_size))).is_err() {
+                        // Channel closed, we're shutting down
+                        debug!("Worker {} channel closed during content analysis send", id);
+                    }
+                }
             }
             Err(e) => {
                 errors_count.fetch_add(1, Ordering::Relaxed);
@@ -1457,8 +1540,8 @@ fn write_sqlite_batch(conn: &mut Connection, entries: &[DbEntry]) -> Result<()> 
 
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO entries (parent_id, name, path, entry_type, size, mtime, atime, ctime, mode, uid, gid, nlink, inode, depth, extension, blocks)
-             VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+            "INSERT INTO entries (parent_id, name, path, entry_type, size, mtime, atime, ctime, mode, uid, gid, nlink, inode, depth, extension, blocks, checksum, file_type)
+             VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
         ).map_err(|e| WalkerError::Database(e.into()))?;
 
         for entry in entries {
@@ -1478,6 +1561,8 @@ fn write_sqlite_batch(conn: &mut Connection, entries: &[DbEntry]) -> Result<()> 
                 entry.depth as i64,
                 entry.extension,
                 entry.blocks as i64,
+                entry.checksum,
+                entry.file_type,
             ]).map_err(|e| WalkerError::Database(e.into()))?;
         }
     }

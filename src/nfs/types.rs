@@ -371,6 +371,12 @@ pub struct DbEntry {
 
     /// Number of 512-byte blocks allocated
     pub blocks: u64,
+
+    /// gxhash checksum (hex-encoded, 32 chars for 128-bit hash)
+    pub checksum: Option<String>,
+
+    /// Detected MIME type from magic bytes
+    pub file_type: Option<String>,
 }
 
 impl DbEntry {
@@ -419,6 +425,8 @@ impl DbEntry {
             depth,
             extension,
             blocks: dir_entry.blocks(),
+            checksum: None,
+            file_type: None,
         }
     }
 
@@ -470,6 +478,8 @@ impl DbEntry {
             depth,
             extension,
             blocks: stat.blocks,
+            checksum: None,
+            file_type: None,
         }
     }
 
@@ -492,6 +502,8 @@ impl DbEntry {
             depth: 0,
             extension: None,
             blocks: 0,
+            checksum: None,
+            file_type: None,
         }
     }
 

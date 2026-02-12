@@ -47,6 +47,10 @@ pub struct RocksEntry {
     pub depth: u32,
     pub extension: Option<String>,
     pub blocks: u64,
+    /// gxhash checksum (hex-encoded)
+    pub checksum: Option<String>,
+    /// Detected MIME type from magic bytes
+    pub file_type: Option<String>,
 }
 
 impl RocksEntry {
@@ -68,6 +72,8 @@ impl RocksEntry {
             depth: entry.depth,
             extension: entry.extension.clone(),
             blocks: entry.blocks,
+            checksum: entry.checksum.clone(),
+            file_type: entry.file_type.clone(),
         }
     }
 
@@ -103,6 +109,8 @@ impl RocksEntry {
             depth: self.depth,
             extension: self.extension.clone(),
             blocks: self.blocks,
+            checksum: self.checksum.clone(),
+            file_type: self.file_type.clone(),
         }
     }
 
@@ -430,6 +438,8 @@ mod tests {
             depth: 2,
             extension: Some("txt".to_string()),
             blocks: 8,
+            checksum: Some("0123456789abcdef0123456789abcdef".to_string()),
+            file_type: Some("text/plain".to_string()),
         };
 
         let bytes = entry.to_bytes().unwrap();

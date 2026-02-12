@@ -50,6 +50,7 @@
 //! ```
 
 pub mod config;
+pub mod content;
 pub mod db;
 pub mod error;
 pub mod nfs;

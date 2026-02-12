@@ -156,8 +156,8 @@ fn convert_entries(
 
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO entries (parent_id, name, path, entry_type, size, mtime, atime, ctime, mode, uid, gid, nlink, inode, depth, extension, blocks)
-             VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+            "INSERT INTO entries (parent_id, name, path, entry_type, size, mtime, atime, ctime, mode, uid, gid, nlink, inode, depth, extension, blocks, checksum, file_type)
+             VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
         ).map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
 
         for result in iter {
@@ -180,6 +180,8 @@ fn convert_entries(
                 entry.depth as i64,
                 entry.extension,
                 entry.blocks as i64,
+                entry.checksum,
+                entry.file_type,
             ]).map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
 
             stats.entries_converted += 1;
@@ -281,6 +283,8 @@ mod tests {
                 depth: 1,
                 extension: Some("txt".to_string()),
                 blocks: 8,
+                checksum: None,
+                file_type: None,
             },
             DbEntry {
                 parent_path: Some("/".to_string()),
@@ -299,6 +303,8 @@ mod tests {
                 depth: 1,
                 extension: None,
                 blocks: 0,
+                checksum: None,
+                file_type: None,
             },
         ];
 

@@ -82,6 +82,10 @@ pub enum NfsError {
     #[error("Failed to stat '{path}': {reason}")]
     StatFailed { path: String, reason: String },
 
+    /// File read operation failed
+    #[error("Failed to read file '{path}': {reason}")]
+    ReadFailed { path: String, reason: String },
+
     /// Permission denied
     #[error("Permission denied: '{path}'")]
     PermissionDenied { path: String },

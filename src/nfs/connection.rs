@@ -738,6 +738,161 @@ impl NfsConnection {
     pub unsafe fn raw_context(&self) -> *mut ffi::nfs_context {
         self.context
     }
+
+    /// Read the first N bytes from a file for magic byte detection
+    ///
+    /// This is optimized for file type detection - it only reads the header bytes
+    /// needed to identify the file format.
+    pub fn read_file_header(&self, path: &str, max_bytes: usize) -> NfsResult<Vec<u8>> {
+        if !self.mounted {
+            return Err(NfsError::ReadFailed {
+                path: path.into(),
+                reason: "Not mounted".into(),
+            });
+        }
+
+        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadFailed {
+            path: path.into(),
+            reason: "Path contains null bytes".into(),
+        })?;
+
+        // Open file for reading (O_RDONLY = 0)
+        let mut fh: *mut ffi::nfsfh = ptr::null_mut();
+        let result = unsafe {
+            ffi::nfs_open(self.context, path_cstr.as_ptr(), 0, &mut fh)
+        };
+
+        if result != 0 {
+            return Err(NfsError::ReadFailed {
+                path: path.into(),
+                reason: self.get_error(),
+            });
+        }
+
+        // Read the header bytes
+        let mut buffer = vec![0u8; max_bytes];
+        let bytes_read = unsafe {
+            ffi::nfs_read(
+                self.context,
+                fh,
+                buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                max_bytes,
+            )
+        };
+
+        // Close the file regardless of read result
+        unsafe {
+            ffi::nfs_close(self.context, fh);
+        }
+
+        if bytes_read < 0 {
+            return Err(NfsError::ReadFailed {
+                path: path.into(),
+                reason: self.get_error(),
+            });
+        }
+
+        // Truncate buffer to actual bytes read
+        buffer.truncate(bytes_read as usize);
+        Ok(buffer)
+    }
+
+    /// Read entire file content for checksum calculation
+    ///
+    /// Returns None if the file is larger than max_size to avoid excessive memory usage.
+    /// For very large files, consider using a streaming approach.
+    pub fn read_file_content(&self, path: &str, max_size: u64) -> NfsResult<Option<Vec<u8>>> {
+        if !self.mounted {
+            return Err(NfsError::ReadFailed {
+                path: path.into(),
+                reason: "Not mounted".into(),
+            });
+        }
+
+        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadFailed {
+            path: path.into(),
+            reason: "Path contains null bytes".into(),
+        })?;
+
+        // First stat the file to check size
+        let mut stat: ffi::nfs_stat_64 = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            ffi::nfs_stat64(self.context, path_cstr.as_ptr(), &mut stat)
+        };
+
+        if result != 0 {
+            return Err(NfsError::ReadFailed {
+                path: path.into(),
+                reason: self.get_error(),
+            });
+        }
+
+        let file_size = stat.nfs_size;
+
+        // Check if file is too large
+        if file_size > max_size {
+            return Ok(None);
+        }
+
+        // Open file for reading (O_RDONLY = 0)
+        let mut fh: *mut ffi::nfsfh = ptr::null_mut();
+        let result = unsafe {
+            ffi::nfs_open(self.context, path_cstr.as_ptr(), 0, &mut fh)
+        };
+
+        if result != 0 {
+            return Err(NfsError::ReadFailed {
+                path: path.into(),
+                reason: self.get_error(),
+            });
+        }
+
+        // Read the entire file in chunks
+        let mut buffer = Vec::with_capacity(file_size as usize);
+        let chunk_size: u64 = 1024 * 1024; // 1MB chunks
+        let mut offset: u64 = 0;
+
+        while offset < file_size {
+            let remaining = file_size - offset;
+            let to_read = std::cmp::min(remaining, chunk_size);
+            let mut chunk = vec![0u8; to_read as usize];
+
+            let bytes_read = unsafe {
+                ffi::nfs_pread(
+                    self.context,
+                    fh,
+                    chunk.as_mut_ptr() as *mut std::ffi::c_void,
+                    to_read as usize,
+                    offset,
+                )
+            };
+
+            if bytes_read < 0 {
+                // Close file and return error
+                unsafe { ffi::nfs_close(self.context, fh); }
+                return Err(NfsError::ReadFailed {
+                    path: path.into(),
+                    reason: self.get_error(),
+                });
+            }
+
+            if bytes_read == 0 {
+                // EOF reached
+                break;
+            }
+
+            chunk.truncate(bytes_read as usize);
+            buffer.extend_from_slice(&chunk);
+            offset += bytes_read as u64;
+        }
+
+        // Close the file
+        unsafe {
+            ffi::nfs_close(self.context, fh);
+        }
+
+        Ok(Some(buffer))
+    }
 }
 
 impl Drop for NfsConnection {

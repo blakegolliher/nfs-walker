@@ -68,7 +68,7 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 ENV LIBCLANG_PATH=/usr/lib64
 # Static link libstdc++ and libnfs
 # Must wrap libnfs in -Bstatic/-Bdynamic to link statically
-ENV RUSTFLAGS="-C link-arg=-static-libstdc++ -C link-arg=-Wl,-Bstatic -C link-arg=-L/usr/local/lib -C link-arg=-lnfs -C link-arg=-Wl,-Bdynamic"
+ENV RUSTFLAGS="-C target-feature=+aes,+sse2 -C link-arg=-static-libstdc++ -C link-arg=-Wl,-Bstatic -C link-arg=-L/usr/local/lib -C link-arg=-lnfs -C link-arg=-Wl,-Bdynamic"
 
 # Copy project source
 COPY . /build/src
