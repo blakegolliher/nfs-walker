@@ -12,6 +12,9 @@ build/
 # Git
 .git/
 
+# Node modules (rebuilt inside Docker)
+web/node_modules/
+
 # OS
 .DS_Store
 Thumbs.db

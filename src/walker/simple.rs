@@ -188,6 +188,7 @@ impl SimpleWalker {
     }
 
     /// Run walker in big-dir-hunt mode with SQLite output
+    #[cfg(not(feature = "rocksdb"))]
     fn run_big_dir_hunt_sqlite(&self) -> Result<WalkStats> {
         let start = Instant::now();
 
@@ -268,6 +269,7 @@ impl SimpleWalker {
     }
 
     /// Spawn SQLite writer thread for big-dir-hunt mode
+    #[cfg(not(feature = "rocksdb"))]
     fn spawn_big_dir_writer_sqlite(
         &self,
         db: Connection,

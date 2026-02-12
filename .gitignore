@@ -50,3 +50,14 @@ docs/INCREMENTAL_SCAN_SPEC.md
 docs/HANDOFF_INCREMENTAL_SCAN.md
 
 vendor/libnfs
+
+# Web dashboard
+web/node_modules/
+web/dist/
+
+# Data files (scans, rocks dbs, parquet outputs)
+*.rocks/
+parquet-output/
+*.sst
+*.log
+*.docx

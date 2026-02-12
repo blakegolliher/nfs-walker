@@ -186,10 +186,11 @@ static:
 	fi
 
 #------------------------------------------------------------------------------
-# Build RocksDB binary for RHEL/Rocky 9+ using Docker (RECOMMENDED)
+# Build portable server binary for RHEL/Rocky 9+ using Docker (RECOMMENDED)
+# Includes: RocksDB, Parquet export, analytics server, embedded web dashboard
 #------------------------------------------------------------------------------
 docker-rocky:
-	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) for Rocky/RHEL 9+ with RocksDB (Docker)...$(NC)"
+	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) for Rocky/RHEL 9+ with all features (Docker)...$(NC)"
 	@mkdir -p $(BUILD_DIR)
 	@if command -v podman &> /dev/null; then \
 		CONTAINER_CMD=podman; \
@@ -203,15 +204,16 @@ docker-rocky:
 	$$CONTAINER_CMD build -f Dockerfile.rocky -t nfs-walker-rocky . 2>&1 | tee $(BUILD_DIR)/build-rocky.log; \
 	BUILD_STATUS=$${PIPESTATUS[0]}; \
 	if [ $$BUILD_STATUS -eq 0 ]; then \
-		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-el9-rocks"; \
+		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-el9-server"; \
 		$$CONTAINER_CMD run --rm nfs-walker-rocky cat /build/nfs-walker > $(BUILD_DIR)/$$RELEASE_NAME; \
 		chmod +x $(BUILD_DIR)/$$RELEASE_NAME; \
-		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-rocks; \
-		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-rocks; \
+		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-server; \
+		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-server; \
 		echo -e "$(GREEN)✓ Rocky 9 build successful$(NC)"; \
 		echo -e "  Binary: $(BUILD_DIR)/$$RELEASE_NAME"; \
-		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-rocks -> $$RELEASE_NAME"; \
+		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-server -> $$RELEASE_NAME"; \
 		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size: " $$5}'; \
+		echo -e "  Features: RocksDB, Parquet, analytics server, embedded dashboard"; \
 		echo -e "  Compatible with: Rocky/RHEL/Alma 9+, Ubuntu 22.04+, Debian 12+"; \
 		file $(BUILD_DIR)/$$RELEASE_NAME | sed 's/^/  /'; \
 		echo "  Dependencies:"; \
@@ -483,7 +485,7 @@ help:
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  docker-rocky    Build RocksDB binary for Rocky/RHEL 9+ via Docker (RECOMMENDED)"
+	@echo "  docker-rocky    Build portable server binary for Rocky/RHEL 9+ via Docker (RECOMMENDED)"
 	@echo "  docker-release  Build RocksDB binary for Ubuntu 20.04+ via Docker"
 	@echo "  build           Build native binary with RocksDB (current system)"
 	@echo "  release         Build static musl binary without RocksDB (smallest)"

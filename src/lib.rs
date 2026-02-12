@@ -55,8 +55,12 @@ pub mod db;
 pub mod error;
 pub mod nfs;
 pub mod progress;
+#[cfg(feature = "parquet")]
+pub mod parquet;
 #[cfg(feature = "rocksdb")]
 pub mod rocksdb;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod walker;
 
 pub use config::{CliArgs, NfsUrl, WalkConfig};
