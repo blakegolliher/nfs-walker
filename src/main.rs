@@ -109,15 +109,23 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Handle subcommands (convert, stats, etc.)
+/// Handle subcommands (convert, stats, export-parquet, etc.)
 #[cfg(feature = "rocksdb")]
 fn handle_command(cmd: &Command) -> Result<()> {
     match cmd {
         Command::Convert { input, output, progress } => {
             run_convert(input, output, *progress)
         }
+        #[cfg(feature = "parquet")]
+        Command::ExportParquet { input, output_dir, progress, file_size_mb, row_group_size, compression_level } => {
+            run_export_parquet(input, output_dir, *progress, *file_size_mb, *row_group_size, *compression_level)
+        }
         Command::Stats { db, by_extension, largest_files, largest_dirs, oldest_files, most_links, by_uid, by_gid, top } => {
             run_stats(db, *by_extension, *largest_files, *largest_dirs, *oldest_files, *most_links, *by_uid, *by_gid, *top)
+        }
+        #[cfg(feature = "server")]
+        Command::Serve { data_dir, port, bind } => {
+            run_server(data_dir, bind, *port)
         }
     }
 }
@@ -326,6 +334,80 @@ fn run_convert(
     eprintln!("  Entries: {}", format_number(stats.entries_converted));
     eprintln!("  SQLite size: {}", db_size);
 
+    Ok(())
+}
+
+/// Run RocksDB to Parquet export
+#[cfg(feature = "parquet")]
+fn run_export_parquet(
+    input: &std::path::Path,
+    output_dir: &std::path::Path,
+    show_progress: bool,
+    file_size_mb: usize,
+    row_group_size: usize,
+    compression_level: i32,
+) -> Result<()> {
+    use nfs_walker::parquet::{convert_rocks_to_parquet, ExportConfig};
+
+    eprintln!("Exporting RocksDB to Parquet...");
+    eprintln!("  Input:      {}", input.display());
+    eprintln!("  Output dir: {}", output_dir.display());
+
+    let config = ExportConfig {
+        row_group_size,
+        target_file_size: file_size_mb * 1024 * 1024,
+        compression_level,
+        progress: show_progress,
+    };
+
+    let progress_reporter = if show_progress {
+        let reporter = ProgressReporter::new();
+        reporter.set_status("Exporting...");
+        Some(reporter)
+    } else {
+        None
+    };
+
+    let callback: Option<Box<dyn Fn(u64, u64) + Send>> = if let Some(ref p) = progress_reporter {
+        let p_clone = p.clone();
+        Some(Box::new(move |exported, _total| {
+            let msg = format!("Exported {} entries", format_number(exported));
+            p_clone.set_status(&msg);
+        }))
+    } else {
+        None
+    };
+
+    let stats = convert_rocks_to_parquet(input, output_dir, config, callback)
+        .context("Parquet export failed")?;
+
+    if let Some(ref p) = progress_reporter {
+        p.finish("Export complete");
+    }
+
+    eprintln!("Export complete:");
+    eprintln!("  Scan ID:    {}", stats.scan_id);
+    eprintln!("  Entries:    {}", format_number(stats.entries_exported));
+    eprintln!("  Files:      {}", stats.files_written);
+    eprintln!(
+        "  Total size: {}",
+        format_size(stats.total_bytes_written, BINARY)
+    );
+
+    Ok(())
+}
+
+/// Start the analytics server
+#[cfg(feature = "server")]
+fn run_server(
+    data_dir: &std::path::Path,
+    bind: &str,
+    port: u16,
+) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()
+        .context("Failed to create tokio runtime")?;
+    rt.block_on(nfs_walker::server::serve(data_dir, bind, port))
+        .context("Server error")?;
     Ok(())
 }
 

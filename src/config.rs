@@ -151,6 +151,50 @@ pub enum Command {
         progress: bool,
     },
 
+    /// Export RocksDB database to Parquet files
+    #[cfg(feature = "parquet")]
+    ExportParquet {
+        /// Input RocksDB directory
+        #[arg(value_name = "INPUT")]
+        input: PathBuf,
+
+        /// Output directory for Parquet files
+        #[arg(value_name = "OUTPUT_DIR")]
+        output_dir: PathBuf,
+
+        /// Show export progress
+        #[arg(short = 'p', long)]
+        progress: bool,
+
+        /// Target file size in MB before splitting
+        #[arg(long, default_value = "256")]
+        file_size_mb: usize,
+
+        /// Rows per row group
+        #[arg(long, default_value = "1000000")]
+        row_group_size: usize,
+
+        /// ZSTD compression level (1-22)
+        #[arg(long, default_value = "3")]
+        compression_level: i32,
+    },
+
+    /// Start analytics server for querying scan data
+    #[cfg(feature = "server")]
+    Serve {
+        /// Directory containing exported Parquet scans
+        #[arg(long, value_name = "DIR")]
+        data_dir: std::path::PathBuf,
+
+        /// Port to listen on
+        #[arg(long, default_value = "8080")]
+        port: u16,
+
+        /// Bind address
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+    },
+
     /// Show statistics from a RocksDB database
     #[cfg(feature = "rocksdb")]
     Stats {

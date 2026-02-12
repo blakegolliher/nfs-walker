@@ -30,6 +30,16 @@ pub enum WalkerError {
     #[error("RocksDB error: {0}")]
     Rocks(#[from] RocksError),
 
+    /// Parquet export errors
+    #[cfg(feature = "parquet")]
+    #[error("Parquet error: {0}")]
+    Parquet(#[from] ParquetError),
+
+    /// Server errors
+    #[cfg(feature = "server")]
+    #[error("Server error: {0}")]
+    Server(#[from] ServerError),
+
     /// Configuration errors
     #[error("Configuration error: {0}")]
     Config(#[from] ConfigError),
@@ -236,6 +246,94 @@ pub enum RocksError {
 /// Result type alias for RocksError
 #[cfg(feature = "rocksdb")]
 pub type RocksResult<T> = std::result::Result<T, RocksError>;
+
+/// Parquet export errors
+#[cfg(feature = "parquet")]
+#[derive(Error, Debug)]
+pub enum ParquetError {
+    /// Arrow error
+    #[error("Arrow error: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
+
+    /// Parquet writer error
+    #[error("Parquet error: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
+
+    /// I/O error
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// JSON serialization error
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// General error with context
+    #[error("{0}")]
+    Other(String),
+}
+
+/// Result type alias for ParquetError
+#[cfg(feature = "parquet")]
+pub type ParquetResult<T> = std::result::Result<T, ParquetError>;
+
+/// Analytics server errors
+#[cfg(feature = "server")]
+#[derive(Error, Debug)]
+pub enum ServerError {
+    /// DataFusion query error
+    #[error("DataFusion error: {0}")]
+    DataFusion(#[from] datafusion::error::DataFusionError),
+
+    /// Arrow error
+    #[error("Arrow error: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
+
+    /// JSON serialization error
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// I/O error
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Query not found in catalog
+    #[error("Query not found: {0}")]
+    QueryNotFound(String),
+
+    /// Invalid query parameter
+    #[error("Invalid parameter '{name}': {reason}")]
+    InvalidParameter { name: String, reason: String },
+
+    /// Scan not found
+    #[error("Scan not found: {0}")]
+    ScanNotFound(String),
+
+    /// Generic error
+    #[error("{0}")]
+    Other(String),
+}
+
+#[cfg(feature = "server")]
+impl axum::response::IntoResponse for ServerError {
+    fn into_response(self) -> axum::response::Response {
+        use axum::http::StatusCode;
+        use axum::Json;
+
+        let (status, message) = match &self {
+            ServerError::QueryNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            ServerError::ScanNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            ServerError::InvalidParameter { .. } => (StatusCode::BAD_REQUEST, self.to_string()),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+        };
+
+        let body = serde_json::json!({ "error": message });
+        (status, Json(body)).into_response()
+    }
+}
+
+/// Result type alias for ServerError
+#[cfg(feature = "server")]
+pub type ServerResult<T> = std::result::Result<T, ServerError>;
 
 /// Result type alias for WalkerError
 pub type Result<T> = std::result::Result<T, WalkerError>;

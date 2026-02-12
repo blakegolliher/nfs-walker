@@ -7,6 +7,7 @@ High-performance NFS filesystem scanner. Scans millions of files directly via NF
 - **Fast**: 48,000+ files/sec using READDIRPLUS and parallel workers
 - **Direct NFS Protocol**: Bypasses kernel NFS client for maximum throughput
 - **RocksDB Storage**: Write-optimized for large scans, with built-in analytics
+- **Analytics Dashboard**: Web UI with 36 pre-built queries across 9 categories
 - **SQLite Export**: Convert to SQLite for complex SQL queries
 - **Memory Efficient**: Periodic flushing keeps memory bounded
 
@@ -82,12 +83,83 @@ sqlite3 scan.db "SELECT extension, COUNT(*), SUM(size)/1e9 as gb
 
 See [docs/QUERY_ROCKSDB.md](docs/QUERY_ROCKSDB.md) and [docs/QUERY_SQLITE.md](docs/QUERY_SQLITE.md) for query examples.
 
+### Analytics Dashboard
+
+The analytics dashboard provides a visual web UI for exploring scan results. It runs 36 pre-built SQL queries via DataFusion against Parquet exports.
+
+**Step 1: Export scan to Parquet**
+
+```bash
+nfs-walker export-parquet scan.rocks parquet-output/
+```
+
+**Step 2: Build the dashboard** (one-time)
+
+```bash
+# Install Node.js dependencies and build the frontend
+cd web && npm install && npm run build && cd ..
+
+# Build the Rust server with dashboard support
+cargo build --release --features server
+```
+
+**Step 3: Start the server**
+
+```bash
+nfs-walker serve --data-dir parquet-output/
+# => Dashboard: http://localhost:8080
+# => API:       http://localhost:8080/api/health
+```
+
+Options:
+```
+nfs-walker serve [OPTIONS] --data-dir <DIR>
+
+  --data-dir <DIR>    Directory containing exported Parquet scans
+  --port <PORT>       Server port [default: 8080]
+  --bind <ADDR>       Bind address [default: 0.0.0.0]
+```
+
+**Dashboard pages:**
+
+| Page | URL | What it shows |
+|------|-----|---------------|
+| Overview | `/` | Entry counts, size/age histograms, top directories |
+| Capacity | `/capacity` | Allocation waste, depth breakdown, hard links, duplicate inodes |
+| Files | `/files` | Size percentiles, growth trends, extensions, largest/zero-byte/temp files |
+| Ownership | `/ownership` | Storage by UID/GID, ownership concentration, world-writable files |
+| Directories | `/directories` | Depth/fanout distributions, widest/deepest/empty directories |
+| Query Explorer | `/queries` | Browse and execute all 36 queries with custom parameters |
+
+**API endpoints:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/health` | Health check |
+| GET | `/api/scans` | List available scans |
+| GET | `/api/queries` | List all 36 queries with metadata |
+| POST | `/api/queries/:id/execute` | Execute a single query |
+| POST | `/api/queries/batch` | Execute multiple queries in one request |
+
+**Development mode** (hot-reload):
+
+```bash
+# Terminal 1: Rust API server
+cargo run --features server -- serve --data-dir parquet-output/
+
+# Terminal 2: Vite dev server with proxy
+cd web && npm run dev
+# => http://localhost:5173 (proxies /api/* to :8080)
+```
+
 ### Command Reference
 
 ```
 nfs-walker [OPTIONS] <NFS_URL>
 nfs-walker stats <DB_PATH> [QUERY_OPTIONS]
 nfs-walker convert <INPUT> <OUTPUT> [--progress]
+nfs-walker export-parquet <INPUT> <OUTPUT_DIR>
+nfs-walker serve --data-dir <DIR> [--port 8080] [--bind 0.0.0.0]
 
 Scan Options:
   -o, --output <FILE>     Output database [default: walk.db]
@@ -174,7 +246,7 @@ Tested on a real NFS export: **4.1M files, 17,919 directories, 1.32 TiB** over N
 - [Building](docs/BUILDING.md) - Build instructions and dependencies
 - [RocksDB Queries](docs/QUERY_ROCKSDB.md) - Built-in query commands
 - [SQLite Queries](docs/QUERY_SQLITE.md) - SQL examples and export
-- [Product Ideas](docs/product_ideas.md) - Future direction and use cases
+- [Analytics Dashboard](#analytics-dashboard) - Web UI setup and usage
 
 ## License
 
