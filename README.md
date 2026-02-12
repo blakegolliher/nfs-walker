@@ -9,6 +9,8 @@ High-performance NFS filesystem scanner. Scans millions of files directly via NF
 - **RocksDB Storage**: Write-optimized for large scans, with built-in analytics
 - **Analytics Dashboard**: Web UI with 36 pre-built queries across 9 categories
 - **SQLite Export**: Convert to SQLite for complex SQL queries
+- **Content Analysis**: Optional checksum (gxhash) and file type detection (magic bytes)
+- **Duplicate Detection**: Find duplicate files by content hash across the entire filesystem
 - **Memory Efficient**: Periodic flushing keeps memory bounded
 
 ## Quick Start
@@ -24,6 +26,13 @@ nfs-walker stats scan.rocks
 nfs-walker stats scan.rocks --by-extension -n 20
 nfs-walker stats scan.rocks --largest-files -n 10
 nfs-walker stats scan.rocks --largest-dirs -n 10
+
+# Scan with content analysis (checksum + file type detection)
+nfs-walker nfs://server/export -o scan.rocks -c -t
+
+# Find duplicate files and analyze file types
+nfs-walker stats scan.rocks --duplicates
+nfs-walker stats scan.rocks --by-file-type
 
 # Convert to SQLite for complex queries
 nfs-walker convert scan.rocks scan.db
@@ -62,6 +71,30 @@ nfs-walker nfs://server/data --exclude ".snapshot" --exclude ".zfs" -o scan.rock
 nfs-walker nfs://server/export -d 3 -o shallow.rocks
 ```
 
+### Content Analysis
+
+nfs-walker can optionally read file contents during scan to compute checksums and detect file types.
+
+```bash
+# Detect file types via magic bytes (reads first 8KB per file)
+nfs-walker nfs://server/export -o scan.rocks -t
+
+# Compute gxhash checksum for each file (reads full file content)
+nfs-walker nfs://server/export -o scan.rocks -c
+
+# Both checksum and file type detection
+nfs-walker nfs://server/export -o scan.rocks -c -t
+
+# Limit checksum to files under 100MB (default: 1GB)
+nfs-walker nfs://server/export -o scan.rocks -c --max-checksum-size 104857600
+```
+
+**Schema additions:** Two nullable columns are added to each entry:
+- `checksum` — 128-bit gxhash hex string (32 chars), set when `-c` is used
+- `file_type` — MIME type string (e.g. `application/pdf`, `image/png`), set when `-t` is used
+
+These fields are `NULL` when the corresponding flag is not enabled, or when the file exceeds `--max-checksum-size` (for checksum) or has unrecognizable magic bytes (for file type).
+
 ### Querying Results
 
 **RocksDB** (fast, built-in queries):
@@ -71,14 +104,25 @@ nfs-walker stats scan.rocks --by-extension     # Files by type
 nfs-walker stats scan.rocks --largest-files    # Biggest files
 nfs-walker stats scan.rocks --largest-dirs     # Fullest directories
 nfs-walker stats scan.rocks --by-uid           # Usage by owner
+nfs-walker stats scan.rocks --duplicates       # Duplicate files (requires -c scan)
+nfs-walker stats scan.rocks --by-file-type     # MIME type distribution (requires -t scan)
+nfs-walker stats scan.rocks --hardlink-groups  # Hard link groups
 ```
 
 **SQLite** (full SQL power):
 ```bash
 nfs-walker convert scan.rocks scan.db
-sqlite3 scan.db "SELECT extension, COUNT(*), SUM(size)/1e9 as gb
-                 FROM entries WHERE entry_type=0
-                 GROUP BY extension ORDER BY gb DESC"
+
+# Duplicate files by checksum
+sqlite3 scan.db "SELECT checksum, COUNT(*) as copies, SUM(size) as wasted
+                 FROM entries WHERE checksum IS NOT NULL
+                 GROUP BY checksum HAVING copies > 1
+                 ORDER BY wasted DESC LIMIT 20"
+
+# File type distribution
+sqlite3 scan.db "SELECT file_type, COUNT(*), SUM(size)/1e9 as gb
+                 FROM entries WHERE file_type IS NOT NULL
+                 GROUP BY file_type ORDER BY gb DESC"
 ```
 
 See [docs/QUERY_ROCKSDB.md](docs/QUERY_ROCKSDB.md) and [docs/QUERY_SQLITE.md](docs/QUERY_SQLITE.md) for query examples.
@@ -170,6 +214,9 @@ Scan Options:
   --dirs-only             Only record directories
   --exclude <PATTERN>     Exclude paths (repeatable)
   --sqlite                Force SQLite output (slower)
+  -c, --checksum          Compute gxhash checksum per file (reads full content)
+  -t, --file-type         Detect MIME type via magic bytes (reads first 8KB)
+  --max-checksum-size N   Skip checksum for files larger than N bytes [default: 1GB]
 
 Stats Options:
   --by-extension          Files by extension
@@ -179,6 +226,10 @@ Stats Options:
   --most-links            Most hard links
   --by-uid                Usage by user ID
   --by-gid                Usage by group ID
+  --duplicates            Duplicate files by checksum (requires -c scan)
+  --by-file-type          MIME type distribution (requires -t scan)
+  --hardlink-groups       Files sharing same inode
+  --min-size <BYTES>      Minimum size for duplicate detection [default: 1024]
   -n, --top <N>           Limit results [default: 20]
 ```
 
@@ -209,6 +260,18 @@ Tested on a real NFS export: **4.1M files, 17,919 directories, 1.32 TiB** over N
 | Duration | 14.8 minutes |
 | Peak Memory | ~5 GB |
 | Database Size | 4.0 GiB |
+
+### Content Analysis Performance
+
+Tested on **770K files, 373 GiB** over NFS:
+
+| Mode | Time | Files/sec | Notes |
+|------|------|-----------|-------|
+| Metadata only | **3.9s** | **196,509** | Default — READDIRPLUS only |
+| File type detection (`-t`) | 3m 19s | 3,880 | Reads first 8KB per file |
+| Checksum (`-c`) | 11m 16s | 1,140 | Reads full file content (gxhash) |
+
+Content analysis is I/O-bound (reading file data over NFS), so throughput depends on network bandwidth and file sizes. Metadata-only scans remain unaffected.
 
 ### Why So Fast?
 

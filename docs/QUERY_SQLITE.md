@@ -184,7 +184,101 @@ FROM entries
 WHERE entry_type = 0;
 ```
 
-### Find Duplicate Files (by size + name)
+### Find Duplicate Files by Checksum
+
+*Requires scan with `-c` flag. This finds true duplicates by content, not just name+size.*
+
+```sql
+-- Top duplicate groups by wasted space
+SELECT
+    checksum,
+    COUNT(*) as copies,
+    ROUND(size / 1024.0 / 1024, 2) as size_mb,
+    ROUND(size * (COUNT(*) - 1) / 1024.0 / 1024 / 1024, 2) as wasted_gb,
+    GROUP_CONCAT(path, CHAR(10)) as paths
+FROM entries
+WHERE entry_type = 0 AND checksum IS NOT NULL
+GROUP BY checksum
+HAVING COUNT(*) > 1
+ORDER BY size * (COUNT(*) - 1) DESC
+LIMIT 20;
+```
+
+```sql
+-- Total wasted space from duplicates
+SELECT
+    COUNT(*) as duplicate_files,
+    ROUND(SUM(wasted) / 1024.0 / 1024 / 1024, 2) as wasted_gb
+FROM (
+    SELECT size * (COUNT(*) - 1) as wasted
+    FROM entries
+    WHERE entry_type = 0 AND checksum IS NOT NULL
+    GROUP BY checksum
+    HAVING COUNT(*) > 1
+);
+```
+
+### File Type Distribution
+
+*Requires scan with `-t` flag.*
+
+```sql
+-- Files grouped by detected MIME type
+SELECT
+    COALESCE(file_type, '(unknown)') as mime_type,
+    COUNT(*) as count,
+    ROUND(SUM(size) / 1024.0 / 1024 / 1024, 2) as size_gb
+FROM entries
+WHERE entry_type = 0
+GROUP BY file_type
+ORDER BY SUM(size) DESC
+LIMIT 30;
+```
+
+```sql
+-- Find all PDF files (by content, not extension)
+SELECT path, ROUND(size / 1024.0 / 1024, 2) as size_mb
+FROM entries
+WHERE file_type = 'application/pdf'
+ORDER BY size DESC
+LIMIT 50;
+```
+
+```sql
+-- Files where extension doesn't match detected type
+SELECT path, extension, file_type, ROUND(size / 1024.0 / 1024, 2) as size_mb
+FROM entries
+WHERE entry_type = 0
+  AND file_type IS NOT NULL
+  AND extension IS NOT NULL
+  AND (
+    (extension IN ('jpg', 'jpeg') AND file_type != 'image/jpeg')
+    OR (extension = 'png' AND file_type != 'image/png')
+    OR (extension = 'pdf' AND file_type != 'application/pdf')
+    OR (extension = 'mp4' AND file_type != 'video/mp4')
+  )
+LIMIT 50;
+```
+
+### Hard Link Groups
+
+```sql
+-- Files sharing the same inode (hard links)
+SELECT
+    inode,
+    nlink,
+    COUNT(*) as found_paths,
+    ROUND(size / 1024.0 / 1024, 2) as size_mb,
+    GROUP_CONCAT(path, CHAR(10)) as paths
+FROM entries
+WHERE entry_type = 0 AND nlink > 1
+GROUP BY inode
+HAVING COUNT(*) > 1
+ORDER BY nlink DESC
+LIMIT 20;
+```
+
+### Find Duplicate Files by Name + Size (no checksum needed)
 
 ```sql
 SELECT
@@ -316,7 +410,9 @@ CREATE TABLE entries (
     inode INTEGER,               -- Inode number
     depth INTEGER NOT NULL,      -- Depth from root (0 = root)
     extension TEXT,              -- File extension (lowercase, no dot)
-    blocks INTEGER DEFAULT 0     -- 512-byte blocks allocated
+    blocks INTEGER DEFAULT 0,    -- 512-byte blocks allocated
+    checksum TEXT,               -- gxhash checksum (32-char hex, set with -c flag)
+    file_type TEXT               -- MIME type (e.g. "application/pdf", set with -t flag)
 );
 
 CREATE TABLE walk_info (
@@ -332,13 +428,15 @@ CREATE INDEX idx_entries_size ON entries(size) WHERE entry_type = 0;
 CREATE INDEX idx_entries_depth ON entries(depth);
 CREATE INDEX idx_entries_ext ON entries(extension) WHERE entry_type = 0;
 CREATE INDEX idx_entries_inode ON entries(inode);
+CREATE INDEX idx_entries_checksum ON entries(checksum) WHERE checksum IS NOT NULL;
+CREATE INDEX idx_entries_file_type ON entries(file_type) WHERE file_type IS NOT NULL;
 ```
 
 ---
 
 ## Performance Tips
 
-1. **Use indexes**: Queries on `path`, `parent_path`, `size`, `extension`, `inode` are indexed
+1. **Use indexes**: Queries on `path`, `parent_path`, `size`, `extension`, `inode`, `checksum`, and `file_type` are indexed
 2. **Filter by entry_type first**: Most queries only need files (`entry_type = 0`)
 3. **LIMIT early**: Add LIMIT to avoid scanning entire table
 4. **Use EXPLAIN QUERY PLAN**: Check if your query uses indexes

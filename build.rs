@@ -51,9 +51,10 @@ fn main() {
         }
     }
 
-    // For non-musl targets, use pkg-config
+    // For non-musl targets, use pkg-config with dynamic linking
+    // (static linking only works when libnfs.a is available)
     let lib = pkg_config::Config::new()
-        .statik(true)  // Prefer static linking
+        .statik(false)  // Use dynamic linking
         .probe("libnfs")
         .expect(
             "libnfs not found. Please install libnfs development package \
@@ -61,14 +62,7 @@ fn main() {
         );
 
     // Print what pkg-config found (for debugging)
+    eprintln!("Using dynamic libnfs");
     eprintln!("libnfs link_paths: {:?}", lib.link_paths);
     eprintln!("libnfs libs: {:?}", lib.libs);
-
-    // Explicitly emit static link directive
-    for path in &lib.link_paths {
-        println!("cargo:rustc-link-search=native={}", path.display());
-    }
-
-    // Force static linking
-    println!("cargo:rustc-link-lib=static=nfs");
 }
