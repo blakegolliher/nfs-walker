@@ -1,7 +1,8 @@
-# Build nfs-walker with RocksDB for RHEL/Rocky 9+ compatibility
+# Build nfs-walker with all features for RHEL/Rocky 9+ compatibility
 #
 # Uses Rocky Linux 9 as base to ensure glibc 2.34 compatibility.
 # Statically links libstdc++ to eliminate C++ runtime dependency.
+# Embeds the React dashboard into the binary via rust-embed.
 # Result works on Rocky 9, RHEL 9, AlmaLinux 9, and newer distros.
 #
 # Usage:
@@ -11,9 +12,10 @@
 
 FROM docker.io/rockylinux/rockylinux:9 AS builder
 
-# Install build dependencies
+# Install build dependencies (including Node.js for web dashboard)
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
+    dnf module enable nodejs:18 -y && \
     dnf install -y --allowerasing \
         gcc \
         gcc-c++ \
@@ -37,7 +39,9 @@ RUN dnf install -y epel-release && \
         libstdc++-static \
         openssl-devel \
         perl \
-        curl && \
+        curl \
+        nodejs \
+        npm && \
     dnf clean all
 
 # Install Rust
@@ -74,11 +78,14 @@ ENV RUSTFLAGS="-C target-feature=+aes,+sse2 -C link-arg=-static-libstdc++ -C lin
 COPY . /build/src
 WORKDIR /build/src
 
+# Build web dashboard
+RUN cd web && npm install && npm run build
+
 # Clean any stale artifacts
 RUN rm -f Cargo.lock
 
-# Build release binary with RocksDB
-RUN cargo build --release --features rocksdb
+# Build release binary with all features (rocksdb + parquet + server with embedded dashboard)
+RUN cargo build --release --features server
 
 # Strip for smaller size
 RUN strip /build/src/target/release/nfs-walker

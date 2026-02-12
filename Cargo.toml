@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "filesystem"]
 default = ["rocksdb"]
 rocksdb = ["dep:rocksdb", "dep:bincode", "dep:serde"]
 parquet = ["rocksdb", "dep:arrow", "dep:parquet", "dep:uuid", "dep:serde_json"]
-server = ["parquet", "dep:datafusion", "dep:axum", "dep:tower-http", "dep:tokio"]
+server = ["parquet", "dep:datafusion", "dep:axum", "dep:tower-http", "dep:tokio", "dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
 # CLI parsing with derive macros
@@ -66,7 +66,9 @@ serde_json = { version = "1", optional = true }
 # Analytics server (optional)
 datafusion = { version = "46", optional = true, default-features = false, features = ["parquet"] }
 axum = { version = "0.7", optional = true, features = ["json"] }
-tower-http = { version = "0.6", optional = true, features = ["cors", "trace", "fs"] }
+tower-http = { version = "0.6", optional = true, features = ["cors", "trace"] }
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "signal"] }
 
 

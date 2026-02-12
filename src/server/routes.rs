@@ -5,16 +5,22 @@ use crate::server::catalog::QUERY_CATALOG;
 use crate::server::context::{AnalyticsContext, SharedContext};
 use crate::server::executor;
 use axum::extract::{Path, State};
+use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use rust_embed::Embed;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
-use tower_http::services::{ServeDir, ServeFile};
+
+/// Embedded web dashboard assets (baked in at compile time)
+#[derive(Embed)]
+#[folder = "web/dist/"]
+struct Asset;
 
 /// Shared application state
 pub struct AppState {
@@ -33,16 +39,33 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/queries/:query_id/execute", post(execute_query))
         .route("/queries/batch", post(batch_execute));
 
-    // SPA static file serving — falls back to index.html for client-side routing
-    let dist_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/dist");
-    let index_html = dist_dir.join("index.html");
-    let spa = ServeDir::new(&dist_dir).fallback(ServeFile::new(index_html));
-
     Router::new()
         .nest("/api", api)
-        .fallback_service(spa)
+        .fallback(static_handler)
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// Serve embedded static assets with SPA fallback to index.html
+async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/');
+
+    // Try the exact path first, then fall back to index.html for SPA routing
+    match Asset::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            (StatusCode::OK, [(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+        }
+        None => {
+            // SPA fallback: serve index.html for any unmatched route
+            match Asset::get("index.html") {
+                Some(content) => {
+                    (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], content.data).into_response()
+                }
+                None => (StatusCode::NOT_FOUND, "dashboard not found").into_response(),
+            }
+        }
+    }
 }
 
 // ─── Handlers ────────────────────────────────────────────────────
