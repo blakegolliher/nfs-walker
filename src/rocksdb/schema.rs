@@ -184,6 +184,11 @@ pub fn get_db_options() -> Options {
     opts.increase_parallelism(num_cpus::get() as i32);
     opts.set_max_background_jobs(4);
 
+    // Cap open SST file handles to avoid EMFILE ("Too many open files").
+    // RocksDB default is -1 (unlimited), which can exhaust the OS fd limit
+    // when the database grows and many workers hold NFS connections.
+    opts.set_max_open_files(256);
+
     // Disable WAL for scan workloads (data is repeatable)
     // WAL is disabled per-write via WriteBatch options
 
