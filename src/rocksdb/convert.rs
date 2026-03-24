@@ -142,29 +142,28 @@ fn copy_metadata(rocks: &RocksHandle, conn: &Connection) -> Result<(), WalkerErr
 fn convert_entries(
     rocks: &RocksHandle,
     conn: &mut Connection,
-    _batch_size: usize,
+    batch_size: usize,
     progress_callback: Option<ProgressCallback>,
 ) -> Result<ConvertStats, WalkerError> {
     let mut stats = ConvertStats::default();
-    let mut batch_count = 0;
+    let mut batch_count: usize = 0;
 
-    // Iterate all entries
+    let sql = "INSERT INTO entries (parent_id, name, path, entry_type, size, mtime, atime, ctime, mode, uid, gid, nlink, inode, depth, extension, blocks, checksum, file_type)
+             VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)";
+
+    // Iterate all entries, committing in chunks of batch_size
     let iter = rocks.iter_by_path();
 
-    let tx = conn.transaction()
+    let mut tx = conn.transaction()
         .map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
 
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO entries (parent_id, name, path, entry_type, size, mtime, atime, ctime, mode, uid, gid, nlink, inode, depth, extension, blocks, checksum, file_type)
-             VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
-        ).map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
+    for result in iter {
+        let entry = result
+            .map_err(|e| WalkerError::Database(DbError::Schema(format!("Failed to read entry: {}", e))))?;
 
-        for result in iter {
-            let entry = result
-                .map_err(|e| WalkerError::Database(DbError::Schema(format!("Failed to read entry: {}", e))))?;
-
-            stmt.execute(params![
+        tx.prepare_cached(sql)
+            .map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?
+            .execute(params![
                 entry.name,
                 entry.path,
                 entry.entry_type as i32,
@@ -184,19 +183,24 @@ fn convert_entries(
                 entry.file_type,
             ]).map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
 
-            stats.entries_converted += 1;
-            batch_count += 1;
+        stats.entries_converted += 1;
+        batch_count += 1;
 
-            // Report progress periodically
+        // Commit and start a new transaction every batch_size entries
+        if batch_count >= batch_size {
+            tx.commit()
+                .map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
+            tx = conn.transaction()
+                .map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
+
             if let Some(ref callback) = progress_callback {
-                if batch_count >= 10_000 {
-                    callback(stats.entries_converted, 0);
-                    batch_count = 0;
-                }
+                callback(stats.entries_converted, 0);
             }
+            batch_count = 0;
         }
     }
 
+    // Commit remaining entries
     tx.commit()
         .map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
 

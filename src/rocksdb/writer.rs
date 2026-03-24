@@ -229,6 +229,8 @@ mod tests {
                 depth: 1,
                 extension: Some("txt".to_string()),
                 blocks: 8,
+                checksum: None,
+                file_type: None,
             },
         ];
 

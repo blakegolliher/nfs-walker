@@ -35,6 +35,11 @@ pub enum WalkerError {
     #[error("Parquet error: {0}")]
     Parquet(#[from] ParquetError),
 
+    /// CSV export errors
+    #[cfg(feature = "csv-export")]
+    #[error("CSV error: {0}")]
+    Csv(#[from] CsvError),
+
     /// Server errors
     #[cfg(feature = "server")]
     #[error("Server error: {0}")]
@@ -279,6 +284,27 @@ pub enum ParquetError {
 /// Result type alias for ParquetError
 #[cfg(feature = "parquet")]
 pub type ParquetResult<T> = std::result::Result<T, ParquetError>;
+
+/// CSV export errors
+#[cfg(feature = "csv-export")]
+#[derive(Error, Debug)]
+pub enum CsvError {
+    /// CSV writer error
+    #[error("CSV error: {0}")]
+    Csv(#[from] csv::Error),
+
+    /// I/O error
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// General error with context
+    #[error("{0}")]
+    Other(String),
+}
+
+/// Result type alias for CsvError
+#[cfg(feature = "csv-export")]
+pub type CsvResult<T> = std::result::Result<T, CsvError>;
 
 /// Analytics server errors
 #[cfg(feature = "server")]

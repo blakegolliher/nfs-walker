@@ -192,6 +192,34 @@ pub enum Command {
         compression_level: i32,
     },
 
+    /// Export RocksDB database to CSV files
+    #[cfg(feature = "csv-export")]
+    ExportCsv {
+        /// Input RocksDB directory
+        #[arg(value_name = "INPUT")]
+        input: PathBuf,
+
+        /// Output directory for CSV files
+        #[arg(value_name = "OUTPUT_DIR")]
+        output_dir: PathBuf,
+
+        /// Show export progress
+        #[arg(short = 'p', long)]
+        progress: bool,
+
+        /// Rows per file before splitting (default: 10M)
+        #[arg(long, default_value = "10000000")]
+        rows_per_file: usize,
+
+        /// Compress output with gzip (.csv.gz)
+        #[arg(long)]
+        gzip: bool,
+
+        /// Gzip compression level 1-9 (default: 6)
+        #[arg(long, default_value = "6")]
+        gzip_level: u32,
+    },
+
     /// Start analytics server for querying scan data
     #[cfg(feature = "server")]
     Serve {

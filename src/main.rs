@@ -123,6 +123,10 @@ fn handle_command(cmd: &Command) -> Result<()> {
         Command::Stats { db, by_extension, largest_files, largest_dirs, oldest_files, most_links, by_uid, by_gid, duplicates, by_file_type, hardlink_groups, min_size, top } => {
             run_stats(db, *by_extension, *largest_files, *largest_dirs, *oldest_files, *most_links, *by_uid, *by_gid, *duplicates, *by_file_type, *hardlink_groups, *min_size, *top)
         }
+        #[cfg(feature = "csv-export")]
+        Command::ExportCsv { input, output_dir, progress, rows_per_file, gzip, gzip_level } => {
+            run_export_csv(input, output_dir, *progress, *rows_per_file, *gzip, *gzip_level)
+        }
         #[cfg(feature = "server")]
         Command::Serve { data_dir, port, bind } => {
             run_server(data_dir, bind, *port)
@@ -467,6 +471,69 @@ fn run_export_parquet(
 
     eprintln!("Export complete:");
     eprintln!("  Scan ID:    {}", stats.scan_id);
+    eprintln!("  Entries:    {}", format_number(stats.entries_exported));
+    eprintln!("  Files:      {}", stats.files_written);
+    eprintln!(
+        "  Total size: {}",
+        format_size(stats.total_bytes_written, BINARY)
+    );
+
+    Ok(())
+}
+
+/// Run RocksDB to CSV export
+#[cfg(feature = "csv-export")]
+fn run_export_csv(
+    input: &std::path::Path,
+    output_dir: &std::path::Path,
+    show_progress: bool,
+    rows_per_file: usize,
+    gzip: bool,
+    gzip_level: u32,
+) -> Result<()> {
+    use nfs_walker::csv_export::{convert_rocks_to_csv, CsvExportConfig};
+
+    eprintln!("Exporting RocksDB to CSV...");
+    eprintln!("  Input:      {}", input.display());
+    eprintln!("  Output dir: {}", output_dir.display());
+    eprintln!("  Rows/file:  {}", format_number(rows_per_file as u64));
+    if gzip {
+        eprintln!("  Compression: gzip (level {})", gzip_level);
+    }
+
+    let config = CsvExportConfig {
+        rows_per_file,
+        gzip,
+        gzip_level,
+        progress: show_progress,
+    };
+
+    let progress_reporter = if show_progress {
+        let reporter = ProgressReporter::new();
+        reporter.set_status("Exporting...");
+        Some(reporter)
+    } else {
+        None
+    };
+
+    let callback: Option<Box<dyn Fn(u64, u64) + Send>> = if let Some(ref p) = progress_reporter {
+        let p_clone = p.clone();
+        Some(Box::new(move |exported, _total| {
+            let msg = format!("Exported {} entries", format_number(exported));
+            p_clone.set_status(&msg);
+        }))
+    } else {
+        None
+    };
+
+    let stats = convert_rocks_to_csv(input, output_dir, config, callback)
+        .context("CSV export failed")?;
+
+    if let Some(ref p) = progress_reporter {
+        p.finish("Export complete");
+    }
+
+    eprintln!("Export complete:");
     eprintln!("  Entries:    {}", format_number(stats.entries_exported));
     eprintln!("  Files:      {}", stats.files_written);
     eprintln!(

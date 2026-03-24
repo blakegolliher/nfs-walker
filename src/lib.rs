@@ -55,6 +55,8 @@ pub mod db;
 pub mod error;
 pub mod nfs;
 pub mod progress;
+#[cfg(feature = "csv-export")]
+pub mod csv_export;
 #[cfg(feature = "parquet")]
 pub mod parquet;
 #[cfg(feature = "rocksdb")]
