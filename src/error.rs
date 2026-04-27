@@ -197,6 +197,10 @@ pub enum ConfigError {
     /// Resume database not found or invalid
     #[error("Cannot resume from '{path}': {reason}")]
     InvalidResumeDb { path: PathBuf, reason: String },
+
+    /// Pipeline depth out of range
+    #[error("Invalid pipeline depth {depth}: must be between 0 and {max}")]
+    InvalidPipelineDepth { depth: usize, max: usize },
 }
 
 /// Worker thread errors

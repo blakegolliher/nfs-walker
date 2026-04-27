@@ -24,6 +24,11 @@ const MIN_QUEUE_SIZE: usize = 100;
 const MIN_BATCH_SIZE: usize = 100;
 const MAX_BATCH_SIZE: usize = 100_000;
 
+/// Maximum READDIRPLUS pipeline depth per worker. Above ~64 libnfs's
+/// internal queue sizing isn't tuned for hundreds of in-flight PDUs
+/// per context and we'd risk hitting per-context server-side caps.
+const MAX_PIPELINE_DEPTH: usize = 64;
+
 /// Regex for parsing NFS URLs
 static NFS_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     // Matches: nfs://server/export/path or server:/export/path
@@ -186,6 +191,12 @@ pub struct CliArgs {
     #[cfg(feature = "parquet")]
     #[arg(long)]
     pub stream_parquet: bool,
+
+    /// Number of READDIRPLUS RPCs to keep in flight per worker.
+    /// 0 disables pipelining (uses the legacy serial worker loop, current
+    /// behavior). 8 is the recommended setting once validated.
+    #[arg(long, default_value = "0", value_name = "N")]
+    pub pipeline_depth: usize,
 }
 
 /// Subcommands
@@ -595,6 +606,10 @@ pub struct WalkConfig {
     /// the live data. Only meaningful when output_format=RocksDb.
     #[cfg(feature = "parquet")]
     pub stream_parquet: bool,
+
+    /// Number of READDIRPLUS RPCs to keep in flight per worker.
+    /// 0 = legacy serial worker loop. >0 selects the pipelined worker.
+    pub pipeline_depth: usize,
 }
 
 impl WalkConfig {
@@ -663,6 +678,14 @@ impl WalkConfig {
             });
         }
 
+        // Validate pipeline depth (0 disables, MAX_PIPELINE_DEPTH cap)
+        if args.pipeline_depth > MAX_PIPELINE_DEPTH {
+            return Err(ConfigError::InvalidPipelineDepth {
+                depth: args.pipeline_depth,
+                max: MAX_PIPELINE_DEPTH,
+            });
+        }
+
         // Compile exclude patterns
         let exclude_patterns = args
             .exclude_patterns
@@ -722,6 +745,7 @@ impl WalkConfig {
             max_checksum_size: args.max_checksum_size,
             #[cfg(feature = "parquet")]
             stream_parquet: args.stream_parquet,
+            pipeline_depth: args.pipeline_depth,
         })
     }
 
@@ -807,6 +831,7 @@ mod tests {
             max_checksum_size: 1_073_741_824,
             #[cfg(feature = "parquet")]
             stream_parquet: false,
+            pipeline_depth: 0,
         };
 
         assert!(config.is_excluded("/data/.snapshot/hourly.0"));
