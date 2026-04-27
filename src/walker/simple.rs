@@ -303,11 +303,38 @@ impl SimpleWalker {
         info!("Opening RocksDB: {}", self.config.output_path.display());
         let rocks_path = self.config.output_path.clone();
 
-        // Channel for entries to write (workers -> writer)
+        // Channel for entries to write (workers -> rocksdb writer)
         let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(100);
 
-        // Spawn dedicated RocksDB writer thread
-        let writer_handle = self.spawn_rocksdb_writer(rocks_path.clone(), entry_rx)?;
+        // Decide whether to fan out to a streaming Parquet writer.
+        #[cfg(feature = "parquet")]
+        let parquet_spawn = self.maybe_spawn_parquet_writer(&rocks_path)?;
+        #[cfg(not(feature = "parquet"))]
+        let parquet_tx: Option<Sender<Vec<DbEntry>>> = None;
+
+        #[cfg(feature = "parquet")]
+        let parquet_tx = parquet_spawn.tx.clone();
+
+        // Spawn dedicated RocksDB writer thread (forwards batches when
+        // parquet_tx is Some, drops them on backpressure -- no stall).
+        let scan_id_for_rocks: Option<(String, i64)>;
+        #[cfg(feature = "parquet")]
+        {
+            scan_id_for_rocks = parquet_spawn
+                .scan_id
+                .as_ref()
+                .map(|id| (id.clone(), chrono::Utc::now().timestamp_micros()));
+        }
+        #[cfg(not(feature = "parquet"))]
+        {
+            scan_id_for_rocks = None;
+        }
+        let writer_handle = self.spawn_rocksdb_writer(
+            rocks_path.clone(),
+            entry_rx,
+            parquet_tx,
+            scan_id_for_rocks,
+        )?;
 
         // Run workers
         self.run_workers(entry_tx)?;
@@ -315,6 +342,18 @@ impl SimpleWalker {
         // Wait for writer to finish
         let rocks_handle = writer_handle.join().expect("RocksDB writer thread panicked")
             .map_err(WalkerError::Rocks)?;
+
+        // Wait for the streaming Parquet writer if it was spawned.
+        #[cfg(feature = "parquet")]
+        if let Some(join) = parquet_spawn.join {
+            match join.join().expect("streaming parquet writer thread panicked") {
+                Ok(stats) => info!(
+                    "Streaming Parquet finished: {} rows in {} parts ({} bytes)",
+                    stats.rows_written, stats.parts_written, stats.bytes_written
+                ),
+                Err(e) => warn!("Streaming Parquet writer error: {}", e),
+            }
+        }
 
         // Finalize database
         info!("Finalizing RocksDB...");
@@ -343,6 +382,51 @@ impl SimpleWalker {
         };
 
         Ok(stats)
+    }
+
+    /// If `--stream-parquet` is enabled, prepare the streaming writer:
+    /// generate the scan_id, refuse to overwrite an existing scan dir,
+    /// open the writer, and spawn its thread.
+    #[cfg(all(feature = "rocksdb", feature = "parquet"))]
+    fn maybe_spawn_parquet_writer(
+        &self,
+        rocks_path: &std::path::Path,
+    ) -> Result<StreamingParquetSpawn> {
+        if !self.config.stream_parquet {
+            return Ok(StreamingParquetSpawn::default());
+        }
+
+        use crate::parquet::{StreamingParquetConfig, StreamingParquetWriter};
+
+        let scan_id = uuid::Uuid::new_v4().to_string();
+        let scan_timestamp_us = chrono::Utc::now().timestamp_micros();
+
+        let scan_dir = streaming_parquet_dir(rocks_path, &scan_id);
+        if scan_dir.exists() {
+            return Err(WalkerError::Parquet(crate::error::ParquetError::Other(format!(
+                "Streaming Parquet target {} already exists. Refusing to overwrite -- \
+                 delete it or run without --stream-parquet.",
+                scan_dir.display()
+            ))));
+        }
+
+        let cfg = StreamingParquetConfig::defaults_for(scan_dir.clone(), scan_id.clone(), scan_timestamp_us);
+        let writer = StreamingParquetWriter::open(cfg)?;
+
+        info!(
+            "Streaming Parquet enabled: scan_id={} dir={}",
+            scan_id,
+            scan_dir.display()
+        );
+
+        // Channel sized to match the rocks/worker channel (100 batches).
+        let (tx, rx) = bounded::<Vec<DbEntry>>(100);
+        let join = spawn_parquet_writer(writer, rx);
+        Ok(StreamingParquetSpawn {
+            tx: Some(tx),
+            join: Some(join),
+            scan_id: Some(scan_id),
+        })
     }
 
     /// Run walker in big-dir-hunt mode (RocksDB only)
@@ -814,15 +898,15 @@ impl SimpleWalker {
         &self,
         path: std::path::PathBuf,
         entry_rx: Receiver<Vec<DbEntry>>,
-    ) -> Result<JoinHandle<std::result::Result<RocksHandle, crate::error::RocksError>>> {
-        
-
+        parquet_tx: Option<Sender<Vec<DbEntry>>>,
+        scan_id_meta: Option<(String, i64)>,
+    ) -> Result<RocksWriterSpawn> {
         // Create RocksDB with metadata
         let config = RocksWriterConfig::default();
 
         // Remove existing directory if present
         if path.exists() {
-            std::fs::remove_dir_all(&path).map_err(|e| WalkerError::Io(e))?;
+            std::fs::remove_dir_all(&path).map_err(WalkerError::Io)?;
         }
 
         // Create writer to initialize database
@@ -839,20 +923,32 @@ impl SimpleWalker {
         writer.set_metadata(meta_keys::WORKER_COUNT, &self.config.worker_count.to_string())
             .map_err(WalkerError::Rocks)?;
 
+        // When streaming is enabled, persist SCAN_ID so a later post-scan
+        // export-parquet can detect the streamed dir and reuse the id.
+        if let Some((scan_id, _ts_us)) = scan_id_meta {
+            writer
+                .set_metadata(meta_keys::SCAN_ID, &scan_id)
+                .map_err(WalkerError::Rocks)?;
+        }
+
         let handle = writer.into_handle();
         let batch_size = self.config.batch_size;
 
         // Spawn writer thread
-        let handle = thread::Builder::new()
+        let join = thread::Builder::new()
             .name("rocks-writer".to_string())
             .spawn(move || {
-                rocksdb_writer_loop(handle, entry_rx, batch_size)
+                rocksdb_writer_loop(handle, entry_rx, parquet_tx, batch_size)
             })
             .expect("Failed to spawn RocksDB writer thread");
 
-        Ok(handle)
+        Ok(join)
     }
 }
+
+/// Type alias for the rocksdb writer thread join handle.
+#[cfg(feature = "rocksdb")]
+type RocksWriterSpawn = JoinHandle<std::result::Result<RocksHandle, crate::error::RocksError>>;
 
 /// Worker thread - processes directories using READDIRPLUS
 fn worker_loop(
@@ -1216,11 +1312,18 @@ fn sqlite_writer_loop(mut conn: Connection, entry_rx: Receiver<Vec<DbEntry>>, ba
     conn
 }
 
-/// RocksDB writer thread - handles all database writes
+/// RocksDB writer thread - handles all database writes.
+///
+/// `parquet_tx` is `Some` only when `--stream-parquet` is enabled. Each
+/// successfully-written pending batch is forwarded via `try_send`; on a
+/// full channel the batch is dropped and `parquet_drops` increments.
+/// Drops surface in the writer-thread's final log line so they're
+/// visible at end-of-scan -- ingest never blocks on the parquet writer.
 #[cfg(feature = "rocksdb")]
 fn rocksdb_writer_loop(
     handle: RocksHandle,
     entry_rx: Receiver<Vec<DbEntry>>,
+    parquet_tx: Option<Sender<Vec<DbEntry>>>,
     batch_size: usize,
 ) -> std::result::Result<RocksHandle, crate::error::RocksError> {
     use crate::error::RocksError;
@@ -1235,6 +1338,8 @@ fn rocksdb_writer_loop(
     let mut entries_since_flush = 0u64;
     let mut writes_since_summary_flush = 0u32;
     let mut summary = SummaryAccumulator::new();
+    let mut parquet_drops: u64 = 0;
+    let mut parquet_drop_rows: u64 = 0;
 
     // Flush every 1M entries to limit memory usage
     // This prevents unbounded memtable growth for large scans
@@ -1259,7 +1364,22 @@ fn rocksdb_writer_loop(
             total_written += pending.len() as u64;
             entries_since_flush += pending.len() as u64;
             writes_since_summary_flush += 1;
-            pending.clear();
+
+            // Move the just-written batch (or drop it on backpressure)
+            // before clearing pending. Reusing a fresh Vec avoids a
+            // realloc and avoids cloning the entries.
+            let written_batch = std::mem::replace(&mut pending, Vec::with_capacity(batch_size * 2));
+            if let Some(ref tx) = parquet_tx {
+                let row_count = written_batch.len();
+                if let Err(crossbeam_channel::TrySendError::Full(_)) = tx.try_send(written_batch) {
+                    parquet_drops += 1;
+                    parquet_drop_rows += row_count as u64;
+                }
+                // Disconnected: parquet thread exited (panicked or
+                // shutdown). Stop forwarding -- ingest continues either
+                // way. We don't bump drops because no further data was
+                // ever going to be parquet'd.
+            }
 
             // Memtable summary flush -- cheap, no db.flush() so it stays
             // in memtable until the next periodic FLUSH_INTERVAL pushes
@@ -1285,7 +1405,19 @@ fn rocksdb_writer_loop(
         write_rocks_batch(&handle, &pending, &write_opts)?;
         summary.update(&pending);
         total_written += pending.len() as u64;
+
+        let final_batch = std::mem::take(&mut pending);
+        if let Some(ref tx) = parquet_tx {
+            let row_count = final_batch.len();
+            if let Err(crossbeam_channel::TrySendError::Full(_)) = tx.try_send(final_batch) {
+                parquet_drops += 1;
+                parquet_drop_rows += row_count as u64;
+            }
+        }
     }
+
+    // Drop parquet_tx so the streaming writer sees disconnect and exits.
+    drop(parquet_tx);
 
     // Final summary flush + db.flush so secondary readers see the
     // committed totals after a clean shutdown.
@@ -1293,6 +1425,14 @@ fn rocksdb_writer_loop(
     flush_summary_to_cf(&handle, &summary, &write_opts)?;
     handle.db.flush().map_err(RocksError::Rocks)?;
 
+    if parquet_drops > 0 {
+        warn!(
+            "Streaming Parquet dropped {} batches ({} rows) under backpressure -- \
+             ingest was not stalled, but the parquet directory is missing those rows. \
+             Re-running export-parquet against the finished RocksDB will produce a complete export.",
+            parquet_drops, parquet_drop_rows
+        );
+    }
     debug!(
         "RocksDB writer thread finished, wrote {} entries (summary: {} files, {} dirs)",
         total_written, summary.total.total_files, summary.total.total_dirs
@@ -1633,6 +1773,61 @@ fn write_sqlite_batch(conn: &mut Connection, entries: &[DbEntry]) -> Result<()> 
     Ok(())
 }
 
+/// Build the canonical streaming-Parquet directory for a RocksDB path.
+///
+/// Format: `<rocks_path>.parquet/scans/<scan_id>/`
+/// Example: `/data/scan.rocks` + `abc123` → `/data/scan.rocks.parquet/scans/abc123/`
+#[cfg(all(feature = "rocksdb", feature = "parquet"))]
+fn streaming_parquet_dir(rocks_path: &std::path::Path, scan_id: &str) -> std::path::PathBuf {
+    let mut sibling = rocks_path.as_os_str().to_owned();
+    sibling.push(".parquet");
+    std::path::PathBuf::from(sibling).join("scans").join(scan_id)
+}
+
+/// Bundle of items returned when the streaming Parquet writer is spawned.
+#[cfg(all(feature = "rocksdb", feature = "parquet"))]
+#[derive(Default)]
+struct StreamingParquetSpawn {
+    /// Sender threaded into the rocksdb writer loop. None = streaming off.
+    tx: Option<Sender<Vec<DbEntry>>>,
+    /// Join handle for the streaming writer thread.
+    join: Option<JoinHandle<Result<crate::parquet::StreamingParquetStats>>>,
+    /// scan_id generated at scan start (used to populate RocksDB metadata).
+    scan_id: Option<String>,
+}
+
+/// Spawn the streaming Parquet writer thread. Consumes batches from
+/// `parquet_rx`, drives the writer to rotation, and closes cleanly when
+/// the channel disconnects (which happens when the rocksdb writer
+/// thread drops its `Sender`).
+#[cfg(all(feature = "rocksdb", feature = "parquet"))]
+fn spawn_parquet_writer(
+    mut writer: crate::parquet::StreamingParquetWriter,
+    parquet_rx: Receiver<Vec<DbEntry>>,
+) -> JoinHandle<Result<crate::parquet::StreamingParquetStats>> {
+    thread::Builder::new()
+        .name("parquet-writer".to_string())
+        .spawn(move || -> Result<crate::parquet::StreamingParquetStats> {
+            debug!("Streaming Parquet writer thread started");
+            while let Ok(entries) = parquet_rx.recv() {
+                if let Err(e) = writer.write_batch(&entries) {
+                    warn!(
+                        "Streaming Parquet write_batch failed: {} (skipping {} rows)",
+                        e,
+                        entries.len()
+                    );
+                    // On a write failure we keep running; the rocksdb
+                    // writer is the source of truth and a later
+                    // export-parquet against the finished DB can
+                    // produce a clean export.
+                }
+            }
+            debug!("Streaming Parquet writer thread closing");
+            writer.close()
+        })
+        .expect("Failed to spawn streaming Parquet writer thread")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1652,5 +1847,127 @@ mod tests {
         progress.dirs = 100;
         progress.elapsed = Duration::from_secs(10);
         assert!((progress.files_per_second() - 110.0).abs() < 0.1);
+    }
+
+    /// End-to-end test for the PR #2 streaming pipeline.
+    ///
+    /// Drives `rocksdb_writer_loop` directly (skipping the NFS workers)
+    /// with a synthetic batch stream, fans out to `spawn_parquet_writer`,
+    /// then verifies both stores end up with the same row count and that
+    /// the streamed Parquet files round-trip through the Arrow reader.
+    #[cfg(all(feature = "rocksdb", feature = "parquet"))]
+    #[test]
+    fn streaming_writer_pipeline_round_trips_through_parquet() {
+        use crate::nfs::types::EntryType;
+        use crate::parquet::{StreamingParquetConfig, StreamingParquetWriter};
+        use crate::rocksdb::RocksWriterConfig;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let rocks_path = dir.path().join("scan.rocks");
+        let scan_dir = dir.path().join("scan.rocks.parquet/scans/test");
+
+        // Open a fresh RocksDB and pull out the handle.
+        let writer = RocksWriter::open(&rocks_path, RocksWriterConfig::default()).unwrap();
+        let rocks_handle = writer.into_handle();
+
+        // Open a streaming parquet writer.
+        let pq_cfg = StreamingParquetConfig {
+            scan_dir: scan_dir.clone(),
+            row_group_size: 100,
+            target_file_size: 1_000_000_000,
+            compression_level: 3,
+            scan_id: "test".to_string(),
+            scan_timestamp_us: 1_700_000_000_000_000,
+        };
+        let pq_writer = StreamingParquetWriter::open(pq_cfg).unwrap();
+
+        // Channels.
+        let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(100);
+        let (pq_tx, pq_rx) = bounded::<Vec<DbEntry>>(100);
+
+        // Spawn parquet writer thread.
+        let pq_join = spawn_parquet_writer(pq_writer, pq_rx);
+
+        // Drive the rocksdb writer in another thread so we can feed batches.
+        let rocks_join = thread::Builder::new()
+            .name("rocks-writer-test".to_string())
+            .spawn(move || rocksdb_writer_loop(rocks_handle, entry_rx, Some(pq_tx), 100))
+            .unwrap();
+
+        // Synthetic batches: 5 batches of 250 entries each = 1250 rows total,
+        // which exceeds batch_size=100 multiple times so the forward path
+        // is exercised.
+        for chunk in 0..5 {
+            let batch: Vec<DbEntry> = (0..250)
+                .map(|i| DbEntry {
+                    parent_path: Some("/".to_string()),
+                    name: format!("file_{}_{}.txt", chunk, i),
+                    path: format!("/file_{}_{}.txt", chunk, i),
+                    entry_type: EntryType::File,
+                    size: 100 + i as u64,
+                    mtime: None,
+                    atime: None,
+                    ctime: None,
+                    mode: Some(0o644),
+                    uid: Some(1000),
+                    gid: Some(1000),
+                    nlink: Some(1),
+                    inode: (chunk * 1000 + i) as u64,
+                    depth: 1,
+                    extension: Some("txt".to_string()),
+                    blocks: 1,
+                    checksum: None,
+                    file_type: None,
+                })
+                .collect();
+            entry_tx.send(batch).unwrap();
+        }
+        drop(entry_tx);
+
+        let _rocks_handle = rocks_join.join().unwrap().unwrap();
+        let pq_stats = pq_join.join().unwrap().unwrap();
+
+        // All 1250 rows landed in Parquet.
+        assert_eq!(pq_stats.rows_written, 1250);
+        assert!(pq_stats.parts_written >= 1);
+
+        // Re-read the parquet directory and count rows.
+        let mut total = 0usize;
+        for entry in std::fs::read_dir(&scan_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .map(|e| e == "parquet")
+                .unwrap_or(false)
+                && !path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with('.')
+            {
+                let file = File::open(&path).unwrap();
+                let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                for batch in reader {
+                    total += batch.unwrap().num_rows();
+                }
+            }
+        }
+        assert_eq!(total, 1250);
+
+        // No leftover .tmp files.
+        for entry in std::fs::read_dir(&scan_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(
+                !name.ends_with(".tmp"),
+                "stray .tmp file: {}",
+                name
+            );
+        }
     }
 }

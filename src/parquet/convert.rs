@@ -4,14 +4,9 @@
 //! column statistics, and automatic file splitting.
 
 use crate::error::{ParquetError, WalkerError};
-use crate::parquet::schema::{
-    compute_parent_path, file_type_string, parquet_schema_ref, seconds_to_microseconds,
-};
+use crate::parquet::builder::{RowBuilder, RowContext};
+use crate::parquet::schema::{parquet_schema_ref, seconds_to_microseconds};
 use crate::rocksdb::schema::{meta_keys, RocksHandle};
-use arrow::array::{
-    ArrayRef, Int64Builder, StringBuilder, UInt16Builder, UInt32Builder, UInt64Builder,
-};
-use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
@@ -78,8 +73,16 @@ where
         WalkerError::Parquet(ParquetError::Other(format!("Failed to open RocksDB: {}", e)))
     })?;
 
-    // Generate scan ID and read metadata
-    let scan_id = Uuid::new_v4().to_string();
+    // Reuse the scan_id persisted at scan start (when --stream-parquet
+    // ran), otherwise mint a fresh one. Sharing the id lets a streamed
+    // scan and a later export point at the same logical artifact.
+    let scan_id = rocks
+        .get_metadata(meta_keys::SCAN_ID)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
     let scan_timestamp_us = rocks
         .get_metadata(meta_keys::START_TIME)
         .ok()
@@ -99,8 +102,20 @@ where
         .flatten()
         .unwrap_or_default();
 
-    // Create output directory
+    // Create output directory. Refuse to overwrite an existing scan dir
+    // with the same id -- this guards against converting on top of a
+    // streamed Parquet directory (which would mix old and new parts
+    // sharing the scan_id) and against re-running convert without first
+    // cleaning up.
     let scan_dir = output_dir.join("scans").join(&scan_id);
+    if scan_dir.exists() {
+        return Err(WalkerError::Parquet(ParquetError::Other(format!(
+            "Refusing to convert: {} already exists. Delete it (or pass a different output_dir) \
+             before re-running. If --stream-parquet was used during the scan the directory is \
+             already populated and another conversion would mix new parts under the same scan_id.",
+            scan_dir.display()
+        ))));
+    }
     fs::create_dir_all(&scan_dir).map_err(ParquetError::Io)?;
 
     info!(
@@ -121,94 +136,24 @@ where
     let mut writer = open_part_writer(&scan_dir, part_number, &schema, props.clone())?;
     part_number += 1;
 
-    // Array builders — one per column
-    let mut b_path = StringBuilder::new();
-    let mut b_filename = StringBuilder::new();
-    let mut b_extension = StringBuilder::new();
-    let mut b_inode = UInt64Builder::new();
-    let mut b_file_type = StringBuilder::new();
-    let mut b_size = UInt64Builder::new();
-    let mut b_alloc_blocks = UInt64Builder::new();
-    let mut b_nlink = UInt32Builder::new();
-    let mut b_uid = UInt32Builder::new();
-    let mut b_gid = UInt32Builder::new();
-    let mut b_permissions = UInt16Builder::new();
-    let mut b_mtime = Int64Builder::new();
-    let mut b_atime = Int64Builder::new();
-    let mut b_ctime = Int64Builder::new();
-    let mut b_depth = UInt16Builder::new();
-    let mut b_parent_path = StringBuilder::new();
-    let mut b_scan_id = StringBuilder::new();
-    let mut b_scan_ts = Int64Builder::new();
-
-    let mut buffered_rows: usize = 0;
+    let mut row_builder = RowBuilder::new(RowContext {
+        scan_id: scan_id.clone(),
+        scan_timestamp_us,
+    });
 
     for result in rocks.iter_by_path() {
         let entry = result.map_err(|e| {
             WalkerError::Parquet(ParquetError::Other(format!("Failed to read entry: {}", e)))
         })?;
 
-        // Append to builders
-        b_path.append_value(&entry.path);
-        b_filename.append_value(&entry.name);
-        match &entry.extension {
-            Some(ext) => b_extension.append_value(ext),
-            None => b_extension.append_null(),
-        }
-        b_inode.append_value(entry.inode);
-        b_file_type.append_value(file_type_string(entry.entry_type));
-        b_size.append_value(entry.size);
-        b_alloc_blocks.append_value(entry.blocks);
-        b_nlink.append_value(entry.nlink.unwrap_or(1) as u32);
-        b_uid.append_value(entry.uid.unwrap_or(0));
-        b_gid.append_value(entry.gid.unwrap_or(0));
-        b_permissions.append_value(entry.mode.map(|m| (m & 0o7777) as u16).unwrap_or(0o644));
-        match entry.mtime {
-            Some(s) => b_mtime.append_value(seconds_to_microseconds(s)),
-            None => b_mtime.append_null(),
-        }
-        match entry.atime {
-            Some(s) => b_atime.append_value(seconds_to_microseconds(s)),
-            None => b_atime.append_null(),
-        }
-        match entry.ctime {
-            Some(s) => b_ctime.append_value(seconds_to_microseconds(s)),
-            None => b_ctime.append_null(),
-        }
-        b_depth.append_value(entry.depth as u16);
-        b_parent_path.append_value(compute_parent_path(&entry.path));
-        b_scan_id.append_value(&scan_id);
-        b_scan_ts.append_value(scan_timestamp_us);
-
-        buffered_rows += 1;
+        row_builder.push_rocks_entry(&entry);
 
         // Flush row group when buffer is full
-        if buffered_rows >= config.row_group_size {
-            let batch = finish_batch(
-                &schema,
-                &mut b_path,
-                &mut b_filename,
-                &mut b_extension,
-                &mut b_inode,
-                &mut b_file_type,
-                &mut b_size,
-                &mut b_alloc_blocks,
-                &mut b_nlink,
-                &mut b_uid,
-                &mut b_gid,
-                &mut b_permissions,
-                &mut b_mtime,
-                &mut b_atime,
-                &mut b_ctime,
-                &mut b_depth,
-                &mut b_parent_path,
-                &mut b_scan_id,
-                &mut b_scan_ts,
-            )?;
-
+        if row_builder.row_count() >= config.row_group_size {
+            let rows = row_builder.row_count();
+            let batch = row_builder.finish()?;
             writer.write(&batch).map_err(ParquetError::Parquet)?;
-            total_exported += buffered_rows as u64;
-            buffered_rows = 0;
+            total_exported += rows as u64;
 
             // Check if file exceeds target size — split to new part
             let bytes_written = writer.bytes_written() as usize;
@@ -223,38 +168,18 @@ where
         progress_counter += 1;
         if progress_counter >= 100_000 {
             if let Some(ref cb) = progress_callback {
-                cb(total_exported + buffered_rows as u64, 0);
+                cb(total_exported + row_builder.row_count() as u64, 0);
             }
             progress_counter = 0;
         }
     }
 
     // Flush remaining rows
-    if buffered_rows > 0 {
-        let batch = finish_batch(
-            &schema,
-            &mut b_path,
-            &mut b_filename,
-            &mut b_extension,
-            &mut b_inode,
-            &mut b_file_type,
-            &mut b_size,
-            &mut b_alloc_blocks,
-            &mut b_nlink,
-            &mut b_uid,
-            &mut b_gid,
-            &mut b_permissions,
-            &mut b_mtime,
-            &mut b_atime,
-            &mut b_ctime,
-            &mut b_depth,
-            &mut b_parent_path,
-            &mut b_scan_id,
-            &mut b_scan_ts,
-        )?;
-
+    if !row_builder.is_empty() {
+        let rows = row_builder.row_count();
+        let batch = row_builder.finish()?;
         writer.write(&batch).map_err(ParquetError::Parquet)?;
-        total_exported += buffered_rows as u64;
+        total_exported += rows as u64;
     }
 
     writer.close().map_err(ParquetError::Parquet)?;
@@ -318,54 +243,6 @@ fn open_part_writer(
     let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
         .map_err(ParquetError::Parquet)?;
     Ok(writer)
-}
-
-/// Finish the current batch by converting builders to a RecordBatch.
-#[allow(clippy::too_many_arguments)]
-fn finish_batch(
-    schema: &Arc<arrow::datatypes::Schema>,
-    b_path: &mut StringBuilder,
-    b_filename: &mut StringBuilder,
-    b_extension: &mut StringBuilder,
-    b_inode: &mut UInt64Builder,
-    b_file_type: &mut StringBuilder,
-    b_size: &mut UInt64Builder,
-    b_alloc_blocks: &mut UInt64Builder,
-    b_nlink: &mut UInt32Builder,
-    b_uid: &mut UInt32Builder,
-    b_gid: &mut UInt32Builder,
-    b_permissions: &mut UInt16Builder,
-    b_mtime: &mut Int64Builder,
-    b_atime: &mut Int64Builder,
-    b_ctime: &mut Int64Builder,
-    b_depth: &mut UInt16Builder,
-    b_parent_path: &mut StringBuilder,
-    b_scan_id: &mut StringBuilder,
-    b_scan_ts: &mut Int64Builder,
-) -> Result<RecordBatch, WalkerError> {
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(b_path.finish()),
-        Arc::new(b_filename.finish()),
-        Arc::new(b_extension.finish()),
-        Arc::new(b_inode.finish()),
-        Arc::new(b_file_type.finish()),
-        Arc::new(b_size.finish()),
-        Arc::new(b_alloc_blocks.finish()),
-        Arc::new(b_nlink.finish()),
-        Arc::new(b_uid.finish()),
-        Arc::new(b_gid.finish()),
-        Arc::new(b_permissions.finish()),
-        Arc::new(b_mtime.finish()),
-        Arc::new(b_atime.finish()),
-        Arc::new(b_ctime.finish()),
-        Arc::new(b_depth.finish()),
-        Arc::new(b_parent_path.finish()),
-        Arc::new(b_scan_id.finish()),
-        Arc::new(b_scan_ts.finish()),
-    ];
-
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| WalkerError::Parquet(ParquetError::Arrow(e)))
 }
 
 /// List all .parquet files in a directory, sorted by name.

@@ -328,3 +328,50 @@ Convert with:
 ```bash
 nfs-walker convert scan.rocks scan.db --progress
 ```
+
+---
+
+## Live DuckDB queries with `--stream-parquet`
+
+For ad-hoc SQL on a scan that's still running, add `--stream-parquet` to
+the scan command. The walker writes a parallel rolled Parquet directory
+alongside the RocksDB:
+
+```
+/mnt/local-nvme/figure.rocks/             # the existing RocksDB
+/mnt/local-nvme/figure.rocks.parquet/     # streamed Parquet sibling
+└── scans/
+    └── <scan_id>/                        # UUID generated at scan start
+        ├── part-00000.parquet
+        ├── part-00001.parquet
+        └── ...
+```
+
+Each `part-NNNNN.parquet` is written as `.part-NNNNN.parquet.tmp` and
+atomically renamed on close, so DuckDB glob queries naturally skip
+in-progress files.
+
+```bash
+# Start a scan with streaming enabled
+nfs-walker nfs://server/export -o /mnt/local-nvme/figure.rocks --stream-parquet
+
+# In another terminal, query the live data with DuckDB
+duckdb -c "SELECT extension, COUNT(*) AS files, SUM(size) AS bytes
+           FROM read_parquet('/mnt/local-nvme/figure.rocks.parquet/scans/*/part-*.parquet')
+           GROUP BY extension ORDER BY bytes DESC LIMIT 20"
+```
+
+### Caveats
+
+- **Backpressure drops, not stalls.** If the Parquet writer can't keep up
+  with the RocksDB writer, batches are dropped (a warning is logged at
+  end-of-scan with the drop count). Ingest never blocks. Re-run
+  `nfs-walker export-parquet <db> <out>` against the finished RocksDB if
+  you need a complete export -- the post-scan converter reads the same
+  `scan_id` from RocksDB metadata, so a clean output dir is required.
+- **Many small parts at scan start.** The first few parts may be smaller
+  than `target_file_size` (256 MB default) because the writer rotates on
+  size, not on time.
+- **`scan_id` is shared between paths.** A streamed scan and a later
+  `export-parquet` use the same UUID, keeping the Parquet directory
+  layout stable across both code paths.

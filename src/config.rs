@@ -177,6 +177,15 @@ pub struct CliArgs {
     /// Files larger than this will have checksum set to None
     #[arg(long, default_value = "1073741824", value_name = "BYTES")]
     pub max_checksum_size: u64,
+
+    /// Stream a rolled Parquet directory alongside RocksDB during the
+    /// scan. Files land in `<output>.parquet/scans/<scan_id>/part-NNNNN.parquet`
+    /// and are queryable with DuckDB / DataFusion while the scan runs.
+    /// Backpressure on the parquet writer drops batches rather than
+    /// stalling ingest; the drop count is reported at end-of-scan.
+    #[cfg(feature = "parquet")]
+    #[arg(long)]
+    pub stream_parquet: bool,
 }
 
 /// Subcommands
@@ -580,6 +589,12 @@ pub struct WalkConfig {
 
     /// Maximum file size for checksum calculation
     pub max_checksum_size: u64,
+
+    /// Stream a parallel rolled-Parquet directory alongside RocksDB
+    /// during the scan. Enables ad-hoc DuckDB / DataFusion queries on
+    /// the live data. Only meaningful when output_format=RocksDb.
+    #[cfg(feature = "parquet")]
+    pub stream_parquet: bool,
 }
 
 impl WalkConfig {
@@ -705,6 +720,8 @@ impl WalkConfig {
             compute_checksum: args.checksum,
             detect_file_type: args.file_type,
             max_checksum_size: args.max_checksum_size,
+            #[cfg(feature = "parquet")]
+            stream_parquet: args.stream_parquet,
         })
     }
 
@@ -788,6 +805,8 @@ mod tests {
             compute_checksum: false,
             detect_file_type: false,
             max_checksum_size: 1_073_741_824,
+            #[cfg(feature = "parquet")]
+            stream_parquet: false,
         };
 
         assert!(config.is_excluded("/data/.snapshot/hourly.0"));

@@ -54,6 +54,9 @@ pub mod meta_keys {
     pub const TOTAL_BYTES: &str = "total_bytes";
     pub const ERROR_COUNT: &str = "error_count";
     pub const WORKER_COUNT: &str = "worker_count";
+    /// UUID generated at scan start. Persisted so post-scan tools
+    /// (Parquet converter, streaming writer) can share the same ID.
+    pub const SCAN_ID: &str = "scan_id";
 }
 
 /// Entry stored in RocksDB with bincode serialization

@@ -116,6 +116,11 @@ nfs-walker stats scan.rocks --by-extension --live  # Query while a scan is still
 > [docs/QUERY_ROCKSDB.md](docs/QUERY_ROCKSDB.md#live-querying-during-an-active-scan---live)
 > for details and caveats.
 
+> **DuckDB SQL during an active scan:** start the scan with `--stream-parquet`
+> and Parquet parts land in `<output>.parquet/scans/<scan_id>/` as the scan
+> runs. Query with DuckDB or DataFusion against the directory glob — see
+> [docs/QUERY_ROCKSDB.md](docs/QUERY_ROCKSDB.md#live-duckdb-queries-with---stream-parquet).
+
 **SQLite** (full SQL power):
 ```bash
 nfs-walker convert scan.rocks scan.db
