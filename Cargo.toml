@@ -88,6 +88,11 @@ tempfile = "3"
 name = "nfs-walker"
 path = "src/main.rs"
 
+[[bin]]
+name = "nfs-walker-parquet-parallel"
+path = "src/bin/nfs-walker-parquet-parallel.rs"
+required-features = ["parquet"]
+
 [profile.release]
 lto = true
 codegen-units = 1
