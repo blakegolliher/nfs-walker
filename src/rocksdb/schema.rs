@@ -253,9 +253,17 @@ pub fn get_db_options() -> Options {
     opts.create_if_missing(true);
     opts.create_missing_column_families(true);
 
-    // Increase parallelism
+    // Increase parallelism. `increase_parallelism` sets the size of the
+    // global thread pool RocksDB uses for compactions/flushes; we
+    // separately need to lift `max_background_jobs`, which caps how many
+    // of those slots can be in use concurrently. The historical default
+    // of 4 left us bottlenecked at ~5 cores on a 160-core box during a
+    // billion-entry scan (writer + 4 compaction threads, all pegged).
+    // Scaling with cpu count, capped at 32, restores parity with the
+    // walker side without monopolizing a small machine.
     opts.increase_parallelism(num_cpus::get() as i32);
-    opts.set_max_background_jobs(4);
+    let bg_jobs = (num_cpus::get() as i32 / 2).clamp(4, 32);
+    opts.set_max_background_jobs(bg_jobs);
 
     // Disable WAL for scan workloads (data is repeatable)
     // WAL is disabled per-write via WriteBatch options

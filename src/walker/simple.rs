@@ -157,8 +157,12 @@ impl SimpleWalker {
         info!("Opening SQLite database: {}", self.config.output_path.display());
         let db = self.open_sqlite_database()?;
 
-        // Channel for entries to write (workers -> writer)
-        let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(100);
+        // Channel for entries to write (workers -> writer).
+        // Bumped from 100 → 1024 after a 1024-worker / pipeline-depth-8
+        // run blocked on entry_tx.send: with that many producers the
+        // 100-slot buffer drained in microseconds and worker parallelism
+        // collapsed back to the writer's max insert rate.
+        let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(1024);
 
         // Spawn dedicated writer thread
         let writer_handle = self.spawn_sqlite_writer(db, entry_rx);
@@ -212,7 +216,7 @@ impl SimpleWalker {
         ).map_err(|e| WalkerError::Database(crate::error::DbError::Sqlite(e)))?;
 
         // Channel for big directory entries (workers -> writer)
-        let (big_dir_tx, big_dir_rx) = bounded::<BigDirEntry>(100);
+        let (big_dir_tx, big_dir_rx) = bounded::<BigDirEntry>(1024);
 
         // Spawn dedicated writer thread for big dirs
         let writer_handle = self.spawn_big_dir_writer_sqlite(db, big_dir_rx);
@@ -303,8 +307,9 @@ impl SimpleWalker {
         info!("Opening RocksDB: {}", self.config.output_path.display());
         let rocks_path = self.config.output_path.clone();
 
-        // Channel for entries to write (workers -> rocksdb writer)
-        let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(100);
+        // Channel for entries to write (workers -> rocksdb writer).
+        // 1024 slots: see the SQLite path above for rationale.
+        let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(1024);
 
         // Decide whether to fan out to a streaming Parquet writer.
         #[cfg(feature = "parquet")]
@@ -419,8 +424,8 @@ impl SimpleWalker {
             scan_dir.display()
         );
 
-        // Channel sized to match the rocks/worker channel (100 batches).
-        let (tx, rx) = bounded::<Vec<DbEntry>>(100);
+        // Channel sized to match the rocks/worker channel (1024 batches).
+        let (tx, rx) = bounded::<Vec<DbEntry>>(1024);
         let join = spawn_parquet_writer(writer, rx);
         Ok(StreamingParquetSpawn {
             tx: Some(tx),
@@ -444,7 +449,7 @@ impl SimpleWalker {
         let rocks_path = self.config.output_path.clone();
 
         // Channel for big directory entries (workers -> writer)
-        let (big_dir_tx, big_dir_rx) = bounded::<BigDirEntry>(100);
+        let (big_dir_tx, big_dir_rx) = bounded::<BigDirEntry>(1024);
 
         // Spawn dedicated big-dir writer thread
         let writer_handle = self.spawn_big_dir_writer(rocks_path.clone(), big_dir_rx)?;
