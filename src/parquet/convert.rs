@@ -453,6 +453,8 @@ mod tests {
                 depth: 1,
                 extension: Some("txt".to_string()),
                 blocks: 8,
+                checksum: None,
+                file_type: None,
             },
             DbEntry {
                 parent_path: Some("/".to_string()),
@@ -471,6 +473,8 @@ mod tests {
                 depth: 1,
                 extension: None,
                 blocks: 8,
+                checksum: None,
+                file_type: None,
             },
             DbEntry {
                 parent_path: Some("/dir1".to_string()),
@@ -489,6 +493,8 @@ mod tests {
                 depth: 2,
                 extension: Some("log".to_string()),
                 blocks: 16,
+                checksum: None,
+                file_type: None,
             },
         ];
 
