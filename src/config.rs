@@ -11,8 +11,11 @@ use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-/// Maximum reasonable worker count
-const MAX_WORKERS: usize = 512;
+/// Maximum reasonable worker count.
+/// Past ~1000-2000 the work-stealing loop scans every other worker's
+/// stealer on each idle tick, so returns diminish sharply. 4096 is a
+/// hard cap to catch fat-finger typos, not a recommended setting.
+const MAX_WORKERS: usize = 4096;
 
 /// Minimum queue size
 const MIN_QUEUE_SIZE: usize = 100;

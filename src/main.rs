@@ -13,8 +13,50 @@ use nfs_walker::walker::{SimpleWalker, WalkStats};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Raise the soft `RLIMIT_NOFILE` to at least `TARGET` (or the hard limit,
+/// whichever is lower). Large RocksDB scans can hold thousands of SST file
+/// handles plus per-worker NFS sockets, and the default soft limit of 1024
+/// on most distros causes "Too many open files" crashes at multi-billion-
+/// entry scale.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    const TARGET: libc::rlim_t = 1_048_576;
+
+    // SAFETY: getrlimit/setrlimit are thread-safe and we pass valid pointers.
+    unsafe {
+        let mut current = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) != 0 {
+            warn!("Failed to read RLIMIT_NOFILE; FD-related crashes possible on large scans");
+            return;
+        }
+
+        let target = TARGET.min(current.rlim_max);
+        if current.rlim_cur >= target {
+            return;
+        }
+
+        let new = libc::rlimit { rlim_cur: target, rlim_max: current.rlim_max };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &new) != 0 {
+            warn!(
+                "Failed to raise RLIMIT_NOFILE soft limit (current={}, hard={}, requested={}). \
+                 Large scans may crash with 'Too many open files'. \
+                 Raise the hard limit in /etc/security/limits.conf and re-login.",
+                current.rlim_cur, current.rlim_max, target
+            );
+        } else {
+            info!(
+                "Raised RLIMIT_NOFILE soft limit: {} -> {} (hard limit: {})",
+                current.rlim_cur, target, current.rlim_max
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() {}
 
 fn main() -> ExitCode {
     match run() {
@@ -33,6 +75,10 @@ fn run() -> Result<()> {
 
     // Setup logging
     setup_logging(args.verbose)?;
+
+    // Raise FD limit early so both scans (lots of NFS sockets) and stats
+    // queries (lots of SST handles) benefit before opening anything.
+    raise_fd_limit();
 
     // Handle subcommands
     #[cfg(feature = "rocksdb")]
