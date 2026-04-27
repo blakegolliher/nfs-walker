@@ -25,7 +25,7 @@ pub mod writer;
 
 pub use convert::{convert_rocks_to_sqlite, ConvertConfig, ConvertStats};
 pub use reader::{compare_entry, ChangeType, RocksBaseline};
-pub use schema::{meta_keys, RocksEntry, RocksHandle};
+pub use schema::{meta_keys, OpenMode, RocksEntry, RocksHandle};
 pub use stats::{
     compute_stats, find_duplicates, find_hardlink_groups, largest_directories, largest_files,
     most_hardlinks, oldest_files, stats_by_extension, stats_by_file_type, stats_by_gid,

@@ -3,9 +3,32 @@
 //! Compute common filesystem statistics directly from RocksDB without conversion.
 
 use crate::error::RocksError;
-use crate::rocksdb::schema::RocksHandle;
+use crate::rocksdb::schema::{default_secondary_path, OpenMode, RocksHandle};
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Open a query handle in the requested mode. In secondary mode, prepares
+/// the secondary state dir and replays the latest MANIFEST/WAL state from
+/// the live primary before returning.
+fn open_query_handle<P: AsRef<Path>>(path: P, mode: OpenMode) -> Result<RocksHandle, RocksError> {
+    match mode {
+        OpenMode::Readonly => RocksHandle::open_readonly(path).map_err(RocksError::Rocks),
+        OpenMode::Secondary => {
+            let secondary = default_secondary_path(&path);
+            std::fs::create_dir_all(&secondary).map_err(|e| {
+                RocksError::Io(format!(
+                    "Failed to create secondary state dir {}: {}",
+                    secondary.display(),
+                    e
+                ))
+            })?;
+            let handle = RocksHandle::open_secondary(path.as_ref(), secondary.as_path())
+                .map_err(RocksError::Rocks)?;
+            handle.try_catch_up_with_primary().map_err(RocksError::Rocks)?;
+            Ok(handle)
+        }
+    }
+}
 
 /// Statistics about files grouped by extension
 #[derive(Debug, Clone, Default)]
@@ -29,11 +52,11 @@ pub struct DbStats {
 }
 
 /// Compute statistics from a RocksDB database
-pub fn compute_stats<P: AsRef<Path>>(path: P) -> Result<DbStats, RocksError> {
-    let handle = RocksHandle::open_readonly(path).map_err(RocksError::Rocks)?;
+pub fn compute_stats<P: AsRef<Path>>(path: P, mode: OpenMode) -> Result<DbStats, RocksError> {
+    let handle = open_query_handle(path, mode)?;
     let mut stats = DbStats::default();
 
-    for result in handle.iter_by_path() {
+    for result in handle.iter_by_inode() {
         let entry = result?;
         stats.total_entries += 1;
 
@@ -61,11 +84,12 @@ pub fn compute_stats<P: AsRef<Path>>(path: P) -> Result<DbStats, RocksError> {
 pub fn stats_by_extension<P: AsRef<Path>>(
     path: P,
     top_n: usize,
+    mode: OpenMode,
 ) -> Result<Vec<ExtensionStats>, RocksError> {
-    let handle = RocksHandle::open_readonly(path).map_err(RocksError::Rocks)?;
+    let handle = open_query_handle(path, mode)?;
     let mut ext_map: HashMap<String, ExtensionStats> = HashMap::new();
 
-    for result in handle.iter_by_path() {
+    for result in handle.iter_by_inode() {
         let entry = result?;
 
         // Only count files
@@ -98,11 +122,12 @@ pub fn stats_by_extension<P: AsRef<Path>>(
 pub fn largest_files<P: AsRef<Path>>(
     path: P,
     top_n: usize,
+    mode: OpenMode,
 ) -> Result<Vec<(String, u64)>, RocksError> {
-    let handle = RocksHandle::open_readonly(path).map_err(RocksError::Rocks)?;
+    let handle = open_query_handle(path, mode)?;
     let mut files: Vec<(String, u64)> = Vec::new();
 
-    for result in handle.iter_by_path() {
+    for result in handle.iter_by_inode() {
         let entry = result?;
 
         // Only count files
@@ -125,10 +150,13 @@ pub fn largest_files<P: AsRef<Path>>(
 pub fn largest_directories<P: AsRef<Path>>(
     path: P,
     top_n: usize,
+    mode: OpenMode,
 ) -> Result<Vec<(String, u64)>, RocksError> {
-    let handle = RocksHandle::open_readonly(path).map_err(RocksError::Rocks)?;
+    let handle = open_query_handle(path, mode)?;
     let mut dir_counts: HashMap<String, u64> = HashMap::new();
 
+    // Iterate by path: a directory's child count is per-name, not per-inode.
+    // Hardlinked aliases each contribute to their own parent's count.
     for result in handle.iter_by_path() {
         let entry = result?;
 
@@ -155,11 +183,12 @@ pub fn largest_directories<P: AsRef<Path>>(
 pub fn oldest_files<P: AsRef<Path>>(
     path: P,
     top_n: usize,
+    mode: OpenMode,
 ) -> Result<Vec<(String, Option<i64>, u64)>, RocksError> {
-    let handle = RocksHandle::open_readonly(path).map_err(RocksError::Rocks)?;
+    let handle = open_query_handle(path, mode)?;
     let mut files: Vec<(String, Option<i64>, u64)> = Vec::new();
 
-    for result in handle.iter_by_path() {
+    for result in handle.iter_by_inode() {
         let entry = result?;
 
         // Only files
@@ -185,11 +214,12 @@ pub fn oldest_files<P: AsRef<Path>>(
 pub fn most_hardlinks<P: AsRef<Path>>(
     path: P,
     top_n: usize,
+    mode: OpenMode,
 ) -> Result<Vec<(String, u64, u64)>, RocksError> {
-    let handle = RocksHandle::open_readonly(path).map_err(RocksError::Rocks)?;
+    let handle = open_query_handle(path, mode)?;
     let mut files: Vec<(String, u64, u64)> = Vec::new();
 
-    for result in handle.iter_by_path() {
+    for result in handle.iter_by_inode() {
         let entry = result?;
 
         // Only files
@@ -223,11 +253,12 @@ pub struct OwnerStats {
 pub fn stats_by_uid<P: AsRef<Path>>(
     path: P,
     top_n: usize,
+    mode: OpenMode,
 ) -> Result<Vec<OwnerStats>, RocksError> {
-    let handle = RocksHandle::open_readonly(path).map_err(RocksError::Rocks)?;
+    let handle = open_query_handle(path, mode)?;
     let mut uid_map: HashMap<u32, OwnerStats> = HashMap::new();
 
-    for result in handle.iter_by_path() {
+    for result in handle.iter_by_inode() {
         let entry = result?;
 
         let uid = entry.uid.unwrap_or(0);
@@ -258,11 +289,12 @@ pub fn stats_by_uid<P: AsRef<Path>>(
 pub fn stats_by_gid<P: AsRef<Path>>(
     path: P,
     top_n: usize,
+    mode: OpenMode,
 ) -> Result<Vec<OwnerStats>, RocksError> {
-    let handle = RocksHandle::open_readonly(path).map_err(RocksError::Rocks)?;
+    let handle = open_query_handle(path, mode)?;
     let mut gid_map: HashMap<u32, OwnerStats> = HashMap::new();
 
-    for result in handle.iter_by_path() {
+    for result in handle.iter_by_inode() {
         let entry = result?;
 
         let gid = entry.gid.unwrap_or(0);
@@ -307,11 +339,12 @@ pub fn find_duplicates<P: AsRef<Path>>(
     path: P,
     min_size: u64,
     top_n: usize,
+    mode: OpenMode,
 ) -> Result<Vec<DuplicateGroup>, RocksError> {
-    let handle = RocksHandle::open_readonly(path).map_err(RocksError::Rocks)?;
+    let handle = open_query_handle(path, mode)?;
     let mut checksum_map: HashMap<String, (u64, Vec<String>)> = HashMap::new();
 
-    for result in handle.iter_by_path() {
+    for result in handle.iter_by_inode() {
         let entry = result?;
 
         // Only files with checksums
@@ -369,11 +402,12 @@ pub struct FileTypeStats {
 pub fn stats_by_file_type<P: AsRef<Path>>(
     path: P,
     top_n: usize,
+    mode: OpenMode,
 ) -> Result<Vec<FileTypeStats>, RocksError> {
-    let handle = RocksHandle::open_readonly(path).map_err(RocksError::Rocks)?;
+    let handle = open_query_handle(path, mode)?;
     let mut type_map: HashMap<String, FileTypeStats> = HashMap::new();
 
-    for result in handle.iter_by_path() {
+    for result in handle.iter_by_inode() {
         let entry = result?;
 
         // Only files
@@ -416,10 +450,13 @@ pub fn find_hardlink_groups<P: AsRef<Path>>(
     path: P,
     min_links: u64,
     top_n: usize,
+    mode: OpenMode,
 ) -> Result<Vec<HardLinkGroup>, RocksError> {
-    let handle = RocksHandle::open_readonly(path).map_err(RocksError::Rocks)?;
+    let handle = open_query_handle(path, mode)?;
     let mut inode_map: HashMap<u64, (u64, u64, Vec<String>)> = HashMap::new();
 
+    // Iterate by path: this query specifically needs to see every name an
+    // inode is hardlinked under, which the inode CF deduplicates away.
     for result in handle.iter_by_path() {
         let entry = result?;
 

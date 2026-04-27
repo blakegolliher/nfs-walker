@@ -253,6 +253,61 @@ nfs-walker stats scan.rocks --by-extension --by-uid --largest-files -n 10
 | `--hardlink-groups` | Groups of paths sharing the same inode |
 | `--min-size N` | Minimum file size for `--duplicates` (default: 1024) |
 | `-n N`, `--top N` | Limit results to top N (default: 20) |
+| `--live` | Open in RocksDB secondary mode for live querying during an active scan |
+
+---
+
+## Live Querying During an Active Scan (`--live`)
+
+By default `nfs-walker stats` opens the database in RocksDB **read-only**
+mode. Read-only mode snapshots the SST file list at open time, which means
+it cannot tolerate the writer running compactions while you query — you
+will see errors like:
+
+```
+RocksDB error: IO error: No such file or directory:
+While open a file for random read: /path/to/scan.rocks/005026.sst
+```
+
+That's a compaction having deleted an SST file out from under the
+read-only view. It is not a corruption.
+
+The `--live` flag opens the same database in RocksDB **secondary** mode,
+which is designed for this case:
+
+```bash
+# Query a database that an active scan is still writing to
+nfs-walker stats /mnt/local-nvme/figure.rocks --by-extension -n 15 --live
+```
+
+### How secondary mode works
+
+A secondary instance reads the live primary's SST files but maintains its
+own MANIFEST/WAL replay state in a separate directory, so concurrent
+compactions on the primary do not break it. nfs-walker auto-derives the
+secondary state directory:
+
+```
+${TMPDIR}/nfs-walker-secondary-<hash-of-canonical-primary-path>
+```
+
+Every `--live` invocation calls `try_catch_up_with_primary()` after open,
+so each query reflects all data the primary had committed at open time.
+
+### Caveats
+
+- **Snapshot at open, not real-time.** A long query iterates a snapshot;
+  data committed by the primary mid-query is not picked up until the next
+  invocation.
+- **Slightly slower to open** than read-only (one MANIFEST replay).
+- **Secondary state dir is reusable.** Subsequent `--live` invocations
+  pick up where they left off, which is faster. Safe to delete at any
+  time — it will be recreated.
+- **Final stats are always more accurate from a finished scan.** Once the
+  scan completes, drop `--live` to use the faster read-only path.
+- **One secondary per state dir.** Two concurrent `--live` queries on the
+  same primary would collide on the auto-derived dir. If you need
+  parallelism, run them serially or wait for the scan to finish.
 
 ---
 

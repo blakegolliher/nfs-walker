@@ -107,7 +107,14 @@ nfs-walker stats scan.rocks --by-uid           # Usage by owner
 nfs-walker stats scan.rocks --duplicates       # Duplicate files (requires -c scan)
 nfs-walker stats scan.rocks --by-file-type     # MIME type distribution (requires -t scan)
 nfs-walker stats scan.rocks --hardlink-groups  # Hard link groups
+nfs-walker stats scan.rocks --by-extension --live  # Query while a scan is still writing
 ```
+
+> **Querying during an active scan:** add `--live` to open the database in
+> RocksDB secondary mode. The default read-only mode breaks under concurrent
+> compactions ("No such file or directory: .../NNNNNN.sst"). See
+> [docs/QUERY_ROCKSDB.md](docs/QUERY_ROCKSDB.md#live-querying-during-an-active-scan---live)
+> for details and caveats.
 
 **SQLite** (full SQL power):
 ```bash

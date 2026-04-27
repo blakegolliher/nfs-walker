@@ -321,6 +321,12 @@ pub enum Command {
         /// Number of results to show
         #[arg(short = 'n', long, default_value = "20")]
         top: usize,
+
+        /// Open the database in RocksDB secondary mode for live querying
+        /// while a scan is still writing to it. Slightly slower than the
+        /// default read-only mode but tolerates concurrent compactions.
+        #[arg(long)]
+        live: bool,
     },
 }
 

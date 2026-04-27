@@ -120,8 +120,8 @@ fn handle_command(cmd: &Command) -> Result<()> {
         Command::ExportParquet { input, output_dir, progress, file_size_mb, row_group_size, compression_level } => {
             run_export_parquet(input, output_dir, *progress, *file_size_mb, *row_group_size, *compression_level)
         }
-        Command::Stats { db, by_extension, largest_files, largest_dirs, oldest_files, most_links, by_uid, by_gid, duplicates, by_file_type, hardlink_groups, min_size, top } => {
-            run_stats(db, *by_extension, *largest_files, *largest_dirs, *oldest_files, *most_links, *by_uid, *by_gid, *duplicates, *by_file_type, *hardlink_groups, *min_size, *top)
+        Command::Stats { db, by_extension, largest_files, largest_dirs, oldest_files, most_links, by_uid, by_gid, duplicates, by_file_type, hardlink_groups, min_size, top, live } => {
+            run_stats(db, *by_extension, *largest_files, *largest_dirs, *oldest_files, *most_links, *by_uid, *by_gid, *duplicates, *by_file_type, *hardlink_groups, *min_size, *top, *live)
         }
         #[cfg(feature = "csv-export")]
         Command::ExportCsv { input, output_dir, progress, rows_per_file, gzip, gzip_level } => {
@@ -150,12 +150,15 @@ fn run_stats(
     hardlink_groups: bool,
     min_size: u64,
     top: usize,
+    live: bool,
 ) -> Result<()> {
     use nfs_walker::rocksdb::{
         compute_stats, find_duplicates, find_hardlink_groups, largest_directories, largest_files,
         most_hardlinks, oldest_files, stats_by_extension, stats_by_file_type, stats_by_gid,
-        stats_by_uid,
+        stats_by_uid, OpenMode,
     };
+
+    let mode = if live { OpenMode::Secondary } else { OpenMode::Readonly };
 
     // If no specific query requested, show overall stats
     let show_overview = !by_extension && !largest_files_flag && !largest_dirs
@@ -163,7 +166,7 @@ fn run_stats(
         && !duplicates && !by_file_type && !hardlink_groups;
 
     if show_overview {
-        let stats = compute_stats(db).context("Failed to compute stats")?;
+        let stats = compute_stats(db, mode).context("Failed to compute stats")?;
         println!();
         println!("Database Statistics");
         println!("─────────────────────────────────────────────────");
@@ -178,7 +181,7 @@ fn run_stats(
     }
 
     if by_extension {
-        let ext_stats = stats_by_extension(db, top).context("Failed to get extension stats")?;
+        let ext_stats = stats_by_extension(db, top, mode).context("Failed to get extension stats")?;
         println!();
         println!("Files by Extension (top {}):", top);
         println!("─────────────────────────────────────────────────");
@@ -198,7 +201,7 @@ fn run_stats(
     }
 
     if largest_files_flag {
-        let files = largest_files(db, top).context("Failed to get largest files")?;
+        let files = largest_files(db, top, mode).context("Failed to get largest files")?;
         println!();
         println!("Largest Files (top {}):", top);
         println!("─────────────────────────────────────────────────");
@@ -209,7 +212,7 @@ fn run_stats(
     }
 
     if largest_dirs {
-        let dirs = largest_directories(db, top).context("Failed to get largest directories")?;
+        let dirs = largest_directories(db, top, mode).context("Failed to get largest directories")?;
         println!();
         println!("Directories with Most Files (top {}):", top);
         println!("─────────────────────────────────────────────────");
@@ -222,7 +225,7 @@ fn run_stats(
     }
 
     if oldest_files_flag {
-        let files = oldest_files(db, top).context("Failed to get oldest files")?;
+        let files = oldest_files(db, top, mode).context("Failed to get oldest files")?;
         println!();
         println!("Oldest Files (top {}):", top);
         println!("─────────────────────────────────────────────────");
@@ -240,7 +243,7 @@ fn run_stats(
     }
 
     if most_links {
-        let files = most_hardlinks(db, top).context("Failed to get files with most links")?;
+        let files = most_hardlinks(db, top, mode).context("Failed to get files with most links")?;
         println!();
         println!("Files with Most Hard Links (top {}):", top);
         println!("─────────────────────────────────────────────────");
@@ -253,7 +256,7 @@ fn run_stats(
     }
 
     if by_uid {
-        let stats = stats_by_uid(db, top).context("Failed to get stats by UID")?;
+        let stats = stats_by_uid(db, top, mode).context("Failed to get stats by UID")?;
         println!();
         println!("Usage by User ID (top {}):", top);
         println!("─────────────────────────────────────────────────");
@@ -272,7 +275,7 @@ fn run_stats(
     }
 
     if by_gid {
-        let stats = stats_by_gid(db, top).context("Failed to get stats by GID")?;
+        let stats = stats_by_gid(db, top, mode).context("Failed to get stats by GID")?;
         println!();
         println!("Usage by Group ID (top {}):", top);
         println!("─────────────────────────────────────────────────");
@@ -291,7 +294,7 @@ fn run_stats(
     }
 
     if duplicates {
-        let groups = find_duplicates(db, min_size, top).context("Failed to find duplicates")?;
+        let groups = find_duplicates(db, min_size, top, mode).context("Failed to find duplicates")?;
         if groups.is_empty() {
             println!();
             println!("No duplicate files found (min size: {})", format_size(min_size, BINARY));
@@ -316,7 +319,7 @@ fn run_stats(
     }
 
     if by_file_type {
-        let stats = stats_by_file_type(db, top).context("Failed to get file type stats")?;
+        let stats = stats_by_file_type(db, top, mode).context("Failed to get file type stats")?;
         if stats.is_empty() || (stats.len() == 1 && stats[0].mime_type == "unknown") {
             println!();
             println!("No file type data available.");
@@ -341,7 +344,7 @@ fn run_stats(
     }
 
     if hardlink_groups {
-        let groups = find_hardlink_groups(db, 2, top).context("Failed to find hardlink groups")?;
+        let groups = find_hardlink_groups(db, 2, top, mode).context("Failed to find hardlink groups")?;
         if groups.is_empty() {
             println!();
             println!("No hard link groups found.");

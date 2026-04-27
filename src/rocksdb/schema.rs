@@ -8,6 +8,22 @@ use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// How to open a RocksDB database for querying.
+///
+/// `Readonly` is the simplest and fastest mode but is incompatible with an
+/// active writer — concurrent compactions can delete SST files out from
+/// under the read-only view, producing "No such file or directory" errors.
+///
+/// `Secondary` opens against the live primary and maintains its own
+/// MANIFEST/WAL replay state in a separate directory, so it tolerates
+/// concurrent compactions. Slightly slower to open and view is only as
+/// fresh as the last `try_catch_up_with_primary()` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    Readonly,
+    Secondary,
+}
+
 /// Column family names
 pub const CF_ENTRIES_BY_PATH: &str = "entries_by_path";
 pub const CF_ENTRIES_BY_INODE: &str = "entries_by_inode";
@@ -231,13 +247,64 @@ pub fn open_rocks_db<P: AsRef<Path>>(path: P) -> Result<DB, rocksdb::Error> {
     DB::open_cf_descriptors(&db_opts, path, cf_descriptors)
 }
 
+/// Database options for query workloads (read-only / secondary).
+///
+/// Crucially differs from `get_db_options()` by removing the
+/// `max_open_files` cap. With a cap, RocksDB's LRU evicts SST file
+/// handles mid-iteration. On Linux an unlinked file stays readable only
+/// while some process holds it open — so when the cache later tries to
+/// reopen an SST that the active primary has compacted away, we get
+/// "No such file or directory". Unlimited handles keep every referenced
+/// SST pinned for the duration of the iteration. Safe because we raise
+/// `RLIMIT_NOFILE` to 1M at startup.
+pub fn get_query_options() -> Options {
+    let mut opts = get_db_options();
+    opts.set_max_open_files(-1);
+    opts
+}
+
 /// Open existing RocksDB database for reading
 pub fn open_rocks_db_readonly<P: AsRef<Path>>(path: P) -> Result<DB, rocksdb::Error> {
-    let db_opts = get_db_options();
+    let db_opts = get_query_options();
 
     let cf_names = vec![CF_ENTRIES_BY_PATH, CF_ENTRIES_BY_INODE, CF_METADATA, CF_BIG_DIRS];
 
     DB::open_cf_for_read_only(&db_opts, path, cf_names, false)
+}
+
+/// Open existing RocksDB database in secondary mode for live querying
+/// alongside an active writer.
+///
+/// Unlike read-only mode, secondary mode tolerates concurrent compactions
+/// on the primary by maintaining its own MANIFEST/WAL replay state under
+/// `secondary_path`. Call `try_catch_up_with_primary()` to refresh.
+pub fn open_rocks_db_secondary<P: AsRef<Path>>(
+    primary_path: P,
+    secondary_path: P,
+) -> Result<DB, rocksdb::Error> {
+    let db_opts = get_query_options();
+
+    let cf_names = vec![CF_ENTRIES_BY_PATH, CF_ENTRIES_BY_INODE, CF_METADATA, CF_BIG_DIRS];
+
+    DB::open_cf_as_secondary(&db_opts, primary_path, secondary_path, cf_names)
+}
+
+/// Build a deterministic secondary state directory under the OS temp dir
+/// for the given primary RocksDB path.
+///
+/// Reusing the same dir between runs lets RocksDB skip re-replay of the
+/// MANIFEST it has already seen. Safe to delete at any time.
+pub fn default_secondary_path<P: AsRef<Path>>(primary_path: P) -> std::path::PathBuf {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let canonical = std::fs::canonicalize(&primary_path)
+        .unwrap_or_else(|_| primary_path.as_ref().to_path_buf());
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    std::env::temp_dir().join(format!("nfs-walker-secondary-{:016x}", hash))
 }
 
 /// RocksDB handle wrapper with column family accessors
@@ -256,6 +323,25 @@ impl RocksHandle {
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Self, rocksdb::Error> {
         let db = open_rocks_db_readonly(path)?;
         Ok(Self { db })
+    }
+
+    /// Open in RocksDB secondary mode against a live primary writer.
+    ///
+    /// `secondary_path` must be a writable directory dedicated to this
+    /// secondary instance's MANIFEST/WAL replay state — it must already exist.
+    pub fn open_secondary<P: AsRef<Path>>(
+        primary_path: P,
+        secondary_path: P,
+    ) -> Result<Self, rocksdb::Error> {
+        let db = open_rocks_db_secondary(primary_path, secondary_path)?;
+        Ok(Self { db })
+    }
+
+    /// In secondary mode, replay any new MANIFEST/WAL entries from the
+    /// primary so this view sees the latest committed state. No-op for
+    /// other modes (returns Ok).
+    pub fn try_catch_up_with_primary(&self) -> Result<(), rocksdb::Error> {
+        self.db.try_catch_up_with_primary()
     }
 
     /// Get entries_by_path column family
@@ -357,6 +443,29 @@ impl RocksHandle {
     ) -> impl Iterator<Item = Result<RocksEntry, crate::error::RocksError>> + '_ {
         self.db
             .iterator_cf(self.cf_entries_by_path(), rocksdb::IteratorMode::Start)
+            .map(|result| {
+                let (_, value) = result.map_err(crate::error::RocksError::Rocks)?;
+                RocksEntry::from_bytes(&value)
+                    .map_err(|e| crate::error::RocksError::Bincode(e.to_string()))
+            })
+    }
+
+    /// Iterate all entries by inode.
+    ///
+    /// Faster than `iter_by_path` for full scans: the inode CF has 8-byte
+    /// fixed keys vs the path CF's variable string keys (~80-150B in deep
+    /// trees), so SST blocks are denser and there is less disk I/O.
+    ///
+    /// Caveat: hardlinked files share an inode, and the inode CF's writes
+    /// overwrite on collision (writer.rs:84). So this iteration yields one
+    /// `RocksEntry` per unique inode — the `path`/`name` fields will be
+    /// whichever alias was written last. Use `iter_by_path` if you need
+    /// to see every name.
+    pub fn iter_by_inode(
+        &self,
+    ) -> impl Iterator<Item = Result<RocksEntry, crate::error::RocksError>> + '_ {
+        self.db
+            .iterator_cf(self.cf_entries_by_inode(), rocksdb::IteratorMode::Start)
             .map(|result| {
                 let (_, value) = result.map_err(crate::error::RocksError::Rocks)?;
                 RocksEntry::from_bytes(&value)
