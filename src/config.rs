@@ -32,17 +32,48 @@ static NFS_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 #[command(
     name = "nfs-walker",
     version,
-    about = "Simple NFS filesystem walker with SQLite/RocksDB output",
-    long_about = "Walks an NFS filesystem using direct libnfs access and outputs results to a database.\n\n\
-                  Uses READDIR for directory names and parallel GETATTR for file attributes.\n\n\
-                  With RocksDB feature: Default output is RocksDB (.rocks) for fast writes.\n\
-                  Convert to SQLite using the 'convert' subcommand for queries.",
-    after_help = "EXAMPLES:\n    \
-        nfs-walker nfs://server/export -o scan.db\n    \
-        nfs-walker 192.168.1.100:/data -w 8 -p\n    \
-        nfs-walker nfs://cluster/share --exclude '.snapshot' --dirs-only\n    \
-        nfs-walker nfs://server/export -o scan.rocks -p  # RocksDB output (with feature)\n    \
-        nfs-walker convert scan.rocks scan.db --progress  # Convert to SQLite",
+    about = "High-performance NFS filesystem scanner with RocksDB storage and multiple export formats",
+    long_about = "Walks an NFS filesystem using direct libnfs READDIRPLUS calls with parallel workers.\n\n\
+                  Default output is RocksDB (.rocks) for maximum write throughput on large filesystems.\n\
+                  After scanning, export to CSV, Parquet, or SQLite, or query stats directly.\n\n\
+                  Typical workflow:\n\
+                  1. Scan:   nfs-walker nfs://server/export -o scan.rocks -w 32\n\
+                  2. Export: nfs-walker export-csv scan.rocks ./csv-output -p --gzip\n\
+                  3. Query:  nfs-walker stats scan.rocks --by-extension --largest-files",
+    after_help = "\
+EXAMPLES:
+  Scan an NFS export to RocksDB (recommended):
+    nfs-walker nfs://server/export -o scan.rocks -w 32
+
+  Scan with exclusions and depth limit:
+    nfs-walker nfs://server/data --exclude '.snapshot' --exclude '\\.Trash' -d 10 -o scan.rocks
+
+  Scan directly to SQLite (slower, but single-file output):
+    nfs-walker nfs://server/export -o scan.db --sqlite
+
+  Hunt for large directories (>1M files):
+    nfs-walker nfs://server/export -o bigdirs.rocks --big-dir-hunt --threshold 1000000
+
+  Export RocksDB to gzip-compressed CSV (splits at 10M rows per file):
+    nfs-walker export-csv scan.rocks ./csv-output -p --gzip
+
+  Export with custom split size (50M rows per file):
+    nfs-walker export-csv scan.rocks ./csv-output -p --gzip --rows-per-file 50000000
+
+  Convert RocksDB to SQLite for ad-hoc SQL queries:
+    nfs-walker convert scan.rocks scan.db -p
+
+  Show overall scan statistics:
+    nfs-walker stats scan.rocks
+
+  Analyze by file extension, largest files, and ownership:
+    nfs-walker stats scan.rocks --by-extension --largest-files --by-uid -n 50
+
+  Find oldest files and directories with most entries:
+    nfs-walker stats scan.rocks --oldest-files --largest-dirs
+
+NOTE: For large scans (>100M files), write output to a filesystem with enough space.
+      Use 'ulimit -n 65536' if you hit 'too many open files' errors.",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true
 )]
@@ -148,14 +179,14 @@ pub struct CliArgs {
 /// Subcommands
 #[derive(clap::Subcommand, Debug, Clone)]
 pub enum Command {
-    /// Convert RocksDB database to SQLite
+    /// Convert RocksDB scan to SQLite for ad-hoc SQL queries
     #[cfg(feature = "rocksdb")]
     Convert {
-        /// Input RocksDB directory
+        /// Input RocksDB directory from a previous scan
         #[arg(value_name = "INPUT")]
         input: PathBuf,
 
-        /// Output SQLite file
+        /// Output SQLite file (.db)
         #[arg(value_name = "OUTPUT")]
         output: PathBuf,
 
@@ -164,7 +195,7 @@ pub enum Command {
         progress: bool,
     },
 
-    /// Export RocksDB database to Parquet files
+    /// Export RocksDB scan to Parquet files (for analytics/DataFusion)
     #[cfg(feature = "parquet")]
     ExportParquet {
         /// Input RocksDB directory
@@ -192,14 +223,14 @@ pub enum Command {
         compression_level: i32,
     },
 
-    /// Export RocksDB database to CSV files
+    /// Export RocksDB scan to CSV files (auto-splits by row count)
     #[cfg(feature = "csv-export")]
     ExportCsv {
-        /// Input RocksDB directory
+        /// Input RocksDB directory from a previous scan
         #[arg(value_name = "INPUT")]
         input: PathBuf,
 
-        /// Output directory for CSV files
+        /// Output directory for CSV files (created if it doesn't exist)
         #[arg(value_name = "OUTPUT_DIR")]
         output_dir: PathBuf,
 
@@ -207,11 +238,11 @@ pub enum Command {
         #[arg(short = 'p', long)]
         progress: bool,
 
-        /// Rows per file before splitting (default: 10M)
+        /// Maximum rows per output file before splitting (default: 10M)
         #[arg(long, default_value = "10000000")]
         rows_per_file: usize,
 
-        /// Compress output with gzip (.csv.gz)
+        /// Compress output with gzip (.csv.gz) - recommended for large exports
         #[arg(long)]
         gzip: bool,
 
@@ -236,10 +267,10 @@ pub enum Command {
         bind: String,
     },
 
-    /// Show statistics from a RocksDB database
+    /// Query statistics from a RocksDB scan (extensions, largest files, ownership, etc.)
     #[cfg(feature = "rocksdb")]
     Stats {
-        /// RocksDB database path
+        /// RocksDB database path from a previous scan
         #[arg(value_name = "DB")]
         db: PathBuf,
 
@@ -433,8 +464,9 @@ impl NfsUrl {
 
     /// Split a full path into export and subpath
     ///
-    /// The export is assumed to be the first path component.
-    /// For example: /export/foo/bar -> export="/export", subpath="/foo/bar"
+    /// The entire path is treated as the export by default, since we cannot
+    /// auto-detect where the export boundary is (multi-component exports like
+    /// /volumes/uuid are common). Use --export to override if needed.
     fn split_export_path(path: &str) -> (String, String) {
         let path = path.trim_end_matches('/');
 
@@ -442,16 +474,8 @@ impl NfsUrl {
             return ("/".to_string(), String::new());
         }
 
-        // Find the second slash (end of export)
-        let without_leading = path.trim_start_matches('/');
-        if let Some(idx) = without_leading.find('/') {
-            let export = format!("/{}", &without_leading[..idx]);
-            let subpath = without_leading[idx..].to_string();
-            (export, subpath)
-        } else {
-            // Single component - it's all export
-            (path.to_string(), String::new())
-        }
+        // Treat the full path as the export
+        (path.to_string(), String::new())
     }
 
     /// Get the full path (export + subpath) for display purposes
@@ -698,8 +722,8 @@ mod tests {
     fn test_parse_nfs_url_with_subpath() {
         let url = NfsUrl::parse("nfs://server/export/data/subdir").unwrap();
         assert_eq!(url.server, "server");
-        assert_eq!(url.export, "/export");
-        assert_eq!(url.subpath, "/data/subdir");
+        assert_eq!(url.export, "/export/data/subdir");
+        assert_eq!(url.subpath, "");
     }
 
     #[test]
@@ -727,6 +751,8 @@ mod tests {
     fn test_full_path() {
         let url = NfsUrl::parse("nfs://server/export/subdir").unwrap();
         assert_eq!(url.full_path(), "/export/subdir");
+        assert_eq!(url.export, "/export/subdir");
+        assert_eq!(url.subpath, "");
     }
 
     #[test]

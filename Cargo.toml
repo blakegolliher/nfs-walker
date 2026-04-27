@@ -3,14 +3,14 @@ name = "nfs-walker"
 version = "0.1.0"
 edition = "2021"
 authors = ["VAST Data"]
-description = "Simple NFS filesystem walker with SQLite output"
+description = "High-performance NFS filesystem scanner with RocksDB storage and multiple export formats"
 license = "MIT"
 readme = "README.md"
 keywords = ["nfs", "filesystem", "walker", "scanner"]
 categories = ["command-line-utilities", "filesystem"]
 
 [features]
-default = ["rocksdb"]
+default = ["rocksdb", "csv-export"]
 rocksdb = ["dep:rocksdb", "dep:bincode", "dep:serde"]
 parquet = ["rocksdb", "dep:arrow", "dep:parquet", "dep:uuid", "dep:serde_json"]
 csv-export = ["rocksdb", "dep:csv", "dep:flate2"]

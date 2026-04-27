@@ -1148,8 +1148,9 @@ fn worker_loop(
                 errors_count.fetch_add(1, Ordering::Relaxed);
                 // Not found errors are common on active filesystems (race condition)
                 // Log them at debug level to reduce noise
-                if e.to_string().contains("not found") || e.to_string().contains("No such file") {
-                    debug!("Worker {} READDIRPLUS not found: {}", id, work.path);
+                if e.to_string().contains("not found") || e.to_string().contains("No such file")
+                    || e.to_string().contains("Permission denied") {
+                    debug!("Worker {} READDIRPLUS error: {} -> {}", id, work.path, e);
                 } else {
                     warn!("Worker {} READDIRPLUS failed: {} -> {}", id, work.path, e);
                 }
@@ -1486,8 +1487,9 @@ fn big_dir_worker_loop(
             Err(e) => {
                 errors_count.fetch_add(1, Ordering::Relaxed);
                 let err_str = format!("{:?}", e);
-                if err_str.contains("NotFound") || err_str.contains("not found") {
-                    debug!("Big-dir worker {} READDIRPLUS not found: {}", id, work.path);
+                if err_str.contains("NotFound") || err_str.contains("not found")
+                    || err_str.contains("PermissionDenied") || err_str.contains("Permission denied") {
+                    debug!("Big-dir worker {} READDIRPLUS error: {} -> {:?}", id, work.path, e);
                 } else {
                     warn!(
                         "Big-dir worker {} READDIRPLUS failed: {} -> {:?}",

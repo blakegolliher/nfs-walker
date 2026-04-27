@@ -168,8 +168,18 @@ fn entries_cf_options() -> Options {
     block_opts.set_cache_index_and_filter_blocks(true);
     opts.set_block_based_table_factory(&block_opts);
 
-    // Compression: LZ4 for speed
-    opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+    // Compression: Zstd for better ratio (~2-3x smaller than LZ4)
+    // Use per-level compression: LZ4 for L0-L1 (frequent compaction),
+    // Zstd for L2+ (bulk of data, compacted less often)
+    opts.set_compression_per_level(&[
+        rocksdb::DBCompressionType::Lz4,  // L0
+        rocksdb::DBCompressionType::Lz4,  // L1
+        rocksdb::DBCompressionType::Zstd, // L2
+        rocksdb::DBCompressionType::Zstd, // L3
+        rocksdb::DBCompressionType::Zstd, // L4
+        rocksdb::DBCompressionType::Zstd, // L5
+        rocksdb::DBCompressionType::Zstd, // L6
+    ]);
 
     opts
 }
@@ -198,6 +208,11 @@ pub fn get_db_options() -> Options {
     // Allow concurrent memtable writes
     opts.set_allow_concurrent_memtable_write(true);
     opts.set_enable_write_thread_adaptive_yield(true);
+
+    // Cap open file descriptors to avoid "too many open files" on large scans.
+    // RocksDB will use an LRU cache for SST file handles beyond this limit.
+    // -1 (default) means unlimited, which can exhaust the OS limit.
+    opts.set_max_open_files(4096);
 
     opts
 }

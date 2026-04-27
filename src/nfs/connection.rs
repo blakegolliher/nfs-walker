@@ -44,6 +44,63 @@ pub struct NfsConnection {
 unsafe impl Send for NfsConnection {}
 // NOT implementing Sync - libnfs is not thread-safe
 
+/// Translate a negated NFS3 status code to a human-readable string.
+///
+/// libnfs callbacks store the NFS3 status as `-(res.status as i32)`,
+/// so NFS3ERR_PERM (1) becomes -1, NFS3ERR_ACCES (13) becomes -13, etc.
+fn nfs3_status_to_string(status: i32) -> String {
+    match status {
+        s if s == -(ffi::nfsstat3_NFS3ERR_PERM as i32) => "NFS3ERR_PERM (operation not permitted)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_NOENT as i32) => "NFS3ERR_NOENT (no such file or directory)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_IO as i32) => "NFS3ERR_IO (I/O error)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_NXIO as i32) => "NFS3ERR_NXIO (no such device or address)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_ACCES as i32) => "NFS3ERR_ACCES (permission denied)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_EXIST as i32) => "NFS3ERR_EXIST (file exists)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_XDEV as i32) => "NFS3ERR_XDEV (cross-device link)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_NODEV as i32) => "NFS3ERR_NODEV (no such device)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_NOTDIR as i32) => "NFS3ERR_NOTDIR (not a directory)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_ISDIR as i32) => "NFS3ERR_ISDIR (is a directory)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_INVAL as i32) => "NFS3ERR_INVAL (invalid argument)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_FBIG as i32) => "NFS3ERR_FBIG (file too large)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_NOSPC as i32) => "NFS3ERR_NOSPC (no space left on device)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_ROFS as i32) => "NFS3ERR_ROFS (read-only file system)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_MLINK as i32) => "NFS3ERR_MLINK (too many links)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_NAMETOOLONG as i32) => "NFS3ERR_NAMETOOLONG (name too long)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_NOTEMPTY as i32) => "NFS3ERR_NOTEMPTY (directory not empty)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_DQUOT as i32) => "NFS3ERR_DQUOT (disk quota exceeded)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_STALE as i32) => "NFS3ERR_STALE (stale file handle)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_REMOTE as i32) => "NFS3ERR_REMOTE (too many levels of remote in path)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_BADHANDLE as i32) => "NFS3ERR_BADHANDLE (illegal NFS file handle)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_NOT_SYNC as i32) => "NFS3ERR_NOT_SYNC (update synchronization mismatch)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_BAD_COOKIE as i32) => "NFS3ERR_BAD_COOKIE (stale cookie)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_NOTSUPP as i32) => "NFS3ERR_NOTSUPP (operation not supported)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_TOOSMALL as i32) => "NFS3ERR_TOOSMALL (buffer or request too small)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_SERVERFAULT as i32) => "NFS3ERR_SERVERFAULT (server fault)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_BADTYPE as i32) => "NFS3ERR_BADTYPE (bad type)".into(),
+        s if s == -(ffi::nfsstat3_NFS3ERR_JUKEBOX as i32) => "NFS3ERR_JUKEBOX (jukebox/try again later)".into(),
+        _ => format!("unknown NFS3 status ({})", status),
+    }
+}
+
+/// Convert a negated NFS3 status code to a typed NfsError with a path context.
+fn nfs3_status_to_nfs_error(status: i32, path: &str) -> NfsError {
+    match status {
+        s if s == -(ffi::nfsstat3_NFS3ERR_PERM as i32) || s == -(ffi::nfsstat3_NFS3ERR_ACCES as i32) => {
+            NfsError::PermissionDenied { path: path.into() }
+        }
+        s if s == -(ffi::nfsstat3_NFS3ERR_NOENT as i32) => {
+            NfsError::NotFound { path: path.into() }
+        }
+        s if s == -(ffi::nfsstat3_NFS3ERR_STALE as i32) => {
+            NfsError::StaleHandle { path: path.into() }
+        }
+        _ => NfsError::ReadDirFailed {
+            path: path.into(),
+            reason: nfs3_status_to_string(status),
+        },
+    }
+}
+
 impl NfsConnection {
     /// Create a new NFS connection from a parsed URL
     ///
@@ -418,10 +475,7 @@ impl NfsConnection {
             }
 
             if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
-                return Err(NfsError::ReadDirFailed {
-                    path: path.into(),
-                    reason: format!("LOOKUP '{}' error: status={}", component, cb_data.status),
-                });
+                return Err(nfs3_status_to_nfs_error(cb_data.status, path));
             }
 
             if cb_data.fh_len == 0 {
@@ -528,10 +582,7 @@ impl NfsConnection {
             }
 
             if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
-                return Err(NfsError::ReadDirFailed {
-                    path: "(by file handle)".into(),
-                    reason: format!("READDIRPLUS error: status={}", cb_data.status),
-                });
+                return Err(nfs3_status_to_nfs_error(cb_data.status, "(by file handle)"));
             }
 
             total_entries += cb_data.entries.len();
@@ -1541,8 +1592,8 @@ impl NfsConnection {
 
             if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
                 return BigDirCheckResult::Error(format!(
-                    "READDIRPLUS error: status={}",
-                    cb_data.status
+                    "READDIRPLUS error: {}",
+                    nfs3_status_to_string(cb_data.status)
                 ));
             }
 
@@ -1650,7 +1701,7 @@ impl NfsConnection {
             // cb_data.completed is guaranteed true here
 
             if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
-                return Err(format!("READDIRPLUS error: status={}", cb_data.status));
+                return Err(format!("READDIRPLUS error: {}", nfs3_status_to_string(cb_data.status)));
             }
 
             // Process collected entries
@@ -1767,7 +1818,7 @@ impl NfsConnection {
         // cb_data.completed is guaranteed true here
 
         if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
-            return Err(format!("LOOKUP '{}' failed: status={}", name, cb_data.status));
+            return Err(format!("LOOKUP '{}' failed: {}", name, nfs3_status_to_string(cb_data.status)));
         }
 
         if cb_data.fh_len == 0 {
@@ -2390,7 +2441,7 @@ impl RawRpcContext {
             Self::wait_for_completion(self.rpc, &cb_data.completed, self.rpc_timeout_ms)?;
 
             if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
-                return Err(format!("READDIRPLUS error: status={}", cb_data.status));
+                return Err(format!("READDIRPLUS error: {}", nfs3_status_to_string(cb_data.status)));
             }
 
             // Process collected entries
@@ -2485,7 +2536,7 @@ impl RawRpcContext {
         Self::wait_for_completion(self.rpc, &cb_data.completed, self.rpc_timeout_ms)?;
 
         if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
-            return Err(format!("LOOKUP '{}' failed: status={}", name, cb_data.status));
+            return Err(format!("LOOKUP '{}' failed: {}", name, nfs3_status_to_string(cb_data.status)));
         }
 
         if cb_data.fh_len == 0 {
