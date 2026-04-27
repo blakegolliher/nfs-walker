@@ -5,10 +5,13 @@
 //! check the summary CF first and only fall back to full-scan iteration
 //! when the keys are missing (e.g. databases written by an older binary).
 //!
-//! Counts are *per-path* (every directory entry contributes), matching
-//! the writer's natural view of entries. On hardlink-heavy filesystems
-//! this differs from per-inode dedup -- see the corresponding stats
-//! function docs for which semantics they expose.
+//! **Per-path semantics.** Counts include every directory entry, so
+//! hardlinked files count once per name. The five stats functions that
+//! consume this summary (`compute_stats`, `stats_by_extension`,
+//! `stats_by_uid`, `stats_by_gid`, `stats_by_file_type`) iterate the
+//! `entries_by_path` CF on fallback, guaranteeing summary-hit and
+//! summary-miss return identical numbers regardless of hardlink
+//! density.
 
 use crate::nfs::types::{DbEntry, EntryType};
 use serde::{Deserialize, Serialize};

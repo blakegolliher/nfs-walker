@@ -71,8 +71,13 @@ pub struct DbStats {
 
 /// Compute statistics from a RocksDB database.
 ///
+/// **Per-path semantics**: every directory entry contributes, so
+/// hardlinked files count once per name. Matches the writer's natural
+/// view (one row per `DbEntry` batch). Both the summary fast path and
+/// the iteration fallback below return identical numbers.
+///
 /// Fast path: returns instantly from the summary CF if present.
-/// Slow path: full inode-CF iteration (legacy DBs without summary).
+/// Slow path: full path-CF iteration (legacy DBs without summary).
 pub fn compute_stats<P: AsRef<Path>>(path: P, mode: OpenMode) -> Result<DbStats, RocksError> {
     let handle = open_query_handle(path, mode)?;
 
@@ -91,7 +96,7 @@ pub fn compute_stats<P: AsRef<Path>>(path: P, mode: OpenMode) -> Result<DbStats,
 
     let mut stats = DbStats::default();
 
-    for result in handle.iter_by_inode() {
+    for result in handle.iter_by_path() {
         let entry = result?;
         stats.total_entries += 1;
 
@@ -117,8 +122,12 @@ pub fn compute_stats<P: AsRef<Path>>(path: P, mode: OpenMode) -> Result<DbStats,
 
 /// Compute file statistics grouped by extension.
 ///
+/// **Per-path semantics**: hardlinked files count once per name.
+/// Both the summary fast path and the iteration fallback below return
+/// identical numbers.
+///
 /// Fast path: project the summary CF's by_extension map.
-/// Slow path: full inode-CF iteration.
+/// Slow path: full path-CF iteration.
 pub fn stats_by_extension<P: AsRef<Path>>(
     path: P,
     top_n: usize,
@@ -145,7 +154,7 @@ pub fn stats_by_extension<P: AsRef<Path>>(
 
     let mut ext_map: HashMap<String, ExtensionStats> = HashMap::new();
 
-    for result in handle.iter_by_inode() {
+    for result in handle.iter_by_path() {
         let entry = result?;
 
         // Only count files
@@ -307,8 +316,12 @@ pub struct OwnerStats {
 
 /// Get file statistics by user ID.
 ///
+/// **Per-path semantics**: hardlinked files count once per name.
+/// Both the summary fast path and the iteration fallback return
+/// identical numbers.
+///
 /// Fast path: project the summary CF's by_uid map.
-/// Slow path: full inode-CF iteration.
+/// Slow path: full path-CF iteration.
 pub fn stats_by_uid<P: AsRef<Path>>(
     path: P,
     top_n: usize,
@@ -335,7 +348,7 @@ pub fn stats_by_uid<P: AsRef<Path>>(
 
     let mut uid_map: HashMap<u32, OwnerStats> = HashMap::new();
 
-    for result in handle.iter_by_inode() {
+    for result in handle.iter_by_path() {
         let entry = result?;
 
         let uid = entry.uid.unwrap_or(0);
@@ -364,8 +377,12 @@ pub fn stats_by_uid<P: AsRef<Path>>(
 
 /// Get file statistics by group ID.
 ///
+/// **Per-path semantics**: hardlinked files count once per name.
+/// Both the summary fast path and the iteration fallback return
+/// identical numbers.
+///
 /// Fast path: project the summary CF's by_gid map.
-/// Slow path: full inode-CF iteration.
+/// Slow path: full path-CF iteration.
 pub fn stats_by_gid<P: AsRef<Path>>(
     path: P,
     top_n: usize,
@@ -392,7 +409,7 @@ pub fn stats_by_gid<P: AsRef<Path>>(
 
     let mut gid_map: HashMap<u32, OwnerStats> = HashMap::new();
 
-    for result in handle.iter_by_inode() {
+    for result in handle.iter_by_path() {
         let entry = result?;
 
         let gid = entry.gid.unwrap_or(0);
@@ -499,8 +516,12 @@ pub struct FileTypeStats {
 /// Only considers files with file_type set (requires --file-type during scan).
 /// Files without a detected type are bucketed under "unknown".
 ///
+/// **Per-path semantics**: hardlinked files count once per name.
+/// Both the summary fast path and the iteration fallback return
+/// identical numbers.
+///
 /// Fast path: project the summary CF's by_file_type map.
-/// Slow path: full inode-CF iteration.
+/// Slow path: full path-CF iteration.
 pub fn stats_by_file_type<P: AsRef<Path>>(
     path: P,
     top_n: usize,
@@ -526,7 +547,7 @@ pub fn stats_by_file_type<P: AsRef<Path>>(
 
     let mut type_map: HashMap<String, FileTypeStats> = HashMap::new();
 
-    for result in handle.iter_by_inode() {
+    for result in handle.iter_by_path() {
         let entry = result?;
 
         // Only files
@@ -803,5 +824,76 @@ mod tests {
         let txt = by_ext.iter().find(|s| s.extension == "txt").unwrap();
         assert_eq!(txt.count, 3);
         assert_eq!(txt.total_bytes, 600);
+    }
+
+    /// Two directory entries pointing at the same inode -- a hardlink.
+    /// Both summary-hit and summary-miss must count the file twice
+    /// (once per name) for the totals to agree.
+    fn hardlink_entries() -> Vec<DbEntry> {
+        let template = DbEntry {
+            parent_path: Some("/".to_string()),
+            name: String::new(),
+            path: String::new(),
+            entry_type: EntryType::File,
+            size: 1000,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            mode: Some(0o644),
+            uid: Some(1000),
+            gid: Some(1000),
+            nlink: Some(2),
+            inode: 99, // shared
+            depth: 1,
+            extension: Some("bin".to_string()),
+            blocks: 2,
+            checksum: None,
+            file_type: None,
+        };
+        let primary = DbEntry {
+            name: "primary.bin".to_string(),
+            path: "/primary.bin".to_string(),
+            ..template.clone()
+        };
+        let alias = DbEntry {
+            name: "alias.bin".to_string(),
+            path: "/alias.bin".to_string(),
+            ..template
+        };
+        vec![primary, alias]
+    }
+
+    #[test]
+    fn hardlinks_count_per_path_in_both_summary_and_iteration() {
+        let entries = hardlink_entries();
+        let (_dir, db) = build_db(&entries);
+
+        // Iteration fallback (no summary keys flushed yet) must see
+        // both names and count them separately.
+        let from_iter = compute_stats(&db, OpenMode::Readonly).unwrap();
+        assert_eq!(from_iter.total_entries, 2);
+        assert_eq!(from_iter.total_files, 2);
+        assert_eq!(from_iter.total_bytes, 2000);
+
+        let ext_iter = stats_by_extension(&db, 100, OpenMode::Readonly).unwrap();
+        let bin = ext_iter.iter().find(|s| s.extension == "bin").unwrap();
+        assert_eq!(bin.count, 2);
+        assert_eq!(bin.total_bytes, 2000);
+
+        // Now flush a summary built from the same entries. The summary
+        // path must yield identical numbers.
+        let mut acc = SummaryAccumulator::new();
+        acc.update(&entries);
+        flush_summary(&db, &acc);
+
+        let from_summary = compute_stats(&db, OpenMode::Readonly).unwrap();
+        assert_eq!(from_summary.total_entries, from_iter.total_entries);
+        assert_eq!(from_summary.total_files, from_iter.total_files);
+        assert_eq!(from_summary.total_bytes, from_iter.total_bytes);
+
+        let ext_summary = stats_by_extension(&db, 100, OpenMode::Readonly).unwrap();
+        let bin_summary = ext_summary.iter().find(|s| s.extension == "bin").unwrap();
+        assert_eq!(bin_summary.count, bin.count);
+        assert_eq!(bin_summary.total_bytes, bin.total_bytes);
     }
 }
