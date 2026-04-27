@@ -244,6 +244,16 @@ pub enum Command {
         /// ZSTD compression level (1-22)
         #[arg(long, default_value = "3")]
         compression_level: i32,
+
+        /// Number of parallel shards. 1 selects the legacy single-threaded
+        /// path; values above 1 enable the SST-balanced parallel exporter.
+        /// Set to roughly num_cpus on many-core boxes; on a 160-core /
+        /// NVMe-backed RocksDB the useful range is 64-128 (NVMe saturates
+        /// past that). Bump `ulimit -n` first — RocksDB read-only mode
+        /// keeps every SST file open, and large databases may exceed the
+        /// default file-descriptor limit.
+        #[arg(long, default_value = "1", value_name = "N")]
+        parallelism: usize,
     },
 
     /// Export RocksDB scan to CSV files (auto-splits by row count)

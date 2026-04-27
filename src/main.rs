@@ -163,8 +163,8 @@ fn handle_command(cmd: &Command) -> Result<()> {
             run_convert(input, output, *progress)
         }
         #[cfg(feature = "parquet")]
-        Command::ExportParquet { input, output_dir, progress, file_size_mb, row_group_size, compression_level } => {
-            run_export_parquet(input, output_dir, *progress, *file_size_mb, *row_group_size, *compression_level)
+        Command::ExportParquet { input, output_dir, progress, file_size_mb, row_group_size, compression_level, parallelism } => {
+            run_export_parquet(input, output_dir, *progress, *file_size_mb, *row_group_size, *compression_level, *parallelism)
         }
         Command::Stats { db, by_extension, largest_files, largest_dirs, oldest_files, most_links, by_uid, by_gid, duplicates, by_file_type, hardlink_groups, min_size, top, live } => {
             run_stats(db, *by_extension, *largest_files, *largest_dirs, *oldest_files, *most_links, *by_uid, *by_gid, *duplicates, *by_file_type, *hardlink_groups, *min_size, *top, *live)
@@ -479,19 +479,12 @@ fn run_export_parquet(
     file_size_mb: usize,
     row_group_size: usize,
     compression_level: i32,
+    parallelism: usize,
 ) -> Result<()> {
-    use nfs_walker::parquet::{convert_rocks_to_parquet, ExportConfig};
-
     eprintln!("Exporting RocksDB to Parquet...");
-    eprintln!("  Input:      {}", input.display());
-    eprintln!("  Output dir: {}", output_dir.display());
-
-    let config = ExportConfig {
-        row_group_size,
-        target_file_size: file_size_mb * 1024 * 1024,
-        compression_level,
-        progress: show_progress,
-    };
+    eprintln!("  Input:       {}", input.display());
+    eprintln!("  Output dir:  {}", output_dir.display());
+    eprintln!("  Parallelism: {}", parallelism);
 
     let progress_reporter = if show_progress {
         let reporter = ProgressReporter::new();
@@ -501,18 +494,28 @@ fn run_export_parquet(
         None
     };
 
-    let callback: Option<Box<dyn Fn(u64, u64) + Send>> = if let Some(ref p) = progress_reporter {
-        let p_clone = p.clone();
-        Some(Box::new(move |exported, _total| {
-            let msg = format!("Exported {} entries", format_number(exported));
-            p_clone.set_status(&msg);
-        }))
+    let stats = if parallelism > 1 {
+        run_export_parquet_parallel(
+            input,
+            output_dir,
+            show_progress,
+            file_size_mb,
+            row_group_size,
+            compression_level,
+            parallelism,
+            progress_reporter.as_ref(),
+        )?
     } else {
-        None
+        run_export_parquet_serial(
+            input,
+            output_dir,
+            show_progress,
+            file_size_mb,
+            row_group_size,
+            compression_level,
+            progress_reporter.as_ref(),
+        )?
     };
-
-    let stats = convert_rocks_to_parquet(input, output_dir, config, callback)
-        .context("Parquet export failed")?;
 
     if let Some(ref p) = progress_reporter {
         p.finish("Export complete");
@@ -528,6 +531,75 @@ fn run_export_parquet(
     );
 
     Ok(())
+}
+
+#[cfg(feature = "parquet")]
+fn run_export_parquet_serial(
+    input: &std::path::Path,
+    output_dir: &std::path::Path,
+    show_progress: bool,
+    file_size_mb: usize,
+    row_group_size: usize,
+    compression_level: i32,
+    progress_reporter: Option<&ProgressReporter>,
+) -> Result<nfs_walker::parquet::ExportStats> {
+    use nfs_walker::parquet::{convert_rocks_to_parquet, ExportConfig};
+
+    let config = ExportConfig {
+        row_group_size,
+        target_file_size: file_size_mb * 1024 * 1024,
+        compression_level,
+        progress: show_progress,
+    };
+
+    let callback: Option<Box<dyn Fn(u64, u64) + Send>> =
+        progress_reporter.map(|p| {
+            let p_clone = p.clone();
+            Box::new(move |exported, _total| {
+                let msg = format!("Exported {} entries", format_number(exported));
+                p_clone.set_status(&msg);
+            }) as Box<dyn Fn(u64, u64) + Send>
+        });
+
+    convert_rocks_to_parquet(input, output_dir, config, callback)
+        .context("Parquet export failed")
+}
+
+#[cfg(feature = "parquet")]
+#[allow(clippy::too_many_arguments)]
+fn run_export_parquet_parallel(
+    input: &std::path::Path,
+    output_dir: &std::path::Path,
+    show_progress: bool,
+    file_size_mb: usize,
+    row_group_size: usize,
+    compression_level: i32,
+    parallelism: usize,
+    progress_reporter: Option<&ProgressReporter>,
+) -> Result<nfs_walker::parquet::ExportStats> {
+    use nfs_walker::parquet::{
+        parallel_convert_rocks_to_parquet, ParallelExportConfig, ParallelProgressCallback,
+    };
+    use std::sync::Arc;
+
+    let config = ParallelExportConfig {
+        parallelism,
+        row_group_size,
+        target_file_size: file_size_mb * 1024 * 1024,
+        compression_level,
+        progress: show_progress,
+    };
+
+    let callback: Option<ParallelProgressCallback> = progress_reporter.map(|p| {
+        let p_clone = p.clone();
+        Arc::new(move |exported: u64, _total: u64| {
+            let msg = format!("Exported {} entries", format_number(exported));
+            p_clone.set_status(&msg);
+        }) as ParallelProgressCallback
+    });
+
+    parallel_convert_rocks_to_parquet(input, output_dir, config, callback)
+        .context("Parallel Parquet export failed")
 }
 
 /// Run RocksDB to CSV export
