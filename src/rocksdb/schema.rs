@@ -29,6 +29,18 @@ pub const CF_ENTRIES_BY_PATH: &str = "entries_by_path";
 pub const CF_ENTRIES_BY_INODE: &str = "entries_by_inode";
 pub const CF_METADATA: &str = "metadata";
 pub const CF_BIG_DIRS: &str = "big_directories";
+/// Pre-computed summary aggregates flushed periodically by the writer
+/// thread. Optional -- legacy databases without this CF still open.
+pub const CF_SUMMARY: &str = "summary";
+
+/// All column families this binary knows about, in canonical order.
+const ALL_CF_NAMES: &[&str] = &[
+    CF_ENTRIES_BY_PATH,
+    CF_ENTRIES_BY_INODE,
+    CF_METADATA,
+    CF_BIG_DIRS,
+    CF_SUMMARY,
+];
 
 /// Metadata keys
 pub mod meta_keys {
@@ -208,6 +220,30 @@ fn metadata_cf_options() -> Options {
     opts
 }
 
+/// Column family options for the summary CF: a handful of small bincode
+/// blobs flushed periodically. Same shape as metadata.
+fn summary_cf_options() -> Options {
+    metadata_cf_options()
+}
+
+/// Enumerate the CFs that already exist in `path`, intersected with the
+/// set of names this binary knows about. Returns the legacy four CFs
+/// when the listing fails (e.g. brand-new DB) so the caller can still
+/// proceed.
+fn existing_known_cfs<P: AsRef<Path>>(path: P, opts: &Options) -> Vec<&'static str> {
+    let existing = match DB::list_cf(opts, path.as_ref()) {
+        Ok(names) => names,
+        Err(_) => {
+            return vec![CF_ENTRIES_BY_PATH, CF_ENTRIES_BY_INODE, CF_METADATA, CF_BIG_DIRS];
+        }
+    };
+    ALL_CF_NAMES
+        .iter()
+        .copied()
+        .filter(|cf| existing.iter().any(|e| e == cf))
+        .collect()
+}
+
 /// Database configuration for write-optimized scans
 pub fn get_db_options() -> Options {
     let mut opts = Options::default();
@@ -242,6 +278,7 @@ pub fn open_rocks_db<P: AsRef<Path>>(path: P) -> Result<DB, rocksdb::Error> {
         ColumnFamilyDescriptor::new(CF_ENTRIES_BY_INODE, entries_cf_options()),
         ColumnFamilyDescriptor::new(CF_METADATA, metadata_cf_options()),
         ColumnFamilyDescriptor::new(CF_BIG_DIRS, metadata_cf_options()),
+        ColumnFamilyDescriptor::new(CF_SUMMARY, summary_cf_options()),
     ];
 
     DB::open_cf_descriptors(&db_opts, path, cf_descriptors)
@@ -263,12 +300,15 @@ pub fn get_query_options() -> Options {
     opts
 }
 
-/// Open existing RocksDB database for reading
+/// Open existing RocksDB database for reading.
+///
+/// Uses `DB::list_cf` to discover the CFs actually present so old
+/// databases written before `CF_SUMMARY` was introduced still open
+/// cleanly -- the absent CF simply means stats functions fall back to
+/// full-scan iteration.
 pub fn open_rocks_db_readonly<P: AsRef<Path>>(path: P) -> Result<DB, rocksdb::Error> {
     let db_opts = get_query_options();
-
-    let cf_names = vec![CF_ENTRIES_BY_PATH, CF_ENTRIES_BY_INODE, CF_METADATA, CF_BIG_DIRS];
-
+    let cf_names = existing_known_cfs(&path, &db_opts);
     DB::open_cf_for_read_only(&db_opts, path, cf_names, false)
 }
 
@@ -283,9 +323,7 @@ pub fn open_rocks_db_secondary<P: AsRef<Path>>(
     secondary_path: P,
 ) -> Result<DB, rocksdb::Error> {
     let db_opts = get_query_options();
-
-    let cf_names = vec![CF_ENTRIES_BY_PATH, CF_ENTRIES_BY_INODE, CF_METADATA, CF_BIG_DIRS];
-
+    let cf_names = existing_known_cfs(&primary_path, &db_opts);
     DB::open_cf_as_secondary(&db_opts, primary_path, secondary_path, cf_names)
 }
 
@@ -370,6 +408,14 @@ impl RocksHandle {
         self.db
             .cf_handle(CF_BIG_DIRS)
             .expect("big_directories CF missing")
+    }
+
+    /// Get the summary column family if the DB was opened with it.
+    ///
+    /// Returns `None` for legacy databases that predate the summary CF;
+    /// callers should fall back to full-scan iteration in that case.
+    pub fn cf_summary(&self) -> Option<&ColumnFamily> {
+        self.db.cf_handle(CF_SUMMARY)
     }
 
     /// Set metadata value

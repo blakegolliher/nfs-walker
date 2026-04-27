@@ -21,6 +21,7 @@ pub mod convert;
 pub mod reader;
 pub mod schema;
 pub mod stats;
+pub mod summary;
 pub mod writer;
 
 pub use convert::{convert_rocks_to_sqlite, ConvertConfig, ConvertStats};

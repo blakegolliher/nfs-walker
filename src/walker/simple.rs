@@ -1224,6 +1224,7 @@ fn rocksdb_writer_loop(
     batch_size: usize,
 ) -> std::result::Result<RocksHandle, crate::error::RocksError> {
     use crate::error::RocksError;
+    use crate::rocksdb::summary::SummaryAccumulator;
 
     use rocksdb::WriteOptions;
 
@@ -1232,10 +1233,16 @@ fn rocksdb_writer_loop(
     let mut total_written = 0u64;
     let mut pending: Vec<DbEntry> = Vec::with_capacity(batch_size * 2);
     let mut entries_since_flush = 0u64;
+    let mut writes_since_summary_flush = 0u32;
+    let mut summary = SummaryAccumulator::new();
 
     // Flush every 1M entries to limit memory usage
     // This prevents unbounded memtable growth for large scans
     const FLUSH_INTERVAL: u64 = 1_000_000;
+    // Flush summary CF after this many write_rocks_batch calls. The
+    // accumulator update itself is cheap; this just bounds how stale the
+    // summary CF can be on disk relative to the in-memory totals.
+    const SUMMARY_FLUSH_EVERY_N_WRITES: u32 = 100;
 
     // Write options with WAL disabled for speed
     let mut write_opts = WriteOptions::default();
@@ -1248,9 +1255,21 @@ fn rocksdb_writer_loop(
         // Write when we have enough
         if pending.len() >= batch_size {
             write_rocks_batch(&handle, &pending, &write_opts)?;
+            summary.update(&pending);
             total_written += pending.len() as u64;
             entries_since_flush += pending.len() as u64;
+            writes_since_summary_flush += 1;
             pending.clear();
+
+            // Memtable summary flush -- cheap, no db.flush() so it stays
+            // in memtable until the next periodic FLUSH_INTERVAL pushes
+            // everything to SST (which is what makes it visible to
+            // RocksDB secondary readers under --live).
+            if writes_since_summary_flush >= SUMMARY_FLUSH_EVERY_N_WRITES {
+                summary.touch_now();
+                flush_summary_to_cf(&handle, &summary, &write_opts)?;
+                writes_since_summary_flush = 0;
+            }
 
             // Periodic flush to limit memory usage
             if entries_since_flush >= FLUSH_INTERVAL {
@@ -1264,14 +1283,53 @@ fn rocksdb_writer_loop(
     // Write remaining entries
     if !pending.is_empty() {
         write_rocks_batch(&handle, &pending, &write_opts)?;
+        summary.update(&pending);
         total_written += pending.len() as u64;
     }
 
-    // Final flush
+    // Final summary flush + db.flush so secondary readers see the
+    // committed totals after a clean shutdown.
+    summary.touch_now();
+    flush_summary_to_cf(&handle, &summary, &write_opts)?;
     handle.db.flush().map_err(RocksError::Rocks)?;
 
-    debug!("RocksDB writer thread finished, wrote {} entries", total_written);
+    debug!(
+        "RocksDB writer thread finished, wrote {} entries (summary: {} files, {} dirs)",
+        total_written, summary.total.total_files, summary.total.total_dirs
+    );
     Ok(handle)
+}
+
+/// Serialize the in-memory accumulator into the five summary keys and
+/// flush them via a single WAL-disabled WriteBatch.
+#[cfg(feature = "rocksdb")]
+fn flush_summary_to_cf(
+    handle: &RocksHandle,
+    summary: &crate::rocksdb::summary::SummaryAccumulator,
+    write_opts: &rocksdb::WriteOptions,
+) -> std::result::Result<(), crate::error::RocksError> {
+    use crate::error::RocksError;
+    use rocksdb::WriteBatch;
+
+    let cf = match handle.cf_summary() {
+        Some(cf) => cf,
+        // Should not happen for DBs created by this binary. If a primary
+        // somehow opens a legacy DB without the CF, just skip flushing.
+        None => return Ok(()),
+    };
+
+    let kv = summary
+        .serialize_kv()
+        .map_err(|e| RocksError::Bincode(e.to_string()))?;
+
+    let mut batch = WriteBatch::default();
+    for (k, v) in kv {
+        batch.put_cf(cf, k, &v);
+    }
+    handle
+        .db
+        .write_opt(batch, write_opts)
+        .map_err(RocksError::Rocks)
 }
 
 /// Write a batch of entries to RocksDB

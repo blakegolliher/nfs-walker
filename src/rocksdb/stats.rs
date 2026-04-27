@@ -4,8 +4,26 @@
 
 use crate::error::RocksError;
 use crate::rocksdb::schema::{default_secondary_path, OpenMode, RocksHandle};
+use crate::rocksdb::summary::SummaryReader;
 use std::collections::HashMap;
 use std::path::Path;
+use tracing::debug;
+
+/// Try to load the per-DB summary snapshot. Returns `Ok(None)` for legacy
+/// DBs without the summary CF and for DBs whose writer never finished a
+/// flush (callers fall back to iteration in either case).
+fn try_load_summary(handle: &RocksHandle) -> Result<Option<SummaryReader>, RocksError> {
+    SummaryReader::try_load(handle)
+}
+
+/// Logged once per stats function when the summary CF is missing.
+fn note_summary_fallback(fn_name: &str) {
+    debug!(
+        "{}: summary CF not available, falling back to full-scan iteration \
+         (this may take a while on large databases)",
+        fn_name
+    );
+}
 
 /// Open a query handle in the requested mode. In secondary mode, prepares
 /// the secondary state dir and replays the latest MANIFEST/WAL state from
@@ -51,9 +69,26 @@ pub struct DbStats {
     pub max_depth: u32,
 }
 
-/// Compute statistics from a RocksDB database
+/// Compute statistics from a RocksDB database.
+///
+/// Fast path: returns instantly from the summary CF if present.
+/// Slow path: full inode-CF iteration (legacy DBs without summary).
 pub fn compute_stats<P: AsRef<Path>>(path: P, mode: OpenMode) -> Result<DbStats, RocksError> {
     let handle = open_query_handle(path, mode)?;
+
+    if let Some(s) = try_load_summary(&handle)? {
+        return Ok(DbStats {
+            total_entries: s.total.total_entries,
+            total_files: s.total.total_files,
+            total_dirs: s.total.total_dirs,
+            total_symlinks: s.total.total_symlinks,
+            total_bytes: s.total.total_bytes,
+            total_blocks: s.total.total_blocks,
+            max_depth: s.total.max_depth,
+        });
+    }
+    note_summary_fallback("compute_stats");
+
     let mut stats = DbStats::default();
 
     for result in handle.iter_by_inode() {
@@ -80,13 +115,34 @@ pub fn compute_stats<P: AsRef<Path>>(path: P, mode: OpenMode) -> Result<DbStats,
     Ok(stats)
 }
 
-/// Compute file statistics grouped by extension
+/// Compute file statistics grouped by extension.
+///
+/// Fast path: project the summary CF's by_extension map.
+/// Slow path: full inode-CF iteration.
 pub fn stats_by_extension<P: AsRef<Path>>(
     path: P,
     top_n: usize,
     mode: OpenMode,
 ) -> Result<Vec<ExtensionStats>, RocksError> {
     let handle = open_query_handle(path, mode)?;
+
+    if let Some(s) = try_load_summary(&handle)? {
+        let mut results: Vec<ExtensionStats> = s
+            .by_extension
+            .into_iter()
+            .map(|(ext, c)| ExtensionStats {
+                extension: ext,
+                count: c.count,
+                total_bytes: c.bytes,
+                total_blocks: c.blocks,
+            })
+            .collect();
+        results.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+        results.truncate(top_n);
+        return Ok(results);
+    }
+    note_summary_fallback("stats_by_extension");
+
     let mut ext_map: HashMap<String, ExtensionStats> = HashMap::new();
 
     for result in handle.iter_by_inode() {
@@ -249,13 +305,34 @@ pub struct OwnerStats {
     pub total_bytes: u64,
 }
 
-/// Get file statistics by user ID
+/// Get file statistics by user ID.
+///
+/// Fast path: project the summary CF's by_uid map.
+/// Slow path: full inode-CF iteration.
 pub fn stats_by_uid<P: AsRef<Path>>(
     path: P,
     top_n: usize,
     mode: OpenMode,
 ) -> Result<Vec<OwnerStats>, RocksError> {
     let handle = open_query_handle(path, mode)?;
+
+    if let Some(s) = try_load_summary(&handle)? {
+        let mut results: Vec<OwnerStats> = s
+            .by_uid
+            .into_iter()
+            .map(|(uid, c)| OwnerStats {
+                id: uid,
+                file_count: c.file_count,
+                dir_count: c.dir_count,
+                total_bytes: c.bytes,
+            })
+            .collect();
+        results.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+        results.truncate(top_n);
+        return Ok(results);
+    }
+    note_summary_fallback("stats_by_uid");
+
     let mut uid_map: HashMap<u32, OwnerStats> = HashMap::new();
 
     for result in handle.iter_by_inode() {
@@ -285,13 +362,34 @@ pub fn stats_by_uid<P: AsRef<Path>>(
     Ok(results)
 }
 
-/// Get file statistics by group ID
+/// Get file statistics by group ID.
+///
+/// Fast path: project the summary CF's by_gid map.
+/// Slow path: full inode-CF iteration.
 pub fn stats_by_gid<P: AsRef<Path>>(
     path: P,
     top_n: usize,
     mode: OpenMode,
 ) -> Result<Vec<OwnerStats>, RocksError> {
     let handle = open_query_handle(path, mode)?;
+
+    if let Some(s) = try_load_summary(&handle)? {
+        let mut results: Vec<OwnerStats> = s
+            .by_gid
+            .into_iter()
+            .map(|(gid, c)| OwnerStats {
+                id: gid,
+                file_count: c.file_count,
+                dir_count: c.dir_count,
+                total_bytes: c.bytes,
+            })
+            .collect();
+        results.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+        results.truncate(top_n);
+        return Ok(results);
+    }
+    note_summary_fallback("stats_by_gid");
+
     let mut gid_map: HashMap<u32, OwnerStats> = HashMap::new();
 
     for result in handle.iter_by_inode() {
@@ -396,15 +494,36 @@ pub struct FileTypeStats {
     pub total_bytes: u64,
 }
 
-/// Compute file statistics grouped by detected MIME type
+/// Compute file statistics grouped by detected MIME type.
 ///
 /// Only considers files with file_type set (requires --file-type during scan).
+/// Files without a detected type are bucketed under "unknown".
+///
+/// Fast path: project the summary CF's by_file_type map.
+/// Slow path: full inode-CF iteration.
 pub fn stats_by_file_type<P: AsRef<Path>>(
     path: P,
     top_n: usize,
     mode: OpenMode,
 ) -> Result<Vec<FileTypeStats>, RocksError> {
     let handle = open_query_handle(path, mode)?;
+
+    if let Some(s) = try_load_summary(&handle)? {
+        let mut results: Vec<FileTypeStats> = s
+            .by_file_type
+            .into_iter()
+            .map(|(ft, c)| FileTypeStats {
+                mime_type: ft,
+                count: c.count,
+                total_bytes: c.bytes,
+            })
+            .collect();
+        results.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+        results.truncate(top_n);
+        return Ok(results);
+    }
+    note_summary_fallback("stats_by_file_type");
+
     let mut type_map: HashMap<String, FileTypeStats> = HashMap::new();
 
     for result in handle.iter_by_inode() {
@@ -497,4 +616,192 @@ pub fn find_hardlink_groups<P: AsRef<Path>>(
     results.truncate(top_n);
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nfs::types::{DbEntry, EntryType};
+    use crate::rocksdb::schema::{RocksEntry, CF_SUMMARY};
+    use crate::rocksdb::summary::SummaryAccumulator;
+    use rocksdb::WriteBatch;
+    use tempfile::tempdir;
+
+    /// Build a small mixed batch of entries -- 3 files with txt extension
+    /// from uid 1000, 2 binaries from uid 2000, 2 dirs.
+    fn sample_entries() -> Vec<DbEntry> {
+        let mk_file = |path: &str, size: u64, ext: &str, uid: u32, ft: Option<&str>| DbEntry {
+            parent_path: Some("/".to_string()),
+            name: path.trim_start_matches('/').to_string(),
+            path: path.to_string(),
+            entry_type: EntryType::File,
+            size,
+            mtime: Some(1700000000),
+            atime: None,
+            ctime: None,
+            mode: Some(0o644),
+            uid: Some(uid),
+            gid: Some(uid),
+            nlink: Some(1),
+            inode: path.bytes().fold(1u64, |a, b| a.wrapping_add(b as u64)),
+            depth: 1,
+            extension: Some(ext.to_string()),
+            blocks: size.div_ceil(512),
+            checksum: None,
+            file_type: ft.map(String::from),
+        };
+        let mk_dir = |path: &str, depth: u32, uid: u32| DbEntry {
+            parent_path: Some("/".to_string()),
+            name: path.trim_start_matches('/').to_string(),
+            path: path.to_string(),
+            entry_type: EntryType::Directory,
+            size: 4096,
+            mtime: None,
+            atime: None,
+            ctime: None,
+            mode: Some(0o755),
+            uid: Some(uid),
+            gid: Some(uid),
+            nlink: Some(2),
+            inode: path.bytes().fold(2u64, |a, b| a.wrapping_add(b as u64)),
+            depth,
+            extension: None,
+            blocks: 8,
+            checksum: None,
+            file_type: None,
+        };
+        vec![
+            mk_file("/a.txt", 100, "txt", 1000, Some("text/plain")),
+            mk_file("/b.txt", 200, "txt", 1000, Some("text/plain")),
+            mk_file("/c.txt", 300, "txt", 1000, None),
+            mk_file("/d.bin", 400, "bin", 2000, None),
+            mk_file("/e.bin", 500, "bin", 2000, None),
+            mk_dir("/sub", 1, 1000),
+            mk_dir("/sub/deep", 2, 1000),
+        ]
+    }
+
+    /// Open a fresh DB, write entries directly via put_entry, return handle.
+    /// Importantly does NOT flush the summary CF -- that lets us exercise
+    /// the iteration fallback first.
+    fn build_db(entries: &[DbEntry]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.rocks");
+        {
+            let handle = RocksHandle::open(&db_path).unwrap();
+            for entry in entries {
+                let rocks_entry = RocksEntry::from_db_entry(entry);
+                handle.put_entry(&rocks_entry).unwrap();
+            }
+            handle.db.flush().unwrap();
+        }
+        (dir, db_path)
+    }
+
+    /// Manually flush a SummaryAccumulator to the DB so subsequent stats
+    /// calls take the summary-CF fast path.
+    fn flush_summary(db_path: &std::path::Path, summary: &SummaryAccumulator) {
+        let handle = RocksHandle::open(db_path).unwrap();
+        let cf = handle.db.cf_handle(CF_SUMMARY).expect("summary CF missing");
+        let mut batch = WriteBatch::default();
+        for (k, v) in summary.serialize_kv().unwrap() {
+            batch.put_cf(cf, k, &v);
+        }
+        handle.db.write(batch).unwrap();
+        handle.db.flush().unwrap();
+    }
+
+    #[test]
+    fn compute_stats_matches_between_summary_and_iteration() {
+        let entries = sample_entries();
+        let (_dir, db) = build_db(&entries);
+
+        // Fallback path (no summary keys yet).
+        let from_iter = compute_stats(&db, OpenMode::Readonly).unwrap();
+        assert_eq!(from_iter.total_entries, 7);
+        assert_eq!(from_iter.total_files, 5);
+        assert_eq!(from_iter.total_dirs, 2);
+        assert_eq!(from_iter.total_bytes, 100 + 200 + 300 + 400 + 500);
+
+        // Summary path.
+        let mut acc = SummaryAccumulator::new();
+        acc.update(&entries);
+        flush_summary(&db, &acc);
+
+        let from_summary = compute_stats(&db, OpenMode::Readonly).unwrap();
+        assert_eq!(from_summary.total_entries, from_iter.total_entries);
+        assert_eq!(from_summary.total_files, from_iter.total_files);
+        assert_eq!(from_summary.total_dirs, from_iter.total_dirs);
+        assert_eq!(from_summary.total_bytes, from_iter.total_bytes);
+        assert_eq!(from_summary.max_depth, from_iter.max_depth);
+    }
+
+    #[test]
+    fn stats_by_extension_summary_matches_iteration() {
+        let entries = sample_entries();
+        let (_dir, db) = build_db(&entries);
+
+        let from_iter = stats_by_extension(&db, 100, OpenMode::Readonly).unwrap();
+
+        let mut acc = SummaryAccumulator::new();
+        acc.update(&entries);
+        flush_summary(&db, &acc);
+
+        let from_summary = stats_by_extension(&db, 100, OpenMode::Readonly).unwrap();
+
+        // Compare as sorted (extension, count, bytes, blocks) tuples.
+        let to_tuples = |v: Vec<ExtensionStats>| {
+            let mut t: Vec<_> = v
+                .into_iter()
+                .map(|s| (s.extension, s.count, s.total_bytes, s.total_blocks))
+                .collect();
+            t.sort();
+            t
+        };
+        assert_eq!(to_tuples(from_iter), to_tuples(from_summary));
+    }
+
+    #[test]
+    fn stats_by_uid_summary_matches_iteration() {
+        let entries = sample_entries();
+        let (_dir, db) = build_db(&entries);
+
+        let from_iter = stats_by_uid(&db, 100, OpenMode::Readonly).unwrap();
+
+        let mut acc = SummaryAccumulator::new();
+        acc.update(&entries);
+        flush_summary(&db, &acc);
+
+        let from_summary = stats_by_uid(&db, 100, OpenMode::Readonly).unwrap();
+
+        let to_tuples = |v: Vec<OwnerStats>| {
+            let mut t: Vec<_> = v
+                .into_iter()
+                .map(|s| (s.id, s.file_count, s.dir_count, s.total_bytes))
+                .collect();
+            t.sort();
+            t
+        };
+        assert_eq!(to_tuples(from_iter), to_tuples(from_summary));
+    }
+
+    #[test]
+    fn legacy_db_without_summary_cf_still_opens_and_falls_back() {
+        // Build a DB the new-binary way then drop CF_SUMMARY by removing
+        // the underlying CF. RocksDB doesn't have a clean drop API on a
+        // closed handle, so simulate by writing entries and never
+        // flushing summary keys. SummaryReader::try_load returns None
+        // when KEY_TOTAL is absent, so the iteration fallback executes.
+        let entries = sample_entries();
+        let (_dir, db) = build_db(&entries);
+
+        let stats = compute_stats(&db, OpenMode::Readonly).unwrap();
+        assert_eq!(stats.total_entries, 7);
+        assert_eq!(stats.total_files, 5);
+
+        let by_ext = stats_by_extension(&db, 100, OpenMode::Readonly).unwrap();
+        let txt = by_ext.iter().find(|s| s.extension == "txt").unwrap();
+        assert_eq!(txt.count, 3);
+        assert_eq!(txt.total_bytes, 600);
+    }
 }
