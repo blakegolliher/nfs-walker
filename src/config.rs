@@ -121,8 +121,13 @@ pub struct CliArgs {
     #[arg(long, default_value = "10000", value_name = "NUM")]
     pub queue_size: usize,
 
-    /// SQLite batch insert size
-    #[arg(short = 'b', long, default_value = "1000", value_name = "NUM")]
+    /// Batch size sent from each worker to the writer thread. Larger
+    /// batches mean fewer cross-thread sends and bigger RocksDB
+    /// WriteBatch transactions, which reduces contention from
+    /// ≥hundreds of producers. 5000 is a good default for billion-entry
+    /// scans on multi-core hosts; drop to 1000 for tiny exports or
+    /// low-memory environments.
+    #[arg(short = 'b', long, default_value = "5000", value_name = "NUM")]
     pub batch_size: usize,
 
     /// Maximum directory depth (unlimited if not set)
