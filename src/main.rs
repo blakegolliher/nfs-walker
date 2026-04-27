@@ -678,13 +678,20 @@ fn run_simple_walker(config: WalkConfig) -> Result<WalkStats> {
         walker.run_with_progress(move |prog| {
             let bytes_str = format_size(prog.bytes, BINARY);
             let entries = prog.dirs + prog.files;
+            let elapsed_secs = prog.elapsed.as_secs_f64();
+            let rate = if elapsed_secs > 0.0 {
+                entries as f64 / elapsed_secs
+            } else {
+                0.0
+            };
             let msg = format!(
-                "Dirs: {} | Files: {} | Entries: {} | Size: {} | {}",
+                "Dirs: {} | Files: {} | Entries: {} | Size: {} | {} | {:.0} entries/s",
                 format_number(prog.dirs),
                 format_number(prog.files),
                 format_number(entries),
                 bytes_str,
                 format_elapsed(prog.elapsed),
+                rate,
             );
             p_clone.set_status(&msg);
         })
