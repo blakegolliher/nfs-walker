@@ -653,6 +653,21 @@ impl SimpleWalker {
 
     /// Run worker threads (shared between SQLite and RocksDB modes)
     fn run_workers(&self, entry_tx: Sender<Vec<DbEntry>>) -> Result<()> {
+        // Pipelined mode currently does not support per-file content
+        // analysis (checksum / file-type detection). Warn loudly if the
+        // combination is requested; the pipelined worker silently skips
+        // those reads.
+        if self.config.pipeline_depth > 0
+            && (self.config.compute_checksum || self.config.detect_file_type)
+        {
+            warn!(
+                "--pipeline-depth {} ignores --checksum and --file-type; \
+                 content analysis is not yet wired into the pipelined worker. \
+                 Drop --pipeline-depth (or set it to 0) for full content metadata.",
+                self.config.pipeline_depth
+            );
+        }
+
         // Work-stealing deque for directories
         let injector: Arc<Injector<DirWork>> = Arc::new(Injector::new());
 
@@ -717,32 +732,55 @@ impl SimpleWalker {
             let compute_checksum = self.config.compute_checksum;
             let detect_file_type = self.config.detect_file_type;
             let max_checksum_size = self.config.max_checksum_size;
+            let pipeline_depth = self.config.pipeline_depth;
 
             let handle = thread::Builder::new()
                 .name(format!("walker-{}", id))
                 .spawn(move || {
-                    worker_loop(
-                        id,
-                        nfs,
-                        local,
-                        injector,
-                        stealers,
-                        entry_tx,
-                        shutdown,
-                        dirs_count,
-                        files_count,
-                        bytes_count,
-                        errors_count,
-                        active_workers,
-                        pending_work,
-                        max_depth,
-                        dirs_only,
-                        worker_count,
-                        batch_size,
-                        compute_checksum,
-                        detect_file_type,
-                        max_checksum_size,
-                    );
+                    if pipeline_depth > 0 {
+                        worker_loop_pipelined(
+                            id,
+                            nfs,
+                            local,
+                            injector,
+                            stealers,
+                            entry_tx,
+                            shutdown,
+                            dirs_count,
+                            files_count,
+                            bytes_count,
+                            errors_count,
+                            active_workers,
+                            pending_work,
+                            max_depth,
+                            dirs_only,
+                            batch_size,
+                            pipeline_depth,
+                        );
+                    } else {
+                        worker_loop(
+                            id,
+                            nfs,
+                            local,
+                            injector,
+                            stealers,
+                            entry_tx,
+                            shutdown,
+                            dirs_count,
+                            files_count,
+                            bytes_count,
+                            errors_count,
+                            active_workers,
+                            pending_work,
+                            max_depth,
+                            dirs_only,
+                            worker_count,
+                            batch_size,
+                            compute_checksum,
+                            detect_file_type,
+                            max_checksum_size,
+                        );
+                    }
                 })
                 .expect("Failed to spawn worker thread");
 
@@ -1264,6 +1302,428 @@ fn worker_loop(
     }
 
     debug!("Worker {} finished", id);
+}
+
+// ============================================================
+// Pipelined worker loop
+// ============================================================
+//
+// Selected when `--pipeline-depth N > 0`. Holds up to N READDIRPLUS
+// RPCs in flight on this worker's single libnfs context, demuxing
+// completions as they arrive. See `docs/PIPELINED_READDIRPLUS_DESIGN.md`.
+//
+// The legacy `worker_loop` above must remain bit-for-bit identical to
+// its pre-pipelining behavior — content-analysis, error logging, and
+// counter ordering all live there. The pipelined worker duplicates the
+// entry-emission logic inline rather than refactoring the legacy
+// closure (intentional duplication; revisit once pipelining is the
+// default).
+
+/// Per-slot state tracked alongside an in-flight READDIRPLUS.
+struct DirState {
+    /// The original work item (path, depth). `work.file_handle` is
+    /// informational; the authoritative handle lives in `file_handle`.
+    work: DirWork,
+    /// The directory file handle used for every submit in this dir
+    /// (set on first submit, reused for cookie-chain re-submits).
+    file_handle: Vec<u8>,
+    cookie: u64,
+    cookieverf: [i8; 8],
+}
+
+/// Try to grab a work item from local / injector / stealers (mirrors
+/// the legacy worker's lookup logic).
+fn try_get_work(
+    local: &DequeWorker<DirWork>,
+    injector: &Injector<DirWork>,
+    stealers: &[Stealer<DirWork>],
+    self_id: usize,
+) -> Option<DirWork> {
+    if let Some(w) = local.pop() {
+        return Some(w);
+    }
+    loop {
+        match injector.steal() {
+            crossbeam_deque::Steal::Success(w) => return Some(w),
+            crossbeam_deque::Steal::Empty => break,
+            crossbeam_deque::Steal::Retry => continue,
+        }
+    }
+    for (i, stealer) in stealers.iter().enumerate() {
+        if i == self_id {
+            continue;
+        }
+        loop {
+            match stealer.steal() {
+                crossbeam_deque::Steal::Success(w) => return Some(w),
+                crossbeam_deque::Steal::Empty => break,
+                crossbeam_deque::Steal::Retry => continue,
+            }
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn worker_loop_pipelined(
+    id: usize,
+    nfs: crate::nfs::NfsConnection,
+    local: DequeWorker<DirWork>,
+    injector: Arc<Injector<DirWork>>,
+    stealers: Arc<Vec<Stealer<DirWork>>>,
+    entry_tx: Sender<Vec<DbEntry>>,
+    shutdown: Arc<AtomicBool>,
+    dirs_count: Arc<AtomicU64>,
+    files_count: Arc<AtomicU64>,
+    bytes_count: Arc<AtomicU64>,
+    errors_count: Arc<AtomicU64>,
+    active_workers: Arc<AtomicUsize>,
+    pending_work: Arc<AtomicU64>,
+    max_depth: Option<usize>,
+    dirs_only: bool,
+    batch_size: usize,
+    pipeline_depth: usize,
+) {
+    debug!("Worker {} (pipelined depth={}) started", id, pipeline_depth);
+
+    // Window the libnfs poll relatively tightly so a worker holding a
+    // few slow in-flight slots can still return promptly to refill
+    // empty slots from its deque or notice shutdown.
+    const POLL_STEP_MS: i32 = 10;
+
+    let mut slots: Vec<crate::nfs::connection::InflightReaddir> =
+        Vec::with_capacity(pipeline_depth);
+    let mut states: Vec<DirState> = Vec::with_capacity(pipeline_depth);
+    let mut batch: Vec<DbEntry> = Vec::with_capacity(batch_size);
+    let mut next_tag: u64 = (id as u64) << 48;
+    // Local active-flag mirrors the legacy active_workers semantics:
+    // counts as "active" while this worker holds at least one in-flight
+    // slot. Used for the (pending_work==0 && active_workers==0)
+    // termination check.
+    let mut active_flag = false;
+
+    'outer: loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // -------- 1. Refill empty slots. --------
+        while slots.len() < pipeline_depth {
+            let Some(work) = try_get_work(&local, &injector, &stealers, id) else {
+                break;
+            };
+
+            // Honor max_depth identically to the legacy worker.
+            if let Some(max) = max_depth {
+                if work.depth > max as u32 {
+                    pending_work.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+            }
+
+            // Resolve fh: cached if present (steady state), else
+            // synchronous LOOKUP chain (root dir, or externally
+            // injected dirs without a cached fh).
+            let fh = match work.file_handle.clone() {
+                Some(fh) => fh,
+                None => match nfs.resolve_path_to_fh(&work.path) {
+                    Ok(fh) => fh,
+                    Err(e) => {
+                        errors_count.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "Worker {} pipelined LOOKUP failed: {} -> {}",
+                            id, work.path, e
+                        );
+                        pending_work.fetch_sub(1, Ordering::SeqCst);
+                        continue;
+                    }
+                },
+            };
+
+            let tag = next_tag;
+            next_tag = next_tag.wrapping_add(1);
+
+            match nfs.submit_readdirplus_by_fh(&fh, 0, [0i8; 8], tag) {
+                Ok(slot) => {
+                    debug!(
+                        "Worker {} pipelined submit: tag={:#x} {} (depth={})",
+                        id, tag, work.path, work.depth
+                    );
+                    slots.push(slot);
+                    states.push(DirState {
+                        work,
+                        file_handle: fh,
+                        cookie: 0,
+                        cookieverf: [0i8; 8],
+                    });
+                }
+                Err(e) => {
+                    errors_count.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Worker {} pipelined submit failed: {} -> {}",
+                        id, work.path, e
+                    );
+                    pending_work.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        // Update active-worker bookkeeping based on slot occupancy.
+        let now_active = !slots.is_empty();
+        if now_active && !active_flag {
+            active_workers.fetch_add(1, Ordering::Relaxed);
+            active_flag = true;
+        } else if !now_active && active_flag {
+            active_workers.fetch_sub(1, Ordering::Relaxed);
+            active_flag = false;
+        }
+
+        if slots.is_empty() {
+            // Idle. Apply the legacy termination check: if no work is
+            // pending anywhere and no other worker is active, exit.
+            if pending_work.load(Ordering::SeqCst) == 0
+                && active_workers.load(Ordering::SeqCst) == 0
+            {
+                break;
+            }
+            thread::sleep(Duration::from_micros(100));
+            continue;
+        }
+
+        // -------- 2. Drive RPCs. --------
+        // Block up to ~50 ms for at least one completion. Returning
+        // early on timeout lets us refill from new work and re-check
+        // shutdown.
+        let pump_result = nfs.pump(&slots, 1, POLL_STEP_MS * 5);
+        match pump_result {
+            Ok(0) => {
+                // Timeout, no progress. Loop back to refill / shutdown check.
+                continue;
+            }
+            Ok(_) => { /* fall through to drain */ }
+            Err(e) => {
+                // fd-level error: fail every in-flight slot and abandon
+                // this worker. The connection is likely unrecoverable.
+                error!(
+                    "Worker {} pipelined pump failed: {} (dropping {} in-flight slots)",
+                    id, e, slots.len()
+                );
+                let n = slots.len() as u64;
+                errors_count.fetch_add(n, Ordering::Relaxed);
+                pending_work.fetch_sub(n, Ordering::SeqCst);
+                slots.clear();
+                states.clear();
+                if active_flag {
+                    active_workers.fetch_sub(1, Ordering::Relaxed);
+                    active_flag = false;
+                }
+                break 'outer;
+            }
+        }
+
+        // -------- 3. Drain completed slots (reverse iter for swap_remove). --------
+        let mut i = slots.len();
+        while i > 0 {
+            i -= 1;
+            if !slots[i].is_completed() {
+                continue;
+            }
+
+            let mut slot = slots.swap_remove(i);
+            let mut state = states.swap_remove(i);
+            let result = slot.take_result();
+            // Drop slot before potentially submitting the next page so
+            // libnfs's internal PDU bookkeeping for this completed PDU
+            // is released first.
+            drop(slot);
+
+            // Successful response (matches legacy: status SUCCESS path).
+            if result.status == ffi_rpc_status_success() {
+                let mut subdir_count = 0usize;
+                let mut chunk_file_count = 0u64;
+                let mut chunk_byte_count = 0u64;
+                let mut channel_broken = false;
+
+                for nfs_entry in result.entries {
+                    if nfs_entry.name == "." || nfs_entry.name == ".." {
+                        continue;
+                    }
+
+                    let full_path = if state.work.path == "/" {
+                        format!("/{}", nfs_entry.name)
+                    } else {
+                        format!("{}/{}", state.work.path, nfs_entry.name)
+                    };
+
+                    let is_dir = nfs_entry.entry_type == EntryType::Directory;
+
+                    if dirs_only && !is_dir {
+                        continue;
+                    }
+
+                    let extension = if nfs_entry.entry_type == EntryType::File {
+                        nfs_entry
+                            .name
+                            .rsplit('.')
+                            .next()
+                            .filter(|ext| ext.len() < 10 && !ext.contains('/'))
+                            .map(|s| s.to_lowercase())
+                    } else {
+                        None
+                    };
+
+                    let db_entry = DbEntry {
+                        parent_path: Some(state.work.path.clone()),
+                        name: nfs_entry.name.clone(),
+                        path: full_path.clone(),
+                        entry_type: nfs_entry.entry_type,
+                        size: nfs_entry.size(),
+                        mtime: nfs_entry.mtime(),
+                        atime: nfs_entry.atime(),
+                        ctime: nfs_entry.ctime(),
+                        mode: nfs_entry.mode(),
+                        uid: nfs_entry.uid(),
+                        gid: nfs_entry.gid(),
+                        nlink: nfs_entry.nlink(),
+                        inode: nfs_entry.inode,
+                        depth: state.work.depth + 1,
+                        extension,
+                        blocks: nfs_entry.blocks(),
+                        // Pipelined mode does not (yet) compute these.
+                        checksum: None,
+                        file_type: None,
+                    };
+
+                    batch.push(db_entry);
+
+                    if is_dir {
+                        subdir_count += 1;
+                        pending_work.fetch_add(1, Ordering::SeqCst);
+                        local.push(DirWork {
+                            path: full_path,
+                            depth: state.work.depth + 1,
+                            file_handle: nfs_entry.file_handle.clone(),
+                        });
+                    } else {
+                        chunk_file_count += 1;
+                        chunk_byte_count += nfs_entry.size();
+                    }
+
+                    if batch.len() >= batch_size {
+                        if entry_tx
+                            .send(std::mem::replace(
+                                &mut batch,
+                                Vec::with_capacity(batch_size),
+                            ))
+                            .is_err()
+                        {
+                            channel_broken = true;
+                            break;
+                        }
+                        files_count.fetch_add(chunk_file_count, Ordering::Relaxed);
+                        bytes_count.fetch_add(chunk_byte_count, Ordering::Relaxed);
+                        chunk_file_count = 0;
+                        chunk_byte_count = 0;
+                    }
+                }
+
+                files_count.fetch_add(chunk_file_count, Ordering::Relaxed);
+                bytes_count.fetch_add(chunk_byte_count, Ordering::Relaxed);
+
+                if channel_broken {
+                    // Writer is gone; we're shutting down. Drop the
+                    // remaining slots and exit.
+                    debug!("Worker {} entry channel broken, exiting", id);
+                    let n_remaining = slots.len() as u64;
+                    pending_work.fetch_sub(n_remaining + 1, Ordering::SeqCst);
+                    slots.clear();
+                    states.clear();
+                    if active_flag {
+                        active_workers.fetch_sub(1, Ordering::Relaxed);
+                        active_flag = false;
+                    }
+                    break 'outer;
+                }
+
+                if result.eof {
+                    debug!(
+                        "Worker {} pipelined EOF: {} ({} subdirs in this page)",
+                        id, state.work.path, subdir_count
+                    );
+                    dirs_count.fetch_add(1, Ordering::Relaxed);
+                    pending_work.fetch_sub(1, Ordering::SeqCst);
+                    // state + slot dropped here.
+                } else {
+                    // More pages for the same dir — advance cookie and
+                    // re-submit on the same fh, same tag.
+                    state.cookie = result.next_cookie;
+                    state.cookieverf = result.next_cookieverf;
+                    let tag = next_tag;
+                    next_tag = next_tag.wrapping_add(1);
+                    match nfs.submit_readdirplus_by_fh(
+                        &state.file_handle,
+                        state.cookie,
+                        state.cookieverf,
+                        tag,
+                    ) {
+                        Ok(new_slot) => {
+                            slots.push(new_slot);
+                            states.push(state);
+                        }
+                        Err(e) => {
+                            errors_count.fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                "Worker {} pipelined re-submit failed: {} -> {}",
+                                id, state.work.path, e
+                            );
+                            pending_work.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            } else {
+                // RPC- or NFS3-level error. Drop the slot, count it,
+                // resolve the work item. (No retry — matches the
+                // legacy worker.)
+                errors_count.fetch_add(1, Ordering::Relaxed);
+                let s = result.status;
+                if s == 0 {
+                    // Should not happen — completed slot with status 0
+                    // and not SUCCESS — but guard anyway.
+                    debug!(
+                        "Worker {} pipelined unexpected zero status: {}",
+                        id, state.work.path
+                    );
+                } else {
+                    debug!(
+                        "Worker {} pipelined READDIRPLUS error status={} path={}",
+                        id, s, state.work.path
+                    );
+                }
+                pending_work.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    // Final cleanup. Drop slots first (must happen before nfs drops to
+    // satisfy the FFI lifetime contract — stack-frame drop order does
+    // this automatically since slots/states are declared after nfs is
+    // bound as a parameter).
+    if active_flag {
+        active_workers.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    if !batch.is_empty() {
+        let _ = entry_tx.send(batch);
+    }
+
+    debug!("Worker {} (pipelined) finished", id);
+}
+
+/// Wrapper around the FFI constant so we don't need an `unsafe` import
+/// every time we want to compare an RPC status to "success".
+#[inline]
+fn ffi_rpc_status_success() -> i32 {
+    crate::nfs::connection::ffi::RPC_STATUS_SUCCESS as i32
 }
 
 /// SQLite writer thread - handles all database writes with optimized bulk loading

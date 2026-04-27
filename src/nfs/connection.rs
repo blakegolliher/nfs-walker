@@ -617,6 +617,259 @@ impl NfsConnection {
         Ok(total_entries)
     }
 
+    // ============================================================
+    // Pipelined READDIRPLUS primitives (see docs/PIPELINED_READDIRPLUS_DESIGN.md)
+    //
+    // The methods below let a worker keep N READDIRPLUS RPCs in flight
+    // on a single libnfs context, demuxing replies as they land. They
+    // do NOT replace `readdir_plus_by_fh` — both code paths coexist.
+    // ============================================================
+
+    /// Submit a READDIRPLUS RPC by file handle without blocking.
+    ///
+    /// On success the returned [`InflightReaddir`] owns a heap-pinned
+    /// `Box<ReaddirplusFullData>` whose address has been handed to libnfs
+    /// as the PDU's `private_data`. The caller MUST keep the
+    /// `InflightReaddir` alive until either (a) `is_completed()` returns
+    /// true and `take_result()` has been called, or (b) the
+    /// `NfsConnection` is dropped (which destroys the rpc_context and
+    /// cancels all in-flight PDUs without firing their callbacks).
+    ///
+    /// `tag` is opaque to this layer; the caller uses it to map a
+    /// completion back to a `DirState` slot.
+    pub fn submit_readdirplus_by_fh(
+        &self,
+        file_handle: &[u8],
+        cookie: u64,
+        cookieverf: [i8; 8],
+        tag: u64,
+    ) -> NfsResult<InflightReaddir> {
+        if !self.mounted {
+            return Err(NfsError::ReadDirFailed {
+                path: "(pipelined)".into(),
+                reason: "Not mounted".into(),
+            });
+        }
+
+        let rpc = unsafe { ffi::nfs_get_rpc_context(self.context) };
+        if rpc.is_null() {
+            return Err(NfsError::ReadDirFailed {
+                path: "(pipelined)".into(),
+                reason: "Failed to get RPC context".into(),
+            });
+        }
+
+        // Heap-pinned cb_data: libnfs writes into it from the rpc_service
+        // callback fired on whatever thread calls rpc_service. We must
+        // not move it. The Box is consumed into the returned
+        // InflightReaddir; the raw pointer below stays valid until that
+        // InflightReaddir is dropped.
+        let mut cb_data: Box<ReaddirplusFullData> = Box::new(ReaddirplusFullData {
+            completed: false,
+            status: 0,
+            eof: false,
+            cookie: 0,
+            cookieverf: [0i8; 8],
+            entries: Vec::new(),
+        });
+
+        // Build args. The args struct can stay stack-allocated because
+        // libnfs XDR-encodes it into the PDU buffer at submit time and
+        // does not retain a pointer.
+        let mut args: ffi::READDIRPLUS3args = unsafe { std::mem::zeroed() };
+        args.dir.data.data_len = file_handle.len() as u32;
+        args.dir.data.data_val = file_handle.as_ptr() as *mut i8;
+        args.cookie = cookie;
+        args.cookieverf = cookieverf;
+        args.dircount = 8192;
+        args.maxcount = 16384;
+
+        let private =
+            (&mut *cb_data) as *mut ReaddirplusFullData as *mut std::ffi::c_void;
+
+        let pdu = unsafe {
+            ffi::rpc_nfs3_readdirplus_task(
+                rpc,
+                Some(readdirplus_full_callback),
+                &mut args,
+                private,
+            )
+        };
+
+        if pdu.is_null() {
+            return Err(NfsError::ReadDirFailed {
+                path: "(pipelined)".into(),
+                reason: "Failed to queue READDIRPLUS RPC".into(),
+            });
+        }
+
+        Ok(InflightReaddir {
+            cb_data,
+            tag,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
+    /// Drive the rpc_context until at least `min_completions` of the
+    /// supplied slots have flipped to completed, or until `timeout_ms`
+    /// elapses with no further progress.
+    ///
+    /// Returns the total number of slots currently completed (which
+    /// may exceed `min_completions` if multiple replies land in one
+    /// `rpc_service` call). On a clean timeout returns the count
+    /// without erroring; only fd-level errors return Err.
+    ///
+    /// Edge cases:
+    /// - empty `slots` slice → returns 0 immediately.
+    /// - all slots already completed → returns count without polling.
+    /// - `rpc_which_events` returns 0 → service with revents=0, sleep
+    ///   10 ms, retry (mirrors legacy `wait_for_rpc_completion`).
+    pub fn pump(
+        &self,
+        slots: &[InflightReaddir],
+        min_completions: usize,
+        timeout_ms: i32,
+    ) -> NfsResult<usize> {
+        if slots.is_empty() {
+            return Ok(0);
+        }
+
+        let count_completed =
+            |s: &[InflightReaddir]| -> usize { s.iter().filter(|i| i.is_completed()).count() };
+
+        let already = count_completed(slots);
+        if already >= min_completions {
+            return Ok(already);
+        }
+
+        let rpc = unsafe { ffi::nfs_get_rpc_context(self.context) };
+        if rpc.is_null() {
+            return Err(NfsError::ReadDirFailed {
+                path: "(pipelined)".into(),
+                reason: "Failed to get RPC context".into(),
+            });
+        }
+
+        use std::os::unix::io::RawFd;
+        let fd: RawFd = unsafe { ffi::rpc_get_fd(rpc) };
+        if fd < 0 {
+            return Err(NfsError::ReadDirFailed {
+                path: "(pipelined)".into(),
+                reason: "Invalid RPC fd".into(),
+            });
+        }
+
+        let start = std::time::Instant::now();
+        let total_budget =
+            std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+
+        loop {
+            let done = count_completed(slots);
+            if done >= min_completions {
+                return Ok(done);
+            }
+            if start.elapsed() >= total_budget {
+                return Ok(done);
+            }
+
+            let events = unsafe { ffi::rpc_which_events(rpc) };
+
+            if events == 0 {
+                let svc = unsafe { ffi::rpc_service(rpc, 0) };
+                if svc < 0 {
+                    return Err(NfsError::ReadDirFailed {
+                        path: "(pipelined)".into(),
+                        reason: "rpc_service failed (no events)".into(),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+
+            let mut pfd = libc::pollfd {
+                fd,
+                events: events as i16,
+                revents: 0,
+            };
+
+            // Cap a single poll wait so we re-check completions promptly.
+            let remaining_ms =
+                total_budget.saturating_sub(start.elapsed()).as_millis() as i32;
+            let poll_wait = remaining_ms.clamp(1, 100);
+            let ret = unsafe { libc::poll(&mut pfd, 1, poll_wait) };
+
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(NfsError::ReadDirFailed {
+                    path: "(pipelined)".into(),
+                    reason: format!("poll failed: {}", err),
+                });
+            }
+
+            if ret > 0 {
+                let revents = if pfd.revents != 0 { pfd.revents as i32 } else { events };
+                let svc = unsafe { ffi::rpc_service(rpc, revents) };
+                if svc < 0 {
+                    return Err(NfsError::ReadDirFailed {
+                        path: "(pipelined)".into(),
+                        reason: format!("rpc_service failed: {}", svc),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Resolve an NFS path to a file handle by walking LOOKUP RPCs from
+    /// the root. Synchronous; safe to call while pipelined slots are in
+    /// flight on the same context (the LOOKUP completion and any READDIRPLUS
+    /// completions share the rpc_service loop without interfering — each
+    /// has its own private_data).
+    ///
+    /// Lifted from the head of `readdir_plus_with_fh` so the pipelined
+    /// worker can fall back to a sync lookup for fh-less work items
+    /// (the root dir, plus any externally-injected dir).
+    pub fn resolve_path_to_fh(&self, path: &str) -> NfsResult<Vec<u8>> {
+        if !self.mounted {
+            return Err(NfsError::ReadDirFailed {
+                path: path.into(),
+                reason: "Not mounted".into(),
+            });
+        }
+
+        let rpc = unsafe { ffi::nfs_get_rpc_context(self.context) };
+        if rpc.is_null() {
+            return Err(NfsError::ReadDirFailed {
+                path: path.into(),
+                reason: "Failed to get RPC context".into(),
+            });
+        }
+
+        let root_fh_ptr = unsafe { ffi::nfs_get_rootfh(self.context) };
+        if root_fh_ptr.is_null() {
+            return Err(NfsError::ReadDirFailed {
+                path: path.into(),
+                reason: "Failed to get root file handle".into(),
+            });
+        }
+
+        let root_fh = unsafe {
+            let fh = &*root_fh_ptr;
+            let mut data = [0u8; 128];
+            let len = (fh.len as usize).min(128);
+            std::ptr::copy_nonoverlapping(fh.val as *const u8, data.as_mut_ptr(), len);
+            (len, data)
+        };
+
+        // NOTE: deliberately no drain_pending_events here. In pipelined
+        // mode this fn may be called between submit/pump cycles with
+        // other READDIRPLUS slots in flight; draining would discard
+        // their pending completions.
+        self.lookup_path_internal(rpc, &root_fh.1[..root_fh.0], path)
+    }
+
     /// Open a directory for manual iteration with seek support
     ///
     /// This allows for cookie-based parallel reading:
@@ -1269,6 +1522,85 @@ struct ReaddirplusFullData {
     cookie: u64,
     cookieverf: [i8; 8],
     entries: Vec<NfsDirEntry>,
+}
+
+/// Result drained from a completed `InflightReaddir` slot.
+///
+/// `next_cookie`/`next_cookieverf` are valid only when `eof` is false;
+/// the caller passes them back into `submit_readdirplus_by_fh` to fetch
+/// the next page of the same directory. When `eof` is true the
+/// directory is fully read.
+#[derive(Default)]
+pub struct ReaddirplusResult {
+    pub entries: Vec<NfsDirEntry>,
+    pub eof: bool,
+    pub next_cookie: u64,
+    pub next_cookieverf: [i8; 8],
+    pub status: i32,
+}
+
+/// Heap-pinned per-PDU state for a READDIRPLUS RPC submitted via
+/// [`NfsConnection::submit_readdirplus_by_fh`].
+///
+/// Memory-safety contract (see `docs/PIPELINED_READDIRPLUS_DESIGN.md` §5):
+///
+/// 1. `cb_data` is a `Box`, so its address is heap-pinned across moves
+///    of the `InflightReaddir` itself. Never `mem::swap` / `mem::replace`
+///    the inner box.
+/// 2. `InflightReaddir` is `!Send`. The libnfs callback writes into
+///    `cb_data` from whichever thread calls `rpc_service`; we always
+///    drive that from the worker thread that owns the `NfsConnection`.
+/// 3. The `Vec<InflightReaddir>` owned by a worker MUST be dropped
+///    before its `NfsConnection`. Stack-frame drop order in
+///    `worker_loop_pipelined` satisfies this automatically; do not
+///    stash slots in a struct that outlives the connection.
+///
+/// Compile-time assertion that the `!Send` invariant holds — if the
+/// PhantomData marker is ever removed, this doc-test will start
+/// passing the compile step and `cargo test` will fail it:
+///
+/// ```compile_fail
+/// use nfs_walker::nfs::connection::InflightReaddir;
+/// fn requires_send<T: Send>() {}
+/// requires_send::<InflightReaddir>();
+/// ```
+pub struct InflightReaddir {
+    cb_data: Box<ReaddirplusFullData>,
+    /// Worker-supplied tag (opaque here). Pipelined worker uses this
+    /// to map a completion back to its `DirState` slot.
+    pub tag: u64,
+    // !Send marker. cb_data is mutated from the libnfs callback running
+    // on whichever thread calls rpc_service. We bind that thread to the
+    // worker that owns the NfsConnection.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl InflightReaddir {
+    /// Has the libnfs callback fired for this slot?
+    #[inline]
+    pub fn is_completed(&self) -> bool {
+        self.cb_data.completed
+    }
+
+    /// Raw RPC status from the callback. Meaningful once
+    /// `is_completed()` is true.
+    #[inline]
+    pub fn status(&self) -> i32 {
+        self.cb_data.status
+    }
+
+    /// Drain the result. Caller invokes after `is_completed()` returns
+    /// true. Idempotent: calling again returns an empty
+    /// `ReaddirplusResult` with the original status preserved.
+    pub fn take_result(&mut self) -> ReaddirplusResult {
+        ReaddirplusResult {
+            entries: std::mem::take(&mut self.cb_data.entries),
+            eof: self.cb_data.eof,
+            next_cookie: self.cb_data.cookie,
+            next_cookieverf: self.cb_data.cookieverf,
+            status: self.cb_data.status,
+        }
+    }
 }
 
 /// Callback for READDIRPLUS RPC (full entry collection with file handles)
@@ -2593,5 +2925,209 @@ mod tests {
         let _builder = NfsConnectionBuilder::new(url)
             .timeout(Duration::from_secs(10))
             .retries(2);
+    }
+
+    // ========================================================
+    // Pipelined READDIRPLUS unit tests
+    //
+    // The non-NFS-server tests run on every `cargo test` invocation.
+    // The NFS-server tests are gated behind the `NFS_TEST_URL` env var
+    // (e.g. `NFS_TEST_URL=nfs://localhost/export cargo test --
+    // pipelined --ignored`) and are `#[ignore]` so they don't block
+    // CI when no loopback NFS is available.
+    // ========================================================
+
+    /// Helper for static-only tests: construct an InflightReaddir whose
+    /// cb_data has been pre-filled to a "completed" state. We never
+    /// hand the pointer to libnfs, so this is a safe simulation of the
+    /// post-callback state.
+    fn fake_completed_inflight(
+        eof: bool,
+        status: i32,
+        cookie: u64,
+        n_entries: usize,
+    ) -> InflightReaddir {
+        let entries = (0..n_entries)
+            .map(|i| NfsDirEntry {
+                name: format!("entry-{i}"),
+                entry_type: EntryType::File,
+                stat: None,
+                inode: i as u64,
+                file_handle: None,
+            })
+            .collect();
+        InflightReaddir {
+            cb_data: Box::new(ReaddirplusFullData {
+                completed: true,
+                status,
+                eof,
+                cookie,
+                cookieverf: [0i8; 8],
+                entries,
+            }),
+            tag: 0xDEAD_BEEF,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    #[test]
+    fn pipelined_take_result_drains_and_is_idempotent() {
+        let mut slot = fake_completed_inflight(false, 0, 12345, 7);
+        assert!(slot.is_completed());
+        assert_eq!(slot.status(), 0);
+
+        let r1 = slot.take_result();
+        assert_eq!(r1.entries.len(), 7);
+        assert_eq!(r1.eof, false);
+        assert_eq!(r1.next_cookie, 12345);
+        assert_eq!(r1.status, 0);
+
+        // Second call: cb_data was drained, but completed/eof/cookie
+        // are still readable. take_result returns an empty entries vec
+        // and the same cookie/status.
+        let r2 = slot.take_result();
+        assert_eq!(r2.entries.len(), 0);
+        assert_eq!(r2.eof, false);
+        assert_eq!(r2.next_cookie, 12345);
+        assert_eq!(r2.status, 0);
+    }
+
+
+    #[test]
+    fn pipelined_readdirplus_result_default_is_sane() {
+        let r = ReaddirplusResult::default();
+        assert!(r.entries.is_empty());
+        assert!(!r.eof);
+        assert_eq!(r.next_cookie, 0);
+        assert_eq!(r.next_cookieverf, [0i8; 8]);
+        assert_eq!(r.status, 0);
+    }
+
+    // ----- NFS-server-backed tests (env-var gated) -----
+
+    fn test_nfs_url() -> Option<NfsUrl> {
+        let raw = std::env::var("NFS_TEST_URL").ok()?;
+        NfsUrl::parse(&raw).ok()
+    }
+
+    /// Connect (mount) to whatever loopback / staging server the env
+    /// var points at. Returns None if the env var is unset, letting
+    /// the caller skip cleanly.
+    fn connect_test_nfs() -> Option<NfsConnection> {
+        let url = test_nfs_url()?;
+        NfsConnectionBuilder::new(url)
+            .timeout(Duration::from_secs(10))
+            .retries(1)
+            .connect()
+            .ok()
+    }
+
+    #[test]
+    #[ignore = "requires NFS_TEST_URL=nfs://host/export"]
+    fn pipelined_submit_two_completes_both() {
+        let nfs = match connect_test_nfs() {
+            Some(n) => n,
+            None => {
+                eprintln!("skip: NFS_TEST_URL not set or unreachable");
+                return;
+            }
+        };
+
+        let root_fh = nfs
+            .resolve_path_to_fh("/")
+            .expect("resolve / failed");
+
+        let s1 = nfs
+            .submit_readdirplus_by_fh(&root_fh, 0, [0i8; 8], 1)
+            .expect("submit 1");
+        let s2 = nfs
+            .submit_readdirplus_by_fh(&root_fh, 0, [0i8; 8], 2)
+            .expect("submit 2");
+
+        let slots = vec![s1, s2];
+        let n = nfs.pump(&slots, 2, 30_000).expect("pump");
+        assert!(n >= 2, "expected at least 2 completions, got {n}");
+        assert!(slots[0].is_completed());
+        assert!(slots[1].is_completed());
+    }
+
+    #[test]
+    #[ignore = "requires NFS_TEST_URL=nfs://host/export"]
+    fn pipelined_drop_with_inflight_does_not_segfault() {
+        let nfs = match connect_test_nfs() {
+            Some(n) => n,
+            None => {
+                eprintln!("skip: NFS_TEST_URL not set or unreachable");
+                return;
+            }
+        };
+
+        let root_fh = nfs.resolve_path_to_fh("/").expect("resolve");
+
+        // Submit several RPCs and drop the slots vec (and then the
+        // connection) without pumping. The Box<ReaddirplusFullData>
+        // outlives the libnfs-cancellation triggered by
+        // nfs_destroy_context — that's the lifetime contract we want
+        // to validate.
+        {
+            let mut slots = Vec::new();
+            for i in 0..4 {
+                if let Ok(s) = nfs.submit_readdirplus_by_fh(&root_fh, 0, [0i8; 8], i) {
+                    slots.push(s);
+                }
+            }
+            // slots dropped here BEFORE nfs (stack-frame order)
+        }
+        // nfs dropped here. If the design is correct, no segfault and
+        // no leak. (Run under valgrind/asan for a stronger check.)
+    }
+
+    #[test]
+    #[ignore = "requires NFS_TEST_URL=nfs://host/export pointing at a dir with >5000 entries"]
+    fn pipelined_cookie_chain_advances_correctly() {
+        let nfs = match connect_test_nfs() {
+            Some(n) => n,
+            None => {
+                eprintln!("skip: NFS_TEST_URL not set or unreachable");
+                return;
+            }
+        };
+
+        let dir = std::env::var("NFS_TEST_BIG_DIR").unwrap_or_else(|_| "/".into());
+        let dir_fh = nfs
+            .resolve_path_to_fh(&dir)
+            .expect("resolve big dir");
+
+        let mut cookie = 0u64;
+        let mut cookieverf = [0i8; 8];
+        let mut total = 0usize;
+        let mut iters = 0u32;
+        loop {
+            let mut slot = nfs
+                .submit_readdirplus_by_fh(&dir_fh, cookie, cookieverf, iters as u64)
+                .expect("submit page");
+            let n = nfs
+                .pump(std::slice::from_ref(&slot), 1, 30_000)
+                .expect("pump page");
+            assert!(n >= 1, "page did not complete");
+            let result = slot.take_result();
+            assert_eq!(
+                result.status,
+                ffi::RPC_STATUS_SUCCESS as i32,
+                "READDIRPLUS page failed: status={}",
+                result.status
+            );
+            total += result.entries.len();
+            if result.eof {
+                break;
+            }
+            cookie = result.next_cookie;
+            cookieverf = result.next_cookieverf;
+            iters += 1;
+            if iters > 10_000 {
+                panic!("cookie chain did not terminate after 10k pages");
+            }
+        }
+        eprintln!("walked {total} entries in {iters} pages");
     }
 }
