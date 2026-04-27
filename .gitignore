@@ -18,7 +18,6 @@ Thumbs.db
 
 # Test outputs
 *.db
-*.parquet
 /tmp/
 
 # Notes and prompts
@@ -56,7 +55,13 @@ web/node_modules/
 web/dist/
 
 # Data files (scans, rocks dbs, parquet outputs)
+# These match scan output directories and stray data files. The
+# patterns without trailing slashes match both files AND directories
+# of the same name, so e.g. *.parquet covers `<scan>.rocks.parquet/`
+# (the streaming Parquet sibling directory) and also stray .parquet
+# files. Likewise *.rocks/ catches RocksDB scan dirs.
 *.rocks/
+*.parquet
 parquet-output/
 *.sst
 *.log
