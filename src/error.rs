@@ -201,6 +201,14 @@ pub enum ConfigError {
     /// Pipeline depth out of range
     #[error("Invalid pipeline depth {depth}: must be between 0 and {max}")]
     InvalidPipelineDepth { depth: usize, max: usize },
+
+    /// Writer-shard count out of range
+    #[error("Invalid writer-shards {shards}: must be between 1 and {max}")]
+    InvalidWriterShards { shards: usize, max: usize },
+
+    /// Two CLI flags can't be combined
+    #[error("Incompatible flag combination: {reason}")]
+    IncompatibleFlags { reason: String },
 }
 
 /// Worker thread errors

@@ -47,15 +47,19 @@ where
     let rocks = RocksHandle::open_readonly(rocks_path)
         .map_err(|e| WalkerError::Database(DbError::Schema(format!("Failed to open RocksDB: {}", e))))?;
 
-    // Get approximate entry count for progress
-    let approx_count = rocks
-        .db
-        .property_int_value_cf(
-            rocks.cf_entries_by_path(),
-            "rocksdb.estimate-num-keys",
-        )
-        .unwrap_or(None)
-        .unwrap_or(0);
+    // Get approximate entry count for progress (sum across shard CFs).
+    let approx_count: u64 = (0..rocks.shards())
+        .map(|i| {
+            rocks
+                .db
+                .property_int_value_cf(
+                    rocks.cf_entries_by_path_shard(i),
+                    "rocksdb.estimate-num-keys",
+                )
+                .unwrap_or(None)
+                .unwrap_or(0)
+        })
+        .sum();
 
     info!("Approximate entries to convert: {}", approx_count);
 

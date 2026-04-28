@@ -19,6 +19,8 @@
 use crate::config::WalkConfig;
 #[cfg(feature = "rocksdb")]
 use crate::config::OutputFormat;
+#[cfg(feature = "rocksdb")]
+use crate::rocksdb::schema::path_to_shard;
 use crate::content::{checksum::compute_gxhash, filetype::detect_file_type as detect_mime_type};
 use crate::db::schema::{create_database, create_indexes, keys, optimize_for_reads, set_walk_info};
 use crate::error::{Result, WalkerError};
@@ -45,6 +47,60 @@ struct DirWork {
     /// Cached file handle from parent's READDIRPLUS response
     /// When set, we can skip LOOKUP RPCs and use this handle directly
     file_handle: Option<Vec<u8>>,
+}
+
+/// Per-worker fan-out helper. Each entry is routed to its owning
+/// path-shard channel by `path_to_shard(entry.path, shards)`. Workers
+/// hold N partial batches in parallel; shards == 1 collapses to a
+/// single channel and matches the legacy behavior bit-for-bit.
+#[cfg(feature = "rocksdb")]
+struct ShardedSender {
+    senders: Vec<Sender<Vec<DbEntry>>>,
+    batches: Vec<Vec<DbEntry>>,
+    batch_size: usize,
+    shards: usize,
+}
+
+#[cfg(feature = "rocksdb")]
+impl ShardedSender {
+    fn new(senders: Vec<Sender<Vec<DbEntry>>>, batch_size: usize) -> Self {
+        let shards = senders.len();
+        let batches = (0..shards)
+            .map(|_| Vec::with_capacity(batch_size))
+            .collect();
+        Self {
+            senders,
+            batches,
+            batch_size,
+            shards,
+        }
+    }
+
+    /// Push one entry into its shard's pending batch. If that batch
+    /// reaches `batch_size`, it's drained and shipped to its writer's
+    /// channel; returns Err(()) when the channel is closed (writer
+    /// gone, propagate as "shutdown").
+    fn push(&mut self, entry: DbEntry) -> std::result::Result<(), ()> {
+        let shard = path_to_shard(&entry.path, self.shards);
+        let batch = &mut self.batches[shard];
+        batch.push(entry);
+        if batch.len() >= self.batch_size {
+            let full =
+                std::mem::replace(batch, Vec::with_capacity(self.batch_size));
+            self.senders[shard].send(full).map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    /// Drain residual partial batches at end-of-walk.
+    fn flush_all(&mut self) {
+        for (shard, batch) in self.batches.iter_mut().enumerate() {
+            if !batch.is_empty() {
+                let full = std::mem::take(batch);
+                let _ = self.senders[shard].send(full);
+            }
+        }
+    }
 }
 
 /// Result from walk operation
@@ -158,17 +214,14 @@ impl SimpleWalker {
         let db = self.open_sqlite_database()?;
 
         // Channel for entries to write (workers -> writer).
-        // Bumped from 100 → 1024 after a 1024-worker / pipeline-depth-8
-        // run blocked on entry_tx.send: with that many producers the
-        // 100-slot buffer drained in microseconds and worker parallelism
-        // collapsed back to the writer's max insert rate.
+        // SQLite path stays single-shard: there is one writer thread.
         let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(1024);
 
         // Spawn dedicated writer thread
         let writer_handle = self.spawn_sqlite_writer(db, entry_rx);
 
-        // Run workers
-        self.run_workers(entry_tx)?;
+        // Run workers (single-channel fan-in)
+        self.run_workers(vec![entry_tx])?;
 
         // Wait for writer to finish
         let db = writer_handle.join().expect("Writer thread panicked");
@@ -298,30 +351,28 @@ impl SimpleWalker {
             .expect("Failed to spawn big-dir-sqlite-writer thread")
     }
 
-    /// Run walker with RocksDB output
+    /// Run walker with RocksDB output. Fans out to `writer_shards`
+    /// independent writer threads when `--writer-shards N > 1`; legacy
+    /// single-writer behavior for shards == 1.
     #[cfg(feature = "rocksdb")]
     fn run_rocksdb(&self) -> Result<WalkStats> {
         let start = Instant::now();
 
-        // Open RocksDB
         info!("Opening RocksDB: {}", self.config.output_path.display());
         let rocks_path = self.config.output_path.clone();
-
-        // Channel for entries to write (workers -> rocksdb writer).
-        // 1024 slots: see the SQLite path above for rationale.
-        let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(1024);
+        let shards = self.config.writer_shards.max(1);
 
         // Decide whether to fan out to a streaming Parquet writer.
+        // Streaming Parquet is single-threaded and not yet sharded, so
+        // it's only allowed when shards == 1 (validated at config parse).
         #[cfg(feature = "parquet")]
         let parquet_spawn = self.maybe_spawn_parquet_writer(&rocks_path)?;
         #[cfg(not(feature = "parquet"))]
         let parquet_tx: Option<Sender<Vec<DbEntry>>> = None;
 
         #[cfg(feature = "parquet")]
-        let parquet_tx = parquet_spawn.tx.clone();
+        let parquet_tx_root = parquet_spawn.tx.clone();
 
-        // Spawn dedicated RocksDB writer thread (forwards batches when
-        // parquet_tx is Some, drops them on backpressure -- no stall).
         let scan_id_for_rocks: Option<(String, i64)>;
         #[cfg(feature = "parquet")]
         {
@@ -334,19 +385,66 @@ impl SimpleWalker {
         {
             scan_id_for_rocks = None;
         }
-        let writer_handle = self.spawn_rocksdb_writer(
-            rocks_path.clone(),
-            entry_rx,
-            parquet_tx,
-            scan_id_for_rocks,
-        )?;
 
-        // Run workers
-        self.run_workers(entry_tx)?;
+        let rocks_handle: Arc<RocksHandle> = if shards <= 1 {
+            // Single-shard path: keep the legacy single rocks-writer
+            // thread so streaming-parquet keeps working unchanged.
+            let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(1024);
+            #[cfg(feature = "parquet")]
+            let parquet_tx = parquet_tx_root.clone();
+            #[cfg(not(feature = "parquet"))]
+            let parquet_tx: Option<Sender<Vec<DbEntry>>> = None;
 
-        // Wait for writer to finish
-        let rocks_handle = writer_handle.join().expect("RocksDB writer thread panicked")
-            .map_err(WalkerError::Rocks)?;
+            let writer_handle = self.spawn_rocksdb_writer(
+                rocks_path.clone(),
+                entry_rx,
+                parquet_tx,
+                scan_id_for_rocks,
+            )?;
+
+            self.run_workers(vec![entry_tx])?;
+
+            let h = writer_handle
+                .join()
+                .expect("RocksDB writer thread panicked")
+                .map_err(WalkerError::Rocks)?;
+            Arc::new(h)
+        } else {
+            // Multi-shard path: spawn N writers, each owning one path
+            // shard CF. Final summary is the merge of each shard's
+            // accumulator.
+            let (rocks_handle, writer_handles, txs) =
+                self.spawn_sharded_rocksdb_writers(rocks_path.clone(), shards)?;
+
+            // Run workers (route per-entry into shard channels).
+            self.run_workers(txs)?;
+
+            // Join all shard writers; merge their accumulators into a
+            // single summary and flush it to the summary CF.
+            use crate::rocksdb::summary::SummaryAccumulator;
+            let mut merged = SummaryAccumulator::new();
+            for (shard_idx, h) in writer_handles.into_iter().enumerate() {
+                let shard_summary = h
+                    .join()
+                    .expect("RocksDB shard writer thread panicked")
+                    .map_err(WalkerError::Rocks)?;
+                debug!(
+                    "shard {} contributed: files={} dirs={}",
+                    shard_idx, shard_summary.total.total_files, shard_summary.total.total_dirs
+                );
+                merged.merge_from(&shard_summary);
+            }
+            merged.touch_now();
+
+            let mut wopts = rocksdb::WriteOptions::default();
+            wopts.disable_wal(true);
+            flush_summary_to_cf(&rocks_handle, &merged, &wopts).map_err(WalkerError::Rocks)?;
+            rocks_handle.db.flush().map_err(|e| {
+                WalkerError::Rocks(crate::error::RocksError::Rocks(e))
+            })?;
+
+            rocks_handle
+        };
 
         // Wait for the streaming Parquet writer if it was spawned.
         #[cfg(feature = "parquet")]
@@ -656,8 +754,13 @@ impl SimpleWalker {
         Ok(handle)
     }
 
-    /// Run worker threads (shared between SQLite and RocksDB modes)
-    fn run_workers(&self, entry_tx: Sender<Vec<DbEntry>>) -> Result<()> {
+    /// Run worker threads (shared between SQLite and RocksDB modes).
+    ///
+    /// `entry_txs` carries one sender per writer shard. Length 1 selects
+    /// the legacy single-writer fan-in; length N (with the RocksDB
+    /// multi-shard writer) makes each worker route per-entry via
+    /// `gxhash(path) % N` into the matching writer's channel.
+    fn run_workers(&self, entry_txs: Vec<Sender<Vec<DbEntry>>>) -> Result<()> {
         // Pipelined mode currently does not support per-file content
         // analysis (checksum / file-type detection). Warn loudly if the
         // combination is requested; the pipelined worker silently skips
@@ -722,7 +825,7 @@ impl SimpleWalker {
 
             let injector = Arc::clone(&injector);
             let stealers = Arc::clone(&stealers);
-            let entry_tx = entry_tx.clone();
+            let entry_txs = entry_txs.clone();
             let shutdown = Arc::clone(&self.shutdown);
             let dirs_count = Arc::clone(&self.dirs_count);
             let files_count = Arc::clone(&self.files_count);
@@ -749,7 +852,7 @@ impl SimpleWalker {
                             local,
                             injector,
                             stealers,
-                            entry_tx,
+                            entry_txs,
                             shutdown,
                             dirs_count,
                             files_count,
@@ -769,7 +872,7 @@ impl SimpleWalker {
                             local,
                             injector,
                             stealers,
-                            entry_tx,
+                            entry_txs,
                             shutdown,
                             dirs_count,
                             files_count,
@@ -792,8 +895,8 @@ impl SimpleWalker {
             handles.push(handle);
         }
 
-        // Drop our sender so writer knows when to stop
-        drop(entry_tx);
+        // Drop our senders so writers know when to stop.
+        drop(entry_txs);
 
         // Wait for workers
         for handle in handles {
@@ -936,6 +1039,89 @@ impl SimpleWalker {
             .expect("Failed to spawn SQLite writer thread")
     }
 
+    /// Spawn N RocksDB writer threads, one per path-CF shard. Returns:
+    ///   - the shared `Arc<RocksHandle>` (kept alive by every writer
+    ///     thread for the duration of the scan; the caller also keeps a
+    ///     copy to write final metadata + finalize),
+    ///   - the join handles, in shard order — each yields the shard's
+    ///     `SummaryAccumulator` on success,
+    ///   - the per-shard `Sender<Vec<DbEntry>>` to thread into workers.
+    ///
+    /// Streaming Parquet is intentionally **not** wired into this path:
+    /// `--stream-parquet` requires `--writer-shards 1` (config validation
+    /// rejects the combination at startup).
+    #[cfg(feature = "rocksdb")]
+    #[allow(clippy::type_complexity)]
+    fn spawn_sharded_rocksdb_writers(
+        &self,
+        path: std::path::PathBuf,
+        shards: usize,
+    ) -> Result<(
+        Arc<RocksHandle>,
+        Vec<JoinHandle<std::result::Result<crate::rocksdb::summary::SummaryAccumulator, crate::error::RocksError>>>,
+        Vec<Sender<Vec<DbEntry>>>,
+    )> {
+        debug_assert!(shards >= 2);
+
+        if path.exists() {
+            std::fs::remove_dir_all(&path).map_err(WalkerError::Io)?;
+        }
+
+        // Open with N path-shard CFs and write initial metadata.
+        let writer = RocksWriter::open_with_shards(
+            &path,
+            shards,
+            RocksWriterConfig::default(),
+        )
+        .map_err(WalkerError::Rocks)?;
+
+        writer
+            .set_metadata(meta_keys::SOURCE_URL, &self.config.nfs_url.to_display_string())
+            .map_err(WalkerError::Rocks)?;
+        writer
+            .set_metadata(meta_keys::START_TIME, &chrono::Utc::now().to_rfc3339())
+            .map_err(WalkerError::Rocks)?;
+        writer
+            .set_metadata(meta_keys::STATUS, "running")
+            .map_err(WalkerError::Rocks)?;
+        writer
+            .set_metadata(meta_keys::WORKER_COUNT, &self.config.worker_count.to_string())
+            .map_err(WalkerError::Rocks)?;
+
+        let handle = Arc::new(writer.into_handle());
+        let batch_size = self.config.batch_size;
+
+        let flush_lock = Arc::new(std::sync::Mutex::new(()));
+        let flush_counter = Arc::new(AtomicU64::new(0));
+
+        let mut txs: Vec<Sender<Vec<DbEntry>>> = Vec::with_capacity(shards);
+        let mut joins: Vec<
+            JoinHandle<
+                std::result::Result<
+                    crate::rocksdb::summary::SummaryAccumulator,
+                    crate::error::RocksError,
+                >,
+            >,
+        > = Vec::with_capacity(shards);
+
+        for shard_idx in 0..shards {
+            let (tx, rx) = bounded::<Vec<DbEntry>>(1024);
+            txs.push(tx);
+            let h = Arc::clone(&handle);
+            let fl = Arc::clone(&flush_lock);
+            let fc = Arc::clone(&flush_counter);
+            let join = thread::Builder::new()
+                .name(format!("rocks-writer-{}", shard_idx))
+                .spawn(move || {
+                    rocksdb_writer_loop_shard(h, shard_idx, rx, None, batch_size, fl, fc)
+                })
+                .expect("Failed to spawn RocksDB shard writer thread");
+            joins.push(join);
+        }
+
+        Ok((handle, joins, txs))
+    }
+
     #[cfg(feature = "rocksdb")]
     fn spawn_rocksdb_writer(
         &self,
@@ -993,14 +1179,20 @@ impl SimpleWalker {
 #[cfg(feature = "rocksdb")]
 type RocksWriterSpawn = JoinHandle<std::result::Result<RocksHandle, crate::error::RocksError>>;
 
-/// Worker thread - processes directories using READDIRPLUS
+/// Worker thread - processes directories using READDIRPLUS.
+///
+/// `entry_txs` carries one sender per writer shard. The worker holds an
+/// equal number of pending `batch` slots inside `ShardedSender`; entries
+/// route per-path via `gxhash % shards`. With shards == 1 this collapses
+/// to one batch + one channel — bit-identical to the legacy worker.
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     id: usize,
     nfs: NfsConnection,
     local: DequeWorker<DirWork>,
     injector: Arc<Injector<DirWork>>,
     stealers: Arc<Vec<Stealer<DirWork>>>,
-    entry_tx: Sender<Vec<DbEntry>>,
+    entry_txs: Vec<Sender<Vec<DbEntry>>>,
     shutdown: Arc<AtomicBool>,
     dirs_count: Arc<AtomicU64>,
     files_count: Arc<AtomicU64>,
@@ -1018,7 +1210,13 @@ fn worker_loop(
 ) {
     debug!("Worker {} started", id);
 
-    let mut batch: Vec<DbEntry> = Vec::with_capacity(batch_size);
+    let shards = entry_txs.len().max(1);
+    // Local in-progress staging: when content analysis is active we need
+    // a flat buffer so the post-readdir pass can patch checksum/file_type
+    // by index. We push to staging first, then drain into the
+    // ShardedSender once analysis is done.
+    let mut staging: Vec<DbEntry> = Vec::with_capacity(batch_size);
+    let mut sender = ShardedSender::new(entry_txs, batch_size);
     let mut idle_spins = 0;
     const MAX_IDLE_SPINS: u32 = 1000;
 
@@ -1165,42 +1363,43 @@ fn worker_loop(
                     file_type: None,
                 };
 
-                // Track index before pushing (for content analysis)
-                let entry_idx = batch.len();
-                batch.push(db_entry);
-
                 if is_dir {
                     // Queue subdirectory for processing with cached file handle
                     subdir_count += 1;
                     pending_work.fetch_add(1, Ordering::SeqCst);
                     local.push(DirWork {
-                        path: full_path,
+                        path: full_path.clone(),
                         depth: work.depth + 1,
                         file_handle: nfs_entry.file_handle.clone(),
                     });
                 } else {
                     chunk_file_count += 1;
                     chunk_byte_count += nfs_entry.size();
-
-                    // Track files for content analysis (will process after dir walk)
-                    if needs_content {
-                        let file_size = nfs_entry.size();
-                        files_for_content.push((full_path.clone(), entry_idx, file_size));
-                    }
                 }
 
-                // Send batch if full (skip if content analysis needed - process after walk)
-                if batch.len() >= batch_size && !needs_content {
-                    if entry_tx.send(std::mem::replace(&mut batch, Vec::with_capacity(batch_size))).is_err() {
-                        channel_broken = true;
-                        return false; // Stop reading if channel is broken
+                if needs_content {
+                    // Stage flat so the post-readdir patch step can
+                    // address by index; track files needing analysis.
+                    let entry_idx = staging.len();
+                    if !is_dir {
+                        files_for_content.push((full_path, entry_idx, nfs_entry.size()));
                     }
-                    // Update progress counters incrementally for real-time display
-                    // (especially important for large flat directories)
-                    files_count.fetch_add(chunk_file_count, Ordering::Relaxed);
-                    bytes_count.fetch_add(chunk_byte_count, Ordering::Relaxed);
-                    chunk_file_count = 0;
-                    chunk_byte_count = 0;
+                    staging.push(db_entry);
+                } else {
+                    // Push straight into the ShardedSender; it auto-
+                    // flushes the per-shard batch when full.
+                    if sender.push(db_entry).is_err() {
+                        channel_broken = true;
+                        return false;
+                    }
+                    // Update progress counters incrementally for real-time
+                    // display (matters on flat dirs with millions of entries).
+                    if chunk_file_count >= batch_size as u64 {
+                        files_count.fetch_add(chunk_file_count, Ordering::Relaxed);
+                        bytes_count.fetch_add(chunk_byte_count, Ordering::Relaxed);
+                        chunk_file_count = 0;
+                        chunk_byte_count = 0;
+                    }
                 }
             }
             !channel_broken // Continue reading if channel is OK
@@ -1219,7 +1418,7 @@ fn worker_loop(
                 // This happens AFTER the directory walk completes so nfs is no longer borrowed
                 if needs_content && !files_for_content.is_empty() {
                     for (path, idx, size) in files_for_content.drain(..) {
-                        if idx >= batch.len() {
+                        if idx >= staging.len() {
                             continue; // Safety check
                         }
 
@@ -1255,11 +1454,11 @@ fn worker_loop(
                         if let Some(data) = content {
                             if compute_checksum && data.len() as u64 == size {
                                 // Only set checksum if we read the full file
-                                batch[idx].checksum = Some(compute_gxhash(&data));
+                                staging[idx].checksum = Some(compute_gxhash(&data));
                             }
                             if detect_file_type {
                                 let header_len = std::cmp::min(data.len(), 8192);
-                                batch[idx].file_type = detect_mime_type(&data[..header_len]);
+                                staging[idx].file_type = detect_mime_type(&data[..header_len]);
                             }
                         }
                     }
@@ -1275,11 +1474,15 @@ fn worker_loop(
                     id, work.path, entry_count, subdir_count
                 );
 
-                // Send batch now if content analysis was enabled (deferred sending)
-                if needs_content && !batch.is_empty() {
-                    if entry_tx.send(std::mem::replace(&mut batch, Vec::with_capacity(batch_size))).is_err() {
-                        // Channel closed, we're shutting down
-                        debug!("Worker {} channel closed during content analysis send", id);
+                // Drain content-analysis staging into the ShardedSender.
+                // (The non-content path already pushed directly inside
+                // the readdir callback.)
+                if needs_content && !staging.is_empty() {
+                    for entry in staging.drain(..) {
+                        if sender.push(entry).is_err() {
+                            debug!("Worker {} channel closed during content drain", id);
+                            break;
+                        }
                     }
                 }
             }
@@ -1301,10 +1504,16 @@ fn worker_loop(
         active_workers.fetch_sub(1, Ordering::Relaxed);
     }
 
-    // Send remaining batch
-    if !batch.is_empty() {
-        let _ = entry_tx.send(batch);
+    // Drain residual staging entries (content-analysis path may have
+    // queued some between the last iteration and shutdown) and any
+    // partial per-shard batches in the ShardedSender.
+    for entry in staging.drain(..) {
+        if sender.push(entry).is_err() {
+            break;
+        }
     }
+    sender.flush_all();
+    let _ = shards;
 
     debug!("Worker {} finished", id);
 }
@@ -1376,7 +1585,7 @@ fn worker_loop_pipelined(
     local: DequeWorker<DirWork>,
     injector: Arc<Injector<DirWork>>,
     stealers: Arc<Vec<Stealer<DirWork>>>,
-    entry_tx: Sender<Vec<DbEntry>>,
+    entry_txs: Vec<Sender<Vec<DbEntry>>>,
     shutdown: Arc<AtomicBool>,
     dirs_count: Arc<AtomicU64>,
     files_count: Arc<AtomicU64>,
@@ -1399,7 +1608,7 @@ fn worker_loop_pipelined(
     let mut slots: Vec<crate::nfs::connection::InflightReaddir> =
         Vec::with_capacity(pipeline_depth);
     let mut states: Vec<DirState> = Vec::with_capacity(pipeline_depth);
-    let mut batch: Vec<DbEntry> = Vec::with_capacity(batch_size);
+    let mut sender = ShardedSender::new(entry_txs, batch_size);
     let mut next_tag: u64 = (id as u64) << 48;
     // Local active-flag mirrors the legacy active_workers semantics:
     // counts as "active" while this worker holds at least one in-flight
@@ -1599,13 +1808,11 @@ fn worker_loop_pipelined(
                         file_type: None,
                     };
 
-                    batch.push(db_entry);
-
                     if is_dir {
                         subdir_count += 1;
                         pending_work.fetch_add(1, Ordering::SeqCst);
                         local.push(DirWork {
-                            path: full_path,
+                            path: full_path.clone(),
                             depth: state.work.depth + 1,
                             file_handle: nfs_entry.file_handle.clone(),
                         });
@@ -1614,17 +1821,14 @@ fn worker_loop_pipelined(
                         chunk_byte_count += nfs_entry.size();
                     }
 
-                    if batch.len() >= batch_size {
-                        if entry_tx
-                            .send(std::mem::replace(
-                                &mut batch,
-                                Vec::with_capacity(batch_size),
-                            ))
-                            .is_err()
-                        {
-                            channel_broken = true;
-                            break;
-                        }
+                    if sender.push(db_entry).is_err() {
+                        channel_broken = true;
+                        break;
+                    }
+
+                    // Periodic counter flush to keep the live
+                    // entries/sec readout responsive on huge dirs.
+                    if chunk_file_count >= batch_size as u64 {
                         files_count.fetch_add(chunk_file_count, Ordering::Relaxed);
                         bytes_count.fetch_add(chunk_byte_count, Ordering::Relaxed);
                         chunk_file_count = 0;
@@ -1717,9 +1921,7 @@ fn worker_loop_pipelined(
         active_workers.fetch_sub(1, Ordering::Relaxed);
     }
 
-    if !batch.is_empty() {
-        let _ = entry_tx.send(batch);
-    }
+    sender.flush_all();
 
     debug!("Worker {} (pipelined) finished", id);
 }
@@ -1777,7 +1979,7 @@ fn sqlite_writer_loop(mut conn: Connection, entry_rx: Receiver<Vec<DbEntry>>, ba
     conn
 }
 
-/// RocksDB writer thread - handles all database writes.
+/// RocksDB writer thread - handles all database writes (single-shard).
 ///
 /// `parquet_tx` is `Some` only when `--stream-parquet` is enabled. Each
 /// successfully-written pending batch is forwarded via `try_send`; on a
@@ -1806,33 +2008,22 @@ fn rocksdb_writer_loop(
     let mut parquet_drops: u64 = 0;
     let mut parquet_drop_rows: u64 = 0;
 
-    // Flush every 1M entries to limit memory usage
-    // This prevents unbounded memtable growth for large scans
     const FLUSH_INTERVAL: u64 = 1_000_000;
-    // Flush summary CF after this many write_rocks_batch calls. The
-    // accumulator update itself is cheap; this just bounds how stale the
-    // summary CF can be on disk relative to the in-memory totals.
     const SUMMARY_FLUSH_EVERY_N_WRITES: u32 = 100;
 
-    // Write options with WAL disabled for speed
     let mut write_opts = WriteOptions::default();
     write_opts.disable_wal(true);
 
-    // Receive batches and write to DB
     while let Ok(entries) = entry_rx.recv() {
         pending.extend(entries);
 
-        // Write when we have enough
         if pending.len() >= batch_size {
-            write_rocks_batch(&handle, &pending, &write_opts)?;
+            write_rocks_batch_shard(&handle, 0, &pending, &write_opts)?;
             summary.update(&pending);
             total_written += pending.len() as u64;
             entries_since_flush += pending.len() as u64;
             writes_since_summary_flush += 1;
 
-            // Move the just-written batch (or drop it on backpressure)
-            // before clearing pending. Reusing a fresh Vec avoids a
-            // realloc and avoids cloning the entries.
             let written_batch = std::mem::replace(&mut pending, Vec::with_capacity(batch_size * 2));
             if let Some(ref tx) = parquet_tx {
                 let row_count = written_batch.len();
@@ -1840,23 +2031,14 @@ fn rocksdb_writer_loop(
                     parquet_drops += 1;
                     parquet_drop_rows += row_count as u64;
                 }
-                // Disconnected: parquet thread exited (panicked or
-                // shutdown). Stop forwarding -- ingest continues either
-                // way. We don't bump drops because no further data was
-                // ever going to be parquet'd.
             }
 
-            // Memtable summary flush -- cheap, no db.flush() so it stays
-            // in memtable until the next periodic FLUSH_INTERVAL pushes
-            // everything to SST (which is what makes it visible to
-            // RocksDB secondary readers under --live).
             if writes_since_summary_flush >= SUMMARY_FLUSH_EVERY_N_WRITES {
                 summary.touch_now();
                 flush_summary_to_cf(&handle, &summary, &write_opts)?;
                 writes_since_summary_flush = 0;
             }
 
-            // Periodic flush to limit memory usage
             if entries_since_flush >= FLUSH_INTERVAL {
                 debug!("RocksDB periodic flush at {} entries", total_written);
                 handle.db.flush().map_err(RocksError::Rocks)?;
@@ -1865,9 +2047,8 @@ fn rocksdb_writer_loop(
         }
     }
 
-    // Write remaining entries
     if !pending.is_empty() {
-        write_rocks_batch(&handle, &pending, &write_opts)?;
+        write_rocks_batch_shard(&handle, 0, &pending, &write_opts)?;
         summary.update(&pending);
         total_written += pending.len() as u64;
 
@@ -1881,11 +2062,8 @@ fn rocksdb_writer_loop(
         }
     }
 
-    // Drop parquet_tx so the streaming writer sees disconnect and exits.
     drop(parquet_tx);
 
-    // Final summary flush + db.flush so secondary readers see the
-    // committed totals after a clean shutdown.
     summary.touch_now();
     flush_summary_to_cf(&handle, &summary, &write_opts)?;
     handle.db.flush().map_err(RocksError::Rocks)?;
@@ -1904,6 +2082,119 @@ fn rocksdb_writer_loop(
     );
     Ok(handle)
 }
+
+/// Per-shard writer thread loop for the multi-shard ingest path.
+///
+/// Each shard owns one path-CF and shares the inode CF with its peers
+/// (per-CF memtables + `allow_concurrent_memtable_write` make this
+/// safe). Periodic `db.flush()` is serialized via `flush_lock` so two
+/// shards don't issue overlapping flushes; the accumulator is updated
+/// per-shard and merged once at end-of-scan in the spawning thread.
+#[cfg(feature = "rocksdb")]
+#[allow(clippy::too_many_arguments)]
+fn rocksdb_writer_loop_shard(
+    handle: Arc<RocksHandle>,
+    shard_idx: usize,
+    entry_rx: Receiver<Vec<DbEntry>>,
+    parquet_tx: Option<Sender<Vec<DbEntry>>>,
+    batch_size: usize,
+    flush_lock: Arc<std::sync::Mutex<()>>,
+    flush_counter: Arc<AtomicU64>,
+) -> std::result::Result<crate::rocksdb::summary::SummaryAccumulator, crate::error::RocksError> {
+    use crate::error::RocksError;
+    use crate::rocksdb::summary::SummaryAccumulator;
+    use rocksdb::WriteOptions;
+
+    debug!(
+        "RocksDB writer thread (shard {}) started with batch_size={}",
+        shard_idx, batch_size
+    );
+
+    let mut total_written = 0u64;
+    let mut pending: Vec<DbEntry> = Vec::with_capacity(batch_size * 2);
+    let mut summary = SummaryAccumulator::new();
+    let mut parquet_drops: u64 = 0;
+    let mut parquet_drop_rows: u64 = 0;
+
+    // Across-shard flush threshold. Any single shard crossing this since
+    // its last contribution triggers one global db.flush(); sharing the
+    // counter (rather than per-shard) avoids amplifying flush count
+    // proportional to N when the ingest rate is fixed.
+    const GLOBAL_FLUSH_INTERVAL: u64 = 1_000_000;
+
+    let mut write_opts = WriteOptions::default();
+    write_opts.disable_wal(true);
+
+    while let Ok(entries) = entry_rx.recv() {
+        pending.extend(entries);
+
+        if pending.len() >= batch_size {
+            let batch_len = pending.len() as u64;
+            write_rocks_batch_shard(&handle, shard_idx, &pending, &write_opts)?;
+            summary.update(&pending);
+            total_written += batch_len;
+
+            let written_batch = std::mem::replace(&mut pending, Vec::with_capacity(batch_size * 2));
+            if let Some(ref tx) = parquet_tx {
+                let row_count = written_batch.len();
+                if let Err(crossbeam_channel::TrySendError::Full(_)) = tx.try_send(written_batch) {
+                    parquet_drops += 1;
+                    parquet_drop_rows += row_count as u64;
+                }
+            }
+
+            // Bump the shared cross-shard counter; check the threshold
+            // outside the mutex so the lock is held only when an actual
+            // flush is needed.
+            flush_counter.fetch_add(batch_len, Ordering::Relaxed);
+        }
+
+        if flush_counter.load(Ordering::Relaxed) >= GLOBAL_FLUSH_INTERVAL {
+            if let Ok(guard) = flush_lock.try_lock() {
+                // Recheck under the lock to avoid duplicate flushes.
+                if flush_counter.load(Ordering::Relaxed) >= GLOBAL_FLUSH_INTERVAL {
+                    debug!(
+                        "RocksDB global flush triggered by shard {}",
+                        shard_idx
+                    );
+                    handle.db.flush().map_err(RocksError::Rocks)?;
+                    flush_counter.store(0, Ordering::Relaxed);
+                }
+                drop(guard);
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        write_rocks_batch_shard(&handle, shard_idx, &pending, &write_opts)?;
+        summary.update(&pending);
+        total_written += pending.len() as u64;
+
+        let final_batch = std::mem::take(&mut pending);
+        if let Some(ref tx) = parquet_tx {
+            let row_count = final_batch.len();
+            if let Err(crossbeam_channel::TrySendError::Full(_)) = tx.try_send(final_batch) {
+                parquet_drops += 1;
+                parquet_drop_rows += row_count as u64;
+            }
+        }
+    }
+
+    drop(parquet_tx);
+
+    if parquet_drops > 0 {
+        warn!(
+            "Streaming Parquet dropped {} batches ({} rows) on shard {} under backpressure",
+            parquet_drops, parquet_drop_rows, shard_idx
+        );
+    }
+    debug!(
+        "RocksDB writer thread (shard {}) finished, wrote {} entries (shard summary: {} files, {} dirs)",
+        shard_idx, total_written, summary.total.total_files, summary.total.total_dirs
+    );
+    Ok(summary)
+}
+
 
 /// Serialize the in-memory accumulator into the five summary keys and
 /// flush them via a single WAL-disabled WriteBatch.
@@ -1937,10 +2228,18 @@ fn flush_summary_to_cf(
         .map_err(RocksError::Rocks)
 }
 
-/// Write a batch of entries to RocksDB
+/// Write a batch of entries owned by `shard_idx` to RocksDB.
+///
+/// All entries in the batch must hash to `shard_idx` under
+/// `path_to_shard(...)` — the caller (worker `ShardedSender`) guarantees
+/// this by routing per-entry. The path entry goes to that shard's CF
+/// and the inode entry goes to the (shared) inode CF. Inode-CF
+/// concurrent writes from N shards are safe because RocksDB has
+/// `allow_concurrent_memtable_write = true` set globally.
 #[cfg(feature = "rocksdb")]
-fn write_rocks_batch(
+fn write_rocks_batch_shard(
     handle: &RocksHandle,
+    shard_idx: usize,
     entries: &[DbEntry],
     write_opts: &rocksdb::WriteOptions,
 ) -> std::result::Result<(), crate::error::RocksError> {
@@ -1949,12 +2248,13 @@ fn write_rocks_batch(
     use rocksdb::WriteBatch;
 
     let mut batch = WriteBatch::default();
-    let cf_path = handle.cf_entries_by_path();
+    let cf_path = handle.cf_entries_by_path_shard(shard_idx);
     let cf_inode = handle.cf_entries_by_inode();
 
     for entry in entries {
         let rocks_entry = RocksEntry::from_db_entry(entry);
-        let value = rocks_entry.to_bytes()
+        let value = rocks_entry
+            .to_bytes()
             .map_err(|e| RocksError::Bincode(e.to_string()))?;
 
         let path_key = encode_path_key(&entry.path);

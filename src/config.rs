@@ -29,6 +29,12 @@ const MAX_BATCH_SIZE: usize = 100_000;
 /// per context and we'd risk hitting per-context server-side caps.
 const MAX_PIPELINE_DEPTH: usize = 64;
 
+/// Maximum writer-shard count. RocksDB's compaction thread pool is
+/// shared across CFs; with shards beyond ~32 the pool starts to thrash
+/// and per-shard memtable memory grows superlinearly with no further
+/// throughput gain.
+const MAX_WRITER_SHARDS: usize = 32;
+
 /// Regex for parsing NFS URLs
 static NFS_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     // Matches: nfs://server/export/path or server:/export/path
@@ -202,6 +208,19 @@ pub struct CliArgs {
     /// behavior). 8 is the recommended setting once validated.
     #[arg(long, default_value = "0", value_name = "N")]
     pub pipeline_depth: usize,
+
+    /// Number of RocksDB writer shards. 1 = legacy single-writer path
+    /// (current behavior). Higher values split the entries-by-path CF
+    /// into N independent CFs each owned by its own writer thread, so a
+    /// scan that's writer-bound can scale past one core's
+    /// `put_cf` rate. Recommended range on a many-core box pointed at a
+    /// large NFS export is 8 (strong baseline) — 16 (lift further only
+    /// if profiling still shows writer saturation). Above 32 the
+    /// background compaction pool starts to thrash. Incompatible with
+    /// `--stream-parquet` in v1; run `export-parquet --parallelism N`
+    /// after the scan instead.
+    #[arg(long, default_value = "1", value_name = "N")]
+    pub writer_shards: usize,
 }
 
 /// Subcommands
@@ -625,6 +644,11 @@ pub struct WalkConfig {
     /// Number of READDIRPLUS RPCs to keep in flight per worker.
     /// 0 = legacy serial worker loop. >0 selects the pipelined worker.
     pub pipeline_depth: usize,
+
+    /// Number of RocksDB writer shards (1 = legacy single-writer path).
+    /// Validated to 1..=32 in `from_args` and rejected when combined
+    /// with `--stream-parquet`.
+    pub writer_shards: usize,
 }
 
 impl WalkConfig {
@@ -701,6 +725,27 @@ impl WalkConfig {
             });
         }
 
+        // Validate writer-shard count.
+        if args.writer_shards == 0 || args.writer_shards > MAX_WRITER_SHARDS {
+            return Err(ConfigError::InvalidWriterShards {
+                shards: args.writer_shards,
+                max: MAX_WRITER_SHARDS,
+            });
+        }
+        // The streaming Parquet writer is single-threaded by design and
+        // would become the new bottleneck under multi-shard ingest. The
+        // recommended workflow is to run a regular scan and then
+        // `nfs-walker export-parquet --parallelism N` afterwards.
+        #[cfg(feature = "parquet")]
+        if args.writer_shards > 1 && args.stream_parquet {
+            return Err(ConfigError::IncompatibleFlags {
+                reason: "--writer-shards > 1 is not yet compatible with --stream-parquet. \
+                         Either drop --stream-parquet or set --writer-shards 1, then run \
+                         `nfs-walker export-parquet --parallelism N` after the scan."
+                    .to_string(),
+            });
+        }
+
         // Compile exclude patterns
         let exclude_patterns = args
             .exclude_patterns
@@ -761,6 +806,7 @@ impl WalkConfig {
             #[cfg(feature = "parquet")]
             stream_parquet: args.stream_parquet,
             pipeline_depth: args.pipeline_depth,
+            writer_shards: args.writer_shards,
         })
     }
 
@@ -847,6 +893,7 @@ mod tests {
             #[cfg(feature = "parquet")]
             stream_parquet: false,
             pipeline_depth: 0,
+            writer_shards: 1,
         };
 
         assert!(config.is_excluded("/data/.snapshot/hourly.0"));

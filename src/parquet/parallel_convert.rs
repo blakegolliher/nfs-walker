@@ -35,7 +35,7 @@ use crate::error::{ParquetError, WalkerError};
 use crate::parquet::builder::{RowBuilder, RowContext};
 use crate::parquet::convert::ExportStats;
 use crate::parquet::schema::{parquet_schema_ref, seconds_to_microseconds};
-use crate::rocksdb::schema::{meta_keys, RocksHandle, CF_ENTRIES_BY_PATH};
+use crate::rocksdb::schema::{cf_name_for_path_shard, meta_keys, RocksHandle};
 
 /// Progress callback for the parallel exporter.
 ///
@@ -165,12 +165,17 @@ where
         shard_count
     );
 
-    // Determine the per-shard key ranges from SST metadata.
-    let ranges = compute_shard_ranges(&rocks, shard_count)?;
-    let actual_shards = ranges.len();
+    // Compute the per-task work plan. For a single-CF DB this is just a
+    // list of key ranges over that CF; for a multi-CF (sharded) DB we
+    // compute SST-balanced ranges per CF and spread the requested
+    // parallelism across them.
+    let tasks = compute_export_tasks(&rocks, shard_count)?;
+    let actual_tasks = tasks.len();
     info!(
-        "Computed {} shard ranges (requested {})",
-        actual_shards, shard_count
+        "Computed {} export tasks across {} path-CF shard(s) (requested parallelism {})",
+        actual_tasks,
+        rocks.shards(),
+        shard_count
     );
 
     let abort = Arc::new(AtomicBool::new(false));
@@ -182,8 +187,8 @@ where
         scan_timestamp_us,
     };
 
-    let mut handles = Vec::with_capacity(actual_shards);
-    for (rank, range) in ranges.into_iter().enumerate() {
+    let mut handles = Vec::with_capacity(actual_tasks);
+    for (rank, task) in tasks.into_iter().enumerate() {
         let rocks = Arc::clone(&rocks);
         let scan_dir = scan_dir.clone();
         let abort = Arc::clone(&abort);
@@ -203,7 +208,7 @@ where
                     rank,
                     rocks,
                     &scan_dir,
-                    range,
+                    task,
                     row_ctx,
                     row_group_size,
                     target_file_size,
@@ -273,8 +278,8 @@ where
     )?;
 
     info!(
-        "Parallel export complete: {} entries in {} files ({} bytes) across {} shards",
-        total, shard_files, total_bytes, actual_shards
+        "Parallel export complete: {} entries in {} files ({} bytes) across {} tasks",
+        total, shard_files, total_bytes, actual_tasks
     );
 
     Ok(ExportStats {
@@ -285,16 +290,32 @@ where
     })
 }
 
-/// Per-shard worker: opens a bounded iterator over the supplied key
-/// range and writes one or more `part-rNN-SSSSS.parquet` files.
+/// One unit of export work — a (path-CF shard index, key range) pair.
 ///
-/// Returns the number of part files this shard produced.
+/// Output files for this task land at `part-rNN-SSSSS.parquet` where
+/// `NN` is the global rank assigned at spawn time.
+#[derive(Clone)]
+struct ExportTask {
+    /// Index of the path-CF shard this task reads from. 0 for legacy
+    /// single-CF DBs.
+    cf_shard: usize,
+    /// Inclusive lower bound, or `None` for the start of the CF.
+    lower: Option<Vec<u8>>,
+    /// Exclusive upper bound, or `None` for the end of the CF.
+    upper: Option<Vec<u8>>,
+}
+
+/// Per-task worker: opens a bounded iterator over the supplied key
+/// range (within one path-CF shard) and writes one or more
+/// `part-rNN-SSSSS.parquet` files.
+///
+/// Returns the number of part files this task produced.
 #[allow(clippy::too_many_arguments)]
 fn run_shard(
     rank: usize,
     rocks: Arc<RocksHandle>,
     scan_dir: &Path,
-    range: ShardRange,
+    task: ExportTask,
     row_ctx: RowContext,
     row_group_size: usize,
     target_file_size: usize,
@@ -315,17 +336,17 @@ fn run_shard(
     let mut shard_total: u64 = 0;
     let mut since_last_progress: u64 = 0;
 
-    // Build ReadOptions with the shard's bounds. Note these own their
+    // Build ReadOptions with the task's bounds. Note these own their
     // bound buffers — we keep ReadOptions alive for the full iteration.
     let mut read_opts = ReadOptions::default();
-    if let Some(lower) = range.lower.as_ref() {
+    if let Some(lower) = task.lower.as_ref() {
         read_opts.set_iterate_lower_bound(lower.clone());
     }
-    if let Some(upper) = range.upper.as_ref() {
+    if let Some(upper) = task.upper.as_ref() {
         read_opts.set_iterate_upper_bound(upper.clone());
     }
 
-    let cf = rocks.cf_entries_by_path();
+    let cf = rocks.cf_entries_by_path_shard(task.cf_shard);
     let iter = rocks
         .db
         .iterator_cf_opt(cf, read_opts, rocksdb::IteratorMode::Start);
@@ -404,86 +425,105 @@ fn run_shard(
     }
 
     info!(
-        "shard {:02} complete: {} entries in {} part files",
-        rank, shard_total, part_seq
+        "shard {:02} (cf_shard={}) complete: {} entries in {} part files",
+        rank, task.cf_shard, shard_total, part_seq
     );
 
     Ok(part_seq)
 }
 
-#[derive(Debug, Clone)]
-struct ShardRange {
-    lower: Option<Vec<u8>>, // inclusive; None = start of CF
-    upper: Option<Vec<u8>>, // exclusive; None = end of CF
-}
-
-/// Walk the path-CF SSTs sorted by start key, accumulate their sizes,
-/// and pick split points wherever cumulative size crosses
-/// `total_size / requested_shards`. The split keys become the upper /
-/// lower bounds for adjacent shards, so every user-key in the CF
-/// belongs to exactly one shard.
-///
-/// Falls back to a single full-keyspace shard if SST metadata is
-/// unavailable or the CF is empty.
-fn compute_shard_ranges(
+/// Plan one task per (path-CF shard, key range). For a single-CF DB
+/// this is just the legacy `compute_shard_ranges` output bound to
+/// shard 0. For an N-shard DB we compute SST-balanced ranges per CF
+/// using a per-CF target parallelism of roughly `requested / N`,
+/// floor-clamped to 1, so every CF gets at least one task.
+fn compute_export_tasks(
     rocks: &RocksHandle,
     requested: usize,
-) -> Result<Vec<ShardRange>, WalkerError> {
+) -> Result<Vec<ExportTask>, WalkerError> {
+    let n_cf = rocks.shards().max(1);
+    let mut tasks = Vec::new();
+
+    // How much parallelism to allocate per CF. With requested=64 and
+    // n_cf=8: 8 tasks per CF, 64 total. Floor clamp to 1 so a low
+    // requested value still yields one task per CF.
+    let per_cf = (requested / n_cf).max(1);
+
     let live = rocks.db.live_files().map_err(|e| {
-        WalkerError::Parquet(ParquetError::Other(format!(
-            "Failed to list SSTs: {}",
-            e
-        )))
+        WalkerError::Parquet(ParquetError::Other(format!("Failed to list SSTs: {}", e)))
     })?;
 
-    // Filter to the path CF and to SSTs that have a valid key range.
-    let mut path_ssts: Vec<&rocksdb::LiveFile> = live
-        .iter()
-        .filter(|f| f.column_family_name == CF_ENTRIES_BY_PATH)
-        .filter(|f| f.start_key.is_some() && f.end_key.is_some())
-        .collect();
+    for cf_shard in 0..n_cf {
+        let cf_name = cf_name_for_path_shard(cf_shard, n_cf);
+        let cf_live: Vec<&rocksdb::LiveFile> = live
+            .iter()
+            .filter(|f| f.column_family_name == cf_name)
+            .filter(|f| f.start_key.is_some() && f.end_key.is_some())
+            .collect();
 
-    if requested <= 1 || path_ssts.is_empty() {
-        return Ok(vec![ShardRange {
-            lower: None,
-            upper: None,
-        }]);
+        let cf_tasks = compute_per_cf_ranges(&cf_live, per_cf);
+        for (lower, upper) in cf_tasks {
+            tasks.push(ExportTask {
+                cf_shard,
+                lower,
+                upper,
+            });
+        }
     }
 
-    path_ssts.sort_by(|a, b| {
+    if tasks.is_empty() {
+        // Empty DB or all CFs missing SST metadata. Emit one full-range
+        // task per CF so we still iterate them all (cheap when empty).
+        for cf_shard in 0..n_cf {
+            tasks.push(ExportTask {
+                cf_shard,
+                lower: None,
+                upper: None,
+            });
+        }
+    }
+    Ok(tasks)
+}
+
+/// Compute SST-balanced (lower, upper) ranges for a single path-CF
+/// shard's live files. Returns at least one entry. The legacy
+/// SST-walking algorithm — pick split points whenever cumulative size
+/// crosses `total_size / requested`.
+fn compute_per_cf_ranges(
+    sst_refs: &[&rocksdb::LiveFile],
+    requested: usize,
+) -> Vec<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    if requested <= 1 || sst_refs.is_empty() {
+        return vec![(None, None)];
+    }
+
+    let mut sorted: Vec<&rocksdb::LiveFile> = sst_refs.to_vec();
+    sorted.sort_by(|a, b| {
         a.start_key
             .as_ref()
             .unwrap()
             .cmp(b.start_key.as_ref().unwrap())
     });
 
-    let total_size: u64 = path_ssts.iter().map(|f| f.size as u64).sum();
+    let total_size: u64 = sorted.iter().map(|f| f.size as u64).sum();
     if total_size == 0 {
-        return Ok(vec![ShardRange {
-            lower: None,
-            upper: None,
-        }]);
+        return vec![(None, None)];
     }
 
-    let target_per_shard = total_size / requested as u64;
+    let target = total_size / requested as u64;
     let mut splits: Vec<Vec<u8>> = Vec::with_capacity(requested.saturating_sub(1));
     let mut cumulative: u64 = 0;
-    let mut next_threshold = target_per_shard;
+    let mut next_threshold = target;
     let mut prev_split: Option<&Vec<u8>> = None;
 
-    for sst in &path_ssts {
+    for sst in &sorted {
         cumulative += sst.size as u64;
         if cumulative >= next_threshold && splits.len() + 1 < requested {
-            // Use this SST's start_key as the cut point: everything <
-            // start_key goes to the left shard, everything >= goes
-            // right.
             let start = sst.start_key.as_ref().unwrap();
-            // Skip duplicates — multiple SSTs can share the same start
-            // key in pathological cases (level 0 overlap).
             if prev_split.is_none_or(|p| p != start) {
                 splits.push(start.clone());
                 prev_split = splits.last();
-                next_threshold += target_per_shard;
+                next_threshold += target;
             }
         }
     }
@@ -491,18 +531,11 @@ fn compute_shard_ranges(
     let mut ranges = Vec::with_capacity(splits.len() + 1);
     let mut prev_lower: Option<Vec<u8>> = None;
     for sp in splits {
-        ranges.push(ShardRange {
-            lower: prev_lower.clone(),
-            upper: Some(sp.clone()),
-        });
+        ranges.push((prev_lower.clone(), Some(sp.clone())));
         prev_lower = Some(sp);
     }
-    ranges.push(ShardRange {
-        lower: prev_lower,
-        upper: None,
-    });
-
-    Ok(ranges)
+    ranges.push((prev_lower, None));
+    ranges
 }
 
 fn writer_properties(compression_level: i32) -> Result<WriterProperties, WalkerError> {

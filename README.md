@@ -273,6 +273,93 @@ Tested on a real NFS export: **4.1M files, 17,919 directories, 1.32 TiB** over N
 | Peak Memory | ~5 GB |
 | Database Size | 4.0 GiB |
 
+### Billion-Entry Workflow
+
+Real production target: a multi-petabyte NFS export with ~4.4 billion entries (~80 M dirs, ~4.36 B files), driven from a 160-core / 1.4 TiB host with NVMe-backed RocksDB output, against a **34-cnode VAST cluster**. Three back-to-back ingest profiles were measured to characterize where the throughput ceiling actually lives.
+
+**Profile A — single writer, pipeline-depth 8 (post writer-tweak baseline, commit `4297796`):**
+
+```bash
+./nfs-walker nfs://<server>/<export> \
+    -w 1024 --pipeline-depth 8 \
+    -o /mnt/nvme/scan-v2.rocks
+```
+
+| Metric | Result |
+|--------|--------|
+| Entries scanned | 4,361,995,918 (4.36 B) |
+| Wall-clock | 3h 37m (13,063 s) |
+| Throughput | **333,920 entries/sec** |
+| RocksDB size | 775.93 GiB |
+| Per-thread profile | one `rocks-writer` at 99.9 % CPU; 1024 walkers at < 1 % blocked on `entry_tx.send` |
+
+**Profile B — eight writer shards, pipeline-depth 8:**
+
+```bash
+sudo ./nfs-walker nfs://<server>/<export> \
+    -w 1024 --pipeline-depth 8 --writer-shards 8 \
+    -o /mnt/nvme/scan-v3.rocks
+```
+
+| Metric | Result |
+|--------|--------|
+| Entries scanned | 4,374,686,367 (4.37 B) |
+| Wall-clock | 3h 34m (12,876 s) — **−1.4 % vs Profile A** |
+| Throughput | **339,748 entries/sec** |
+| RocksDB size | 796.71 GiB (+2.7 %) |
+| Per-thread profile | 8 `rocks-writer-N` threads at ~14 % CPU each (perfectly balanced); walkers still parked at 0–5 %; compaction picks up |
+
+**Profile C — single writer, pipeline-depth 16:**
+
+```bash
+sudo ./nfs-walker nfs://<server>/<export> \
+    -w 1024 --pipeline-depth 16 --writer-shards 1 \
+    -o /mnt/nvme/scan-v4.rocks
+```
+
+| Metric | Result |
+|--------|--------|
+| Throughput (sustained) | **351,000 entries/sec** — **+5 % vs Profile A** |
+| Per-thread profile | one `rocks-writer` at ~80 % CPU; walkers visibly active at 7–15 %; compaction at ~16 cores burst |
+
+**The wall is the NFS server's response rate to a single client.** Three independent levers — adding 8× writer parallelism, doubling per-walker RPC concurrency, both at once — moved wall-clock by less than 5 %. Per-walker throughput barely budged between depth 8 (332 ent/s/walker) and depth 16 (343 ent/s/walker). That means walkers are not waiting for in-flight RPCs to drain; they're getting responses at a server-throttled cadence regardless of how many they queue up.
+
+**Sizing factor:** the ~340–355 K entries/sec ceiling is a property of *this* server (a 34-cnode VAST cluster), not a property of nfs-walker. Larger clusters with more cnodes will deliver more requests/sec to a single client; smaller clusters less. Treat the numbers above as a **per-cluster-capacity datum**, not a tool benchmark — and re-run all three profiles when characterizing a new target.
+
+**Recommended config for this class of target:**
+
+```bash
+./nfs-walker nfs://<server>/<export> \
+    -w 1024 --pipeline-depth 8 \
+    -o /mnt/nvme/scan.rocks
+```
+
+`--writer-shards` defaults to 1. Turn it on only when per-thread sampling (`ps -eLo pid,tid,pcpu,comm | sort -k3 -nr | head -40`) shows `rocks-writer` pinned at 99 % *and* walker threads at 0 % — that's the signature of a writer-bound scan, where Profile B's 4–6× lift can be claimed. On servers like the one above, that signature never appears.
+
+**Parallel Parquet export** (read-only on the finished `.rocks`, can run alongside the next scan):
+
+```bash
+ulimit -n 1048576       # RocksDB read-only mode pins every SST file open
+./nfs-walker export-parquet /mnt/nvme/scan.rocks /mnt/nvme/scan.parquet \
+    --parallelism 160 -p
+```
+
+| Profile | Parquet wall-clock | Output size | Files |
+|---------|-------------------|-------------|-------|
+| A (1 writer)   | 7m 42s | **85.28 GiB** | 407 |
+| B (8 writers)  | 8m 25s | **107.41 GiB** (+26 %) | 498 |
+
+> ⚠️ **`--writer-shards > 1` costs ~25 % more Parquet bytes.** ZSTD compresses the path column heavily when adjacent rows in a row group share long common prefixes (`/videos/d8a/file-001.mp4`, `/videos/d8a/file-002.mp4`, …). With 8 shards, gxhash scatters siblings across 8 CFs — each shard's rows are internally sorted, but the path bytes within any one row group have far less mutual prefix overlap, so the compression dictionary becomes much less effective. Same compression level, worse compressibility. Another reason to leave `--writer-shards 1` as the default.
+
+The Parquet directory is one logical scan (`metadata.json` lists every part), so DuckDB / DataFusion / Polars can `read_parquet('scan.parquet/scans/*/part-*.parquet')` and iterate the 4.4 B rows directly.
+
+> Tuning notes for very large scans:
+> - Scale RocksDB compaction parallelism with the host: the binary already sets `set_max_background_jobs((num_cpus / 2).clamp(4, 32))`.
+> - Bump the producer→writer channel and the writer batch size on many-core boxes — defaults are 1024 / 5000 respectively.
+> - `--pipeline-depth 8` is a sweet spot; `16` adds nothing on a server-bound target and adds memory pressure (16 in-flight READDIRPLUS responses per worker).
+> - **The only client-side lever left after `--writer-shards 1 --pipeline-depth 8` is multi-host scan-out** — split the tree across N transfer hosts, each scanning a disjoint subtree. Per-client throttling at the NFS server is what the experiments above measure; running two clients should roughly double aggregate throughput on this class of cluster.
+> - `--stream-parquet` stays single-threaded by design; use it only with `--writer-shards 1`.
+
 ### Content Analysis Performance
 
 Tested on **770K files, 373 GiB** over NFS:

@@ -39,7 +39,7 @@ pub struct RocksWriter {
 }
 
 impl RocksWriter {
-    /// Open or create RocksDB for writing
+    /// Open or create RocksDB for writing (single-shard schema).
     pub fn open<P: AsRef<Path>>(path: P, config: RocksWriterConfig) -> Result<Self, RocksError> {
         // Remove existing database if present (fresh scan)
         let path_ref = path.as_ref();
@@ -49,6 +49,22 @@ impl RocksWriter {
         }
 
         let handle = RocksHandle::open(path).map_err(RocksError::Rocks)?;
+        Ok(Self { handle, config })
+    }
+
+    /// Open or create RocksDB with `shards` path-CF shards. The database
+    /// is wiped if it already exists (consistent with `open`).
+    pub fn open_with_shards<P: AsRef<Path>>(
+        path: P,
+        shards: usize,
+        config: RocksWriterConfig,
+    ) -> Result<Self, RocksError> {
+        let path_ref = path.as_ref();
+        if path_ref.exists() {
+            std::fs::remove_dir_all(path_ref).map_err(|e| RocksError::Io(e.to_string()))?;
+        }
+
+        let handle = RocksHandle::open_with_shards(path, shards).map_err(RocksError::Rocks)?;
         Ok(Self { handle, config })
     }
 
@@ -62,14 +78,15 @@ impl RocksWriter {
         self.handle.set_metadata(key, value).map_err(RocksError::Rocks)
     }
 
-    /// Write a batch of entries
+    /// Write a batch of entries. Routes each entry's path-keyed write
+    /// to its owning shard CF (single CF when shards == 1). The
+    /// inode-keyed write goes to the shared inode CF either way.
     pub fn write_batch(&self, entries: &[DbEntry]) -> Result<(), RocksError> {
         if entries.is_empty() {
             return Ok(());
         }
 
         let mut batch = WriteBatch::default();
-        let cf_path = self.handle.cf_entries_by_path();
         let cf_inode = self.handle.cf_entries_by_inode();
 
         for entry in entries {
@@ -80,7 +97,8 @@ impl RocksWriter {
             let path_key = encode_path_key(&entry.path);
             let inode_key = encode_inode_key(entry.inode);
 
-            batch.put_cf(cf_path, &path_key, &value);
+            let shard = self.handle.shard_for_path(&entry.path);
+            batch.put_cf(self.handle.cf_entries_by_path_shard(shard), &path_key, &value);
             batch.put_cf(cf_inode, &inode_key, &value);
         }
 
@@ -241,5 +259,56 @@ mod tests {
         let entry = writer.handle().get_by_path("/test.txt").unwrap();
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().name, "test.txt");
+    }
+
+    #[test]
+    fn rocks_writer_with_4_shards_round_trips() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("sharded.rocks");
+
+        let writer = RocksWriter::open_with_shards(&db_path, 4, RocksWriterConfig::default())
+            .unwrap();
+
+        let entries: Vec<DbEntry> = (0..256u64)
+            .map(|i| DbEntry {
+                parent_path: Some("/data".to_string()),
+                name: format!("file-{:04}.bin", i),
+                path: format!("/data/file-{:04}.bin", i),
+                entry_type: EntryType::File,
+                size: i,
+                mtime: None,
+                atime: None,
+                ctime: None,
+                mode: Some(0o644),
+                uid: Some(1000),
+                gid: Some(1000),
+                nlink: Some(1),
+                inode: i + 1,
+                depth: 2,
+                extension: Some("bin".to_string()),
+                blocks: 0,
+                checksum: None,
+                file_type: None,
+            })
+            .collect();
+
+        writer.write_batch(&entries).unwrap();
+        writer.flush().unwrap();
+        let h = writer.into_handle();
+
+        // Iter via k-way merge across 4 shard CFs is ordered + complete.
+        let mut count = 0usize;
+        for res in h.iter_by_path() {
+            let _ = res.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 256);
+
+        // Each entry resolves via its owning shard.
+        for i in 0..256u64 {
+            let path = format!("/data/file-{:04}.bin", i);
+            let got = h.get_by_path(&path).unwrap();
+            assert_eq!(got.unwrap().path, path);
+        }
     }
 }

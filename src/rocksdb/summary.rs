@@ -150,6 +150,47 @@ impl SummaryAccumulator {
         self.total.last_updated_us = chrono::Utc::now().timestamp_micros();
     }
 
+    /// Fold another accumulator's totals into this one. Used by the
+    /// multi-shard writer to merge per-shard accumulators at end-of-scan
+    /// (and at periodic flush points if a global view is needed).
+    pub fn merge_from(&mut self, other: &SummaryAccumulator) {
+        self.total.total_entries += other.total.total_entries;
+        self.total.total_files += other.total.total_files;
+        self.total.total_dirs += other.total.total_dirs;
+        self.total.total_symlinks += other.total.total_symlinks;
+        self.total.total_bytes += other.total.total_bytes;
+        self.total.total_blocks += other.total.total_blocks;
+        if other.total.max_depth > self.total.max_depth {
+            self.total.max_depth = other.total.max_depth;
+        }
+        if other.total.last_updated_us > self.total.last_updated_us {
+            self.total.last_updated_us = other.total.last_updated_us;
+        }
+        for (k, v) in &other.by_extension {
+            let dst = self.by_extension.entry(k.clone()).or_default();
+            dst.count += v.count;
+            dst.bytes += v.bytes;
+            dst.blocks += v.blocks;
+        }
+        for (k, v) in &other.by_uid {
+            let dst = self.by_uid.entry(*k).or_default();
+            dst.file_count += v.file_count;
+            dst.dir_count += v.dir_count;
+            dst.bytes += v.bytes;
+        }
+        for (k, v) in &other.by_gid {
+            let dst = self.by_gid.entry(*k).or_default();
+            dst.file_count += v.file_count;
+            dst.dir_count += v.dir_count;
+            dst.bytes += v.bytes;
+        }
+        for (k, v) in &other.by_file_type {
+            let dst = self.by_file_type.entry(k.clone()).or_default();
+            dst.count += v.count;
+            dst.bytes += v.bytes;
+        }
+    }
+
     /// Serialize the five summary keys ready for a single WriteBatch flush.
     pub fn serialize_kv(&self) -> Result<Vec<(&'static [u8], Vec<u8>)>, bincode::Error> {
         Ok(vec![

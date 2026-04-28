@@ -6,6 +6,7 @@
 use crate::error::RocksError;
 use crate::rocksdb::schema::{encode_inode_key, encode_path_key, RocksEntry, RocksHandle};
 use std::path::Path;
+use std::string::FromUtf8Error;
 
 /// Baseline reader for incremental scan comparisons
 ///
@@ -35,12 +36,14 @@ impl RocksBaseline {
         self.handle.get_by_inode(inode)
     }
 
-    /// Check if path exists in baseline
+    /// Check if path exists in baseline. Routes to the owning shard CF
+    /// regardless of shard count.
     pub fn contains_path(&self, path: &str) -> Result<bool, RocksError> {
         let key = encode_path_key(path);
+        let shard = self.handle.shard_for_path(path);
         self.handle
             .db
-            .get_cf(self.handle.cf_entries_by_path(), &key)
+            .get_cf(self.handle.cf_entries_by_path_shard(shard), &key)
             .map(|v| v.is_some())
             .map_err(RocksError::Rocks)
     }
@@ -55,55 +58,33 @@ impl RocksBaseline {
             .map_err(RocksError::Rocks)
     }
 
-    /// Iterate all paths in baseline
-    /// Returns (path, entry) pairs in lexicographic order
+    /// Iterate all paths in baseline.
+    /// Returns (path, entry) pairs in lexicographic order, transparently
+    /// k-way merged across shard CFs when the DB is multi-shard.
     pub fn iter_paths(
         &self,
-    ) -> impl Iterator<Item = Result<(String, RocksEntry), RocksError>> + '_ {
-        use rocksdb::IteratorMode;
-
-        self.handle
-            .db
-            .iterator_cf(self.handle.cf_entries_by_path(), IteratorMode::Start)
-            .map(|result| {
-                let (key, value) = result.map_err(RocksError::Rocks)?;
-                let path = String::from_utf8(key.to_vec())
-                    .map_err(|e| RocksError::Bincode(e.to_string()))?;
-                let entry = RocksEntry::from_bytes(&value)
-                    .map_err(|e| RocksError::Bincode(e.to_string()))?;
-                Ok((path, entry))
-            })
+    ) -> Box<dyn Iterator<Item = Result<(String, RocksEntry), RocksError>> + '_> {
+        Box::new(self.handle.iter_by_path_kv().map(|res| {
+            let (key, entry) = res?;
+            let path = bytes_to_path(&key)?;
+            Ok((path, entry))
+        }))
     }
 
-    /// Iterate paths with a given prefix
+    /// Iterate paths with a given prefix in lexicographic order.
     pub fn iter_paths_with_prefix(
         &self,
         prefix: &str,
-    ) -> impl Iterator<Item = Result<(String, RocksEntry), RocksError>> + '_ {
-        use rocksdb::IteratorMode;
-
-        let prefix_bytes = prefix.as_bytes().to_vec();
-
-        self.handle
-            .db
-            .iterator_cf(
-                self.handle.cf_entries_by_path(),
-                IteratorMode::From(&prefix_bytes, rocksdb::Direction::Forward),
-            )
-            .take_while(move |result| {
-                match result {
-                    Ok((key, _)) => key.starts_with(&prefix_bytes),
-                    Err(_) => true, // Continue to propagate errors
-                }
-            })
-            .map(|result| {
-                let (key, value) = result.map_err(RocksError::Rocks)?;
-                let path = String::from_utf8(key.to_vec())
-                    .map_err(|e| RocksError::Bincode(e.to_string()))?;
-                let entry = RocksEntry::from_bytes(&value)
-                    .map_err(|e| RocksError::Bincode(e.to_string()))?;
-                Ok((path, entry))
-            })
+    ) -> Box<dyn Iterator<Item = Result<(String, RocksEntry), RocksError>> + '_> {
+        Box::new(
+            self.handle
+                .iter_by_path_prefix(prefix.as_bytes())
+                .map(|res| {
+                    let (key, entry) = res?;
+                    let path = bytes_to_path(&key)?;
+                    Ok((path, entry))
+                }),
+        )
     }
 
     /// Get metadata value
@@ -111,17 +92,26 @@ impl RocksBaseline {
         self.handle.get_metadata(key).map_err(RocksError::Rocks)
     }
 
-    /// Get approximate entry count (fast, but not exact)
+    /// Get approximate entry count (fast, but not exact). Sums the
+    /// per-shard estimate when the DB has multiple path-CF shards.
     pub fn approx_entry_count(&self) -> u64 {
-        self.handle
-            .db
-            .property_int_value_cf(
-                self.handle.cf_entries_by_path(),
-                "rocksdb.estimate-num-keys",
-            )
-            .unwrap_or(None)
-            .unwrap_or(0)
+        (0..self.handle.shards())
+            .map(|i| {
+                self.handle
+                    .db
+                    .property_int_value_cf(
+                        self.handle.cf_entries_by_path_shard(i),
+                        "rocksdb.estimate-num-keys",
+                    )
+                    .unwrap_or(None)
+                    .unwrap_or(0)
+            })
+            .sum()
     }
+}
+
+fn bytes_to_path(bytes: &[u8]) -> Result<String, RocksError> {
+    String::from_utf8(bytes.to_vec()).map_err(|e: FromUtf8Error| RocksError::Bincode(e.to_string()))
 }
 
 /// Result of comparing a current entry against the baseline
