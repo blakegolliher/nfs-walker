@@ -103,9 +103,7 @@ impl RocksWriter {
         let cf_inode = self.handle.cf_entries_by_inode();
 
         for entry in entries {
-            tracing::warn!(path = %entry.path, mtime_at_writer = ?entry.mtime, "PROBE: writer mtime");
             let rocks_entry = RocksEntry::from_db_entry(entry);
-            tracing::warn!(path = %entry.path, rocks_entry_mtime = ?rocks_entry.mtime, "PROBE: rocks_entry mtime after from_db_entry");
             let value = rocks_entry.to_bytes()
                 .map_err(|e| RocksError::Bincode(e.to_string()))?;
 
