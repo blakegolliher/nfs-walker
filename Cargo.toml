@@ -97,3 +97,8 @@ opt-level = 3
 
 [profile.dev]
 opt-level = 1
+
+[[bin]]
+name = "nfs-walker-parquet-parallel"
+path = "src/bin/nfs-walker-parquet-parallel.rs"
+required-features = ["parquet"]
