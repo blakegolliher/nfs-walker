@@ -49,7 +49,9 @@ impl RocksWriter {
         }
 
         let handle = RocksHandle::open(path).map_err(RocksError::Rocks)?;
-        Ok(Self { handle, config })
+        let me = Self { handle, config };
+        me.stamp_format_metadata()?;
+        Ok(me)
     }
 
     /// Open or create RocksDB with `shards` path-CF shards. The database
@@ -65,7 +67,18 @@ impl RocksWriter {
         }
 
         let handle = RocksHandle::open_with_shards(path, shards).map_err(RocksError::Rocks)?;
-        Ok(Self { handle, config })
+        let me = Self { handle, config };
+        me.stamp_format_metadata()?;
+        Ok(me)
+    }
+
+    /// Tag the freshly-opened DB with the time-unit format the writer
+    /// uses, so Parquet exporters can tell new (microsecond) databases
+    /// apart from legacy (second-only) ones.
+    fn stamp_format_metadata(&self) -> Result<(), RocksError> {
+        self.handle
+            .set_metadata(meta_keys::MTIME_FORMAT, meta_keys::MTIME_FORMAT_MICROSECONDS)
+            .map_err(RocksError::Rocks)
     }
 
     /// Get reference to the underlying handle
@@ -90,7 +103,9 @@ impl RocksWriter {
         let cf_inode = self.handle.cf_entries_by_inode();
 
         for entry in entries {
+            tracing::warn!(path = %entry.path, mtime_at_writer = ?entry.mtime, "PROBE: writer mtime");
             let rocks_entry = RocksEntry::from_db_entry(entry);
+            tracing::warn!(path = %entry.path, rocks_entry_mtime = ?rocks_entry.mtime, "PROBE: rocks_entry mtime after from_db_entry");
             let value = rocks_entry.to_bytes()
                 .map_err(|e| RocksError::Bincode(e.to_string()))?;
 

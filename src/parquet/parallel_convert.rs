@@ -185,6 +185,7 @@ where
     let row_ctx = RowContext {
         scan_id: scan_id.clone(),
         scan_timestamp_us,
+        mtime_scale: crate::parquet::convert::detect_mtime_scale(&rocks)?,
     };
 
     let mut handles = Vec::with_capacity(actual_tasks);

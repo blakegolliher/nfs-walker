@@ -84,6 +84,14 @@ pub mod meta_keys {
     /// PATH_SHARDS so a reader compiled with a different hash refuses
     /// to open instead of routing point lookups to the wrong shard.
     pub const PATH_SHARDS_HASH_VERSION: &str = "path_cf_shards_hash_version";
+    /// Time-unit tag for `RocksEntry::{mtime,atime,ctime}` values.
+    /// Present on databases written by walkers that capture sub-second
+    /// precision; absent on older databases that stored seconds. The
+    /// Parquet exporter switches between pass-through and *1_000_000
+    /// based on this key. Value is `"microseconds"` for new scans.
+    pub const MTIME_FORMAT: &str = "mtime_format";
+    /// String value written for `MTIME_FORMAT` by the current walker.
+    pub const MTIME_FORMAT_MICROSECONDS: &str = "microseconds";
 }
 
 /// Hash a path to a shard index.
@@ -116,6 +124,12 @@ pub fn cf_name_for_path_shard(idx: usize, shards: usize) -> String {
 
 /// Entry stored in RocksDB with bincode serialization
 /// Designed for compact storage (~100 bytes/entry)
+///
+/// `mtime`/`atime`/`ctime` hold microseconds since the Unix epoch on
+/// fresh databases (those tagged with `meta_keys::MTIME_FORMAT =
+/// "microseconds"`). Legacy databases written before that tag was
+/// introduced stored seconds; the Parquet exporter detects the absence
+/// of the tag and rescales those values on the way out.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RocksEntry {
     pub name: String,

@@ -5,6 +5,16 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Convert a microseconds-since-epoch value to a SystemTime, handling
+/// pre-epoch (negative) inputs by walking backwards from UNIX_EPOCH.
+fn micros_to_system_time(us: i64) -> SystemTime {
+    if us >= 0 {
+        UNIX_EPOCH + Duration::from_micros(us as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_micros((-us) as u64)
+    }
+}
+
 /// Type of filesystem entry
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -135,13 +145,17 @@ pub struct NfsStat {
     /// File mode (type + permissions)
     pub mode: u32,
 
-    /// Last access time (Unix timestamp)
+    /// Last access time (microseconds since Unix epoch)
+    ///
+    /// Packs the libnfs sec + nsec fields together via the helpers in
+    /// `connection.rs` so sub-second precision is preserved end-to-end
+    /// (RocksDB → Parquet `atime_us` → migration `nfs_utimes`).
     pub atime: Option<i64>,
 
-    /// Last modification time (Unix timestamp)
+    /// Last modification time (microseconds since Unix epoch)
     pub mtime: Option<i64>,
 
-    /// Status change time (Unix timestamp)
+    /// Status change time (microseconds since Unix epoch)
     pub ctime: Option<i64>,
 
     /// Block size
@@ -162,26 +176,14 @@ impl NfsStat {
         Permissions::from_mode(self.mode)
     }
 
-    /// Convert atime to SystemTime
+    /// Convert atime (microseconds since epoch) to SystemTime
     pub fn atime_as_system_time(&self) -> Option<SystemTime> {
-        self.atime.map(|t| {
-            if t >= 0 {
-                UNIX_EPOCH + Duration::from_secs(t as u64)
-            } else {
-                UNIX_EPOCH - Duration::from_secs((-t) as u64)
-            }
-        })
+        self.atime.map(micros_to_system_time)
     }
 
-    /// Convert mtime to SystemTime
+    /// Convert mtime (microseconds since epoch) to SystemTime
     pub fn mtime_as_system_time(&self) -> Option<SystemTime> {
-        self.mtime.map(|t| {
-            if t >= 0 {
-                UNIX_EPOCH + Duration::from_secs(t as u64)
-            } else {
-                UNIX_EPOCH - Duration::from_secs((-t) as u64)
-            }
-        })
+        self.mtime.map(micros_to_system_time)
     }
 }
 
@@ -339,13 +341,13 @@ pub struct DbEntry {
     /// File size in bytes
     pub size: u64,
 
-    /// Last modification time (Unix timestamp)
+    /// Last modification time (microseconds since Unix epoch)
     pub mtime: Option<i64>,
 
-    /// Last access time (Unix timestamp)
+    /// Last access time (microseconds since Unix epoch)
     pub atime: Option<i64>,
 
-    /// Status change time (Unix timestamp)
+    /// Status change time (microseconds since Unix epoch)
     pub ctime: Option<i64>,
 
     /// Permission mode

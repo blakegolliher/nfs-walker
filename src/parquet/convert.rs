@@ -51,6 +51,34 @@ pub struct ExportStats {
 /// Progress callback type
 pub type ProgressCallback = Box<dyn Fn(u64, u64) + Send>;
 
+/// Decide whether the RocksDB row times are already microseconds or
+/// still in seconds (legacy databases written before the walker
+/// captured sub-second precision). Returns the multiplier the row
+/// builder should apply: `1` for microseconds, `1_000_000` for seconds.
+///
+/// New databases stamp `meta_keys::MTIME_FORMAT = "microseconds"`.
+/// Anything else — absent, empty, the literal `"seconds"`, or an
+/// unrecognized value — is treated as legacy seconds. We deliberately
+/// don't error on unrecognized values: rescaling preserves the existing
+/// behavior of older binaries (no precision loss for whole-second data,
+/// and a clear flag in metadata hints at why values look stale).
+pub(crate) fn detect_mtime_scale(rocks: &RocksHandle) -> Result<i64, WalkerError> {
+    let value = rocks
+        .get_metadata(meta_keys::MTIME_FORMAT)
+        .map_err(|e| {
+            WalkerError::Parquet(ParquetError::Other(format!(
+                "Failed to read mtime_format metadata: {}",
+                e
+            )))
+        })?
+        .unwrap_or_default();
+    Ok(if value == meta_keys::MTIME_FORMAT_MICROSECONDS {
+        1
+    } else {
+        1_000_000
+    })
+}
+
 /// Convert a RocksDB database to Parquet files.
 ///
 /// Writes Parquet files to `<output_dir>/scans/<scan_id>/` with automatic
@@ -139,6 +167,7 @@ where
     let mut row_builder = RowBuilder::new(RowContext {
         scan_id: scan_id.clone(),
         scan_timestamp_us,
+        mtime_scale: detect_mtime_scale(&rocks)?,
     });
 
     for result in rocks.iter_by_path() {
@@ -503,5 +532,150 @@ mod tests {
 
         // Final callback should have been called with total entries
         assert_eq!(last_count.load(Ordering::SeqCst), stats.entries_exported);
+    }
+
+    #[test]
+    fn detect_mtime_scale_returns_one_for_new_dbs() {
+        // RocksWriter::open stamps MTIME_FORMAT = "microseconds". So a
+        // freshly-opened DB must drive scale=1 (no rescale at export).
+        let dir = tempdir().unwrap();
+        let rocks_path = create_test_rocks(dir.path());
+
+        let rocks = RocksHandle::open_readonly(&rocks_path).unwrap();
+        assert_eq!(detect_mtime_scale(&rocks).unwrap(), 1);
+    }
+
+    #[test]
+    fn detect_mtime_scale_returns_million_for_legacy_dbs() {
+        // Drop the MTIME_FORMAT key to simulate an old database written
+        // before the walker captured sub-second precision. The exporter
+        // must rescale by 1_000_000 so legacy seconds turn into the
+        // microseconds the Parquet schema expects.
+        let dir = tempdir().unwrap();
+        let rocks_path = create_test_rocks(dir.path());
+        {
+            let h = RocksHandle::open(&rocks_path).unwrap();
+            h.db
+                .delete_cf(h.cf_metadata(), meta_keys::MTIME_FORMAT.as_bytes())
+                .unwrap();
+        }
+
+        let rocks = RocksHandle::open_readonly(&rocks_path).unwrap();
+        assert_eq!(detect_mtime_scale(&rocks).unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn legacy_db_export_rescales_seconds_to_microseconds() {
+        use arrow::array::{Array, Int64Array};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        // Build a DB the way create_test_rocks does, then strip the
+        // MTIME_FORMAT key so the exporter treats it as legacy seconds.
+        let dir = tempdir().unwrap();
+        let rocks_path = create_test_rocks(dir.path());
+        {
+            let h = RocksHandle::open(&rocks_path).unwrap();
+            h.db
+                .delete_cf(h.cf_metadata(), meta_keys::MTIME_FORMAT.as_bytes())
+                .unwrap();
+        }
+
+        let output_dir = dir.path().join("parquet_output");
+        let stats = convert_rocks_to_parquet(
+            &rocks_path,
+            &output_dir,
+            ExportConfig {
+                row_group_size: 100,
+                target_file_size: 256 * 1024 * 1024,
+                compression_level: 3,
+                progress: false,
+            },
+            None,
+        )
+        .unwrap();
+
+        // Read the part file and confirm mtime_us = 1700000000 * 1_000_000
+        // for the rows that had mtime: Some(1700000000) in the fixture.
+        let scan_dir = output_dir.join("scans").join(&stats.scan_id);
+        let file = File::open(scan_dir.join("part-00000.parquet")).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut saw_rescaled = false;
+        for batch_result in reader {
+            let batch = batch_result.unwrap();
+            let mtime_idx = batch
+                .schema()
+                .index_of("mtime_us")
+                .expect("mtime_us column missing");
+            let col = batch
+                .column(mtime_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("mtime_us is not Int64");
+            for i in 0..col.len() {
+                if !col.is_null(i) && col.value(i) == 1_700_000_000_000_000 {
+                    saw_rescaled = true;
+                }
+            }
+        }
+        assert!(
+            saw_rescaled,
+            "legacy export must multiply seconds by 1_000_000 -- expected mtime_us == 1700000000000000 in at least one row"
+        );
+    }
+
+    #[test]
+    fn fresh_db_export_passes_microseconds_through() {
+        use arrow::array::{Array, Int64Array};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        // The fixture's mtime values now mean microseconds (= 1970), and
+        // a fresh DB has MTIME_FORMAT set, so the exporter must NOT
+        // rescale. mtime_us must equal the input verbatim.
+        let dir = tempdir().unwrap();
+        let rocks_path = create_test_rocks(dir.path());
+        let output_dir = dir.path().join("parquet_output");
+        let stats = convert_rocks_to_parquet(
+            &rocks_path,
+            &output_dir,
+            ExportConfig {
+                row_group_size: 100,
+                target_file_size: 256 * 1024 * 1024,
+                compression_level: 3,
+                progress: false,
+            },
+            None,
+        )
+        .unwrap();
+
+        let scan_dir = output_dir.join("scans").join(&stats.scan_id);
+        let file = File::open(scan_dir.join("part-00000.parquet")).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut saw_passthrough = false;
+        for batch_result in reader {
+            let batch = batch_result.unwrap();
+            let mtime_idx = batch.schema().index_of("mtime_us").unwrap();
+            let col = batch
+                .column(mtime_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..col.len() {
+                if !col.is_null(i) && col.value(i) == 1_700_000_000 {
+                    saw_passthrough = true;
+                }
+            }
+        }
+        assert!(
+            saw_passthrough,
+            "fresh-DB export must pass microseconds through unchanged -- expected mtime_us == 1700000000 in at least one row"
+        );
     }
 }

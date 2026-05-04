@@ -91,9 +91,12 @@ impl StreamingParquetWriter {
             .set_max_row_group_size(config.row_group_size)
             .build();
 
+        // Streaming writer is fed from the live walker pipeline, where
+        // `DbEntry` already carries microseconds. Pass-through scale.
         let builder = RowBuilder::new(RowContext {
             scan_id: config.scan_id.clone(),
             scan_timestamp_us: config.scan_timestamp_us,
+            mtime_scale: 1,
         });
 
         let mut me = Self {

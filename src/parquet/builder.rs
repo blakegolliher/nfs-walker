@@ -8,9 +8,7 @@
 
 use crate::error::{ParquetError, WalkerError};
 use crate::nfs::types::DbEntry;
-use crate::parquet::schema::{
-    compute_parent_path, file_type_string, parquet_schema_ref, seconds_to_microseconds,
-};
+use crate::parquet::schema::{compute_parent_path, file_type_string, parquet_schema_ref};
 use crate::rocksdb::schema::RocksEntry;
 use arrow::array::{
     ArrayRef, Int64Builder, StringBuilder, UInt16Builder, UInt32Builder, UInt64Builder,
@@ -25,6 +23,23 @@ use std::sync::Arc;
 pub struct RowContext {
     pub scan_id: String,
     pub scan_timestamp_us: i64,
+    /// Multiplier applied to incoming mtime/atime/ctime values before
+    /// writing to the Parquet `*_us` columns. `1` for fresh databases
+    /// (already microseconds); `1_000_000` for legacy databases that
+    /// stored only seconds. The exporter chooses based on the
+    /// `MTIME_FORMAT` metadata key; `Default::default` is the
+    /// pass-through case so unit-test fixtures don't need to set it.
+    pub mtime_scale: i64,
+}
+
+impl Default for RowContext {
+    fn default() -> Self {
+        Self {
+            scan_id: String::new(),
+            scan_timestamp_us: 0,
+            mtime_scale: 1,
+        }
+    }
 }
 
 /// Accumulates rows into Arrow column builders and produces a
@@ -213,16 +228,17 @@ impl RowBuilder {
         self.b_gid.append_value(gid.unwrap_or(0));
         self.b_permissions
             .append_value(mode.map(|m| (m & 0o7777) as u16).unwrap_or(0o644));
+        let scale = self.ctx.mtime_scale;
         match mtime {
-            Some(s) => self.b_mtime.append_value(seconds_to_microseconds(s)),
+            Some(t) => self.b_mtime.append_value(t.saturating_mul(scale)),
             None => self.b_mtime.append_null(),
         }
         match atime {
-            Some(s) => self.b_atime.append_value(seconds_to_microseconds(s)),
+            Some(t) => self.b_atime.append_value(t.saturating_mul(scale)),
             None => self.b_atime.append_null(),
         }
         match ctime {
-            Some(s) => self.b_ctime.append_value(seconds_to_microseconds(s)),
+            Some(t) => self.b_ctime.append_value(t.saturating_mul(scale)),
             None => self.b_ctime.append_null(),
         }
         self.b_depth.append_value(depth as u16);

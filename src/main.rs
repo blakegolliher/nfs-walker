@@ -275,12 +275,15 @@ fn run_stats(
         println!();
         println!("Oldest Files (top {}):", top);
         println!("─────────────────────────────────────────────────");
-        for (path, mtime, size) in files {
-            let time_str = mtime
-                .map(|t| {
-                    chrono::DateTime::from_timestamp(t, 0)
+        for (path, mtime_us, size) in files {
+            // mtime is microseconds since epoch; chrono wants seconds + nanos.
+            let time_str = mtime_us
+                .map(|us| {
+                    let secs = us.div_euclid(1_000_000);
+                    let nsec = (us.rem_euclid(1_000_000) as u32) * 1_000;
+                    chrono::DateTime::from_timestamp(secs, nsec)
                         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_else(|| t.to_string())
+                        .unwrap_or_else(|| us.to_string())
                 })
                 .unwrap_or_else(|| "unknown".to_string());
             println!("{:>16}  {:>10}  {}", time_str, format_size(size, BINARY), path);

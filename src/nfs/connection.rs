@@ -44,6 +44,45 @@ pub struct NfsConnection {
 unsafe impl Send for NfsConnection {}
 // NOT implementing Sync - libnfs is not thread-safe
 
+/// Pack a (seconds, nanoseconds) timestamp into microseconds-since-epoch.
+///
+/// Used at every libnfs stat callsite so the sub-second component of
+/// mtime/atime/ctime survives the trip into the database. Without this
+/// every row downstream rounds to whole seconds.
+///
+/// `nsec` is clamped to `[0, 999_999_999]`. Real filesystems shouldn't
+/// produce out-of-range values, but garbage in stat structs (e.g. from a
+/// libnfs version with a different field layout, or clock-skew races on
+/// the server) shouldn't be allowed to corrupt the microsecond math.
+#[inline]
+fn pack_micros(sec: i64, nsec: i64) -> i64 {
+    let nsec = nsec.clamp(0, 999_999_999);
+    sec.saturating_mul(1_000_000)
+        .saturating_add(nsec / 1_000)
+}
+
+/// libnfs `nfsdirent.{atime,mtime,ctime}_nsec` are u32. Widen and pack.
+#[inline]
+fn timeval_to_micros(sec: i64, nsec: u32) -> i64 {
+    pack_micros(sec, nsec as i64)
+}
+
+/// libnfs `nfs_stat_64.nfs_*_nsec` are u64. Widen and pack.
+#[inline]
+fn nfs_stat64_to_micros(sec: u64, nsec: u64) -> i64 {
+    // u64 epoch seconds happily fit in i64 until year 292277026596.
+    // Cap nsec at i64::MAX before signed conversion to avoid wraparound
+    // on absurd inputs from a malformed stat struct.
+    let nsec_i64 = nsec.min(i64::MAX as u64) as i64;
+    pack_micros(sec as i64, nsec_i64)
+}
+
+/// NFS3 `nfstime3` exposes `seconds: u32` and `nseconds: u32`. Widen.
+#[inline]
+fn nfstime3_to_micros(sec: u32, nsec: u32) -> i64 {
+    pack_micros(sec as i64, nsec as i64)
+}
+
 /// Translate a negated NFS3 status code to a human-readable string.
 ///
 /// libnfs callbacks store the NFS3 status as `-(res.status as i32)`,
@@ -976,7 +1015,10 @@ impl NfsConnection {
         // Determine entry type
         let entry_type = EntryType::from_mode(d.mode);
 
-        // Build stat if we have full attributes
+        // Build stat if we have full attributes. Pack seconds + nanoseconds
+        // into a single microseconds-since-epoch value so sub-second
+        // precision survives the trip through RocksDB into Parquet's
+        // mtime_us column.
         let stat = Some(NfsStat {
             size: d.size,
             inode: d.inode,
@@ -984,9 +1026,9 @@ impl NfsConnection {
             uid: d.uid,
             gid: d.gid,
             mode: d.mode,
-            atime: Some(d.atime.tv_sec as i64),
-            mtime: Some(d.mtime.tv_sec as i64),
-            ctime: Some(d.ctime.tv_sec as i64),
+            atime: Some(timeval_to_micros(d.atime.tv_sec as i64, d.atime_nsec)),
+            mtime: Some(timeval_to_micros(d.mtime.tv_sec as i64, d.mtime_nsec)),
+            ctime: Some(timeval_to_micros(d.ctime.tv_sec as i64, d.ctime_nsec)),
             blksize: d.blksize,
             blocks: d.blocks,
         });
@@ -1009,9 +1051,9 @@ impl NfsConnection {
             uid: stat.nfs_uid as u32,
             gid: stat.nfs_gid as u32,
             mode: stat.nfs_mode as u32,
-            atime: Some(stat.nfs_atime as i64),
-            mtime: Some(stat.nfs_mtime as i64),
-            ctime: Some(stat.nfs_ctime as i64),
+            atime: Some(nfs_stat64_to_micros(stat.nfs_atime, stat.nfs_atime_nsec)),
+            mtime: Some(nfs_stat64_to_micros(stat.nfs_mtime, stat.nfs_mtime_nsec)),
+            ctime: Some(nfs_stat64_to_micros(stat.nfs_ctime, stat.nfs_ctime_nsec)),
             blksize: stat.nfs_blksize,
             blocks: stat.nfs_blocks,
         }
@@ -1309,9 +1351,9 @@ impl NfsDirHandle {
             uid: d.uid,
             gid: d.gid,
             mode: d.mode,
-            atime: Some(d.atime.tv_sec as i64),
-            mtime: Some(d.mtime.tv_sec as i64),
-            ctime: Some(d.ctime.tv_sec as i64),
+            atime: Some(timeval_to_micros(d.atime.tv_sec as i64, d.atime_nsec)),
+            mtime: Some(timeval_to_micros(d.mtime.tv_sec as i64, d.mtime_nsec)),
+            ctime: Some(timeval_to_micros(d.ctime.tv_sec as i64, d.ctime_nsec)),
             blksize: d.blksize,
             blocks: d.blocks,
         });
@@ -1662,9 +1704,18 @@ unsafe extern "C" fn readdirplus_full_callback(
                             uid: attrs.uid,
                             gid: attrs.gid,
                             mode: attrs.mode,
-                            atime: Some(attrs.atime.seconds as i64),
-                            mtime: Some(attrs.mtime.seconds as i64),
-                            ctime: Some(attrs.ctime.seconds as i64),
+                            atime: Some(nfstime3_to_micros(
+                                attrs.atime.seconds,
+                                attrs.atime.nseconds,
+                            )),
+                            mtime: Some(nfstime3_to_micros(
+                                attrs.mtime.seconds,
+                                attrs.mtime.nseconds,
+                            )),
+                            ctime: Some(nfstime3_to_micros(
+                                attrs.ctime.seconds,
+                                attrs.ctime.nseconds,
+                            )),
                             blksize: 4096, // NFS3 doesn't provide blksize
                             blocks: (attrs.used + 511) / 512, // Convert used bytes to 512-byte blocks
                         };
@@ -2909,6 +2960,85 @@ mod tests {
 
     // Note: Most tests require an actual NFS server
     // These are unit tests for the non-FFI parts
+
+    #[test]
+    fn pack_micros_combines_seconds_and_nanos() {
+        // Whole-second input, no nanos -> exact microsecond multiple.
+        assert_eq!(pack_micros(1_777_857_024, 0), 1_777_857_024_000_000);
+        // The example from the bug report: 1777857024.7166800450 -> us.
+        // 716680045 ns / 1000 = 716680 us.
+        assert_eq!(
+            pack_micros(1_777_857_024, 716_680_045),
+            1_777_857_024_716_680
+        );
+    }
+
+    #[test]
+    fn pack_micros_clamps_negative_nsec_to_zero() {
+        // Real filesystems don't produce negative nsec, but a malformed
+        // stat struct shouldn't be allowed to subtract from sec*1e6.
+        assert_eq!(pack_micros(1_000, -42), 1_000_000_000);
+    }
+
+    #[test]
+    fn pack_micros_clamps_overlarge_nsec() {
+        // 1.5 seconds of "nanoseconds" -> clamped to 999_999_999 ns
+        // = 999_999 us added to the seconds component.
+        assert_eq!(
+            pack_micros(1_000, 1_500_000_000),
+            1_000_000_000 + 999_999
+        );
+    }
+
+    #[test]
+    fn pack_micros_preserves_subsecond_remainder() {
+        // The whole point of the fix: every (sec, nsec >= 1000) input
+        // must produce a microsecond value whose %1_000_000 remainder is
+        // non-zero. Without the fix the remainder is always zero.
+        let cases: &[(i64, i64)] = &[
+            (1_700_000_000, 1_000),     // 1us
+            (1_700_000_000, 999_999_000), // 999_999us
+            (1_700_000_000, 500_500_500), // 500_500us
+        ];
+        for (sec, nsec) in cases {
+            let us = pack_micros(*sec, *nsec);
+            let rem = us.rem_euclid(1_000_000);
+            assert!(
+                rem != 0,
+                "pack_micros({}, {}) produced rem=0 -- subsecond data lost",
+                sec,
+                nsec
+            );
+        }
+    }
+
+    #[test]
+    fn timeval_to_micros_widens_unsigned_nsec() {
+        // u32 input; max value still fits the i64 path cleanly.
+        assert_eq!(timeval_to_micros(1, u32::MAX), 1_000_000 + 999_999);
+    }
+
+    #[test]
+    fn nfs_stat64_to_micros_widens_u64_nsec() {
+        // Normal case.
+        assert_eq!(
+            nfs_stat64_to_micros(1_777_857_024, 716_680_045),
+            1_777_857_024_716_680
+        );
+        // Garbage nsec (way past 1s) is clamped to 999_999us.
+        assert_eq!(
+            nfs_stat64_to_micros(0, u64::MAX),
+            999_999
+        );
+    }
+
+    #[test]
+    fn nfstime3_to_micros_widens_u32_pair() {
+        assert_eq!(
+            nfstime3_to_micros(1_777_857_024, 716_680_045),
+            1_777_857_024_716_680
+        );
+    }
 
     #[test]
     fn test_nfs_url_to_connection() {
