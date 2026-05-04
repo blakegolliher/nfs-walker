@@ -1029,6 +1029,12 @@ impl NfsConnection {
             atime: Some(timeval_to_micros(d.atime.tv_sec as i64, d.atime_nsec)),
             mtime: Some(timeval_to_micros(d.mtime.tv_sec as i64, d.mtime_nsec)),
             ctime: Some(timeval_to_micros(d.ctime.tv_sec as i64, d.ctime_nsec)),
+            mtime_sec: Some(d.mtime.tv_sec as i64),
+            mtime_nsec: Some(d.mtime_nsec as i32),
+            atime_sec: Some(d.atime.tv_sec as i64),
+            atime_nsec: Some(d.atime_nsec as i32),
+            ctime_sec: Some(d.ctime.tv_sec as i64),
+            ctime_nsec: Some(d.ctime_nsec as i32),
             blksize: d.blksize,
             blocks: d.blocks,
         });
@@ -1054,6 +1060,12 @@ impl NfsConnection {
             atime: Some(nfs_stat64_to_micros(stat.nfs_atime, stat.nfs_atime_nsec)),
             mtime: Some(nfs_stat64_to_micros(stat.nfs_mtime, stat.nfs_mtime_nsec)),
             ctime: Some(nfs_stat64_to_micros(stat.nfs_ctime, stat.nfs_ctime_nsec)),
+            mtime_sec: Some(stat.nfs_mtime as i64),
+            mtime_nsec: Some(stat.nfs_mtime_nsec as i32),
+            atime_sec: Some(stat.nfs_atime as i64),
+            atime_nsec: Some(stat.nfs_atime_nsec as i32),
+            ctime_sec: Some(stat.nfs_ctime as i64),
+            ctime_nsec: Some(stat.nfs_ctime_nsec as i32),
             blksize: stat.nfs_blksize,
             blocks: stat.nfs_blocks,
         }
@@ -1354,6 +1366,12 @@ impl NfsDirHandle {
             atime: Some(timeval_to_micros(d.atime.tv_sec as i64, d.atime_nsec)),
             mtime: Some(timeval_to_micros(d.mtime.tv_sec as i64, d.mtime_nsec)),
             ctime: Some(timeval_to_micros(d.ctime.tv_sec as i64, d.ctime_nsec)),
+            mtime_sec: Some(d.mtime.tv_sec as i64),
+            mtime_nsec: Some(d.mtime_nsec as i32),
+            atime_sec: Some(d.atime.tv_sec as i64),
+            atime_nsec: Some(d.atime_nsec as i32),
+            ctime_sec: Some(d.ctime.tv_sec as i64),
+            ctime_nsec: Some(d.ctime_nsec as i32),
             blksize: d.blksize,
             blocks: d.blocks,
         });
@@ -1716,6 +1734,12 @@ unsafe extern "C" fn readdirplus_full_callback(
                                 attrs.ctime.seconds,
                                 attrs.ctime.nseconds,
                             )),
+                            mtime_sec: Some(attrs.mtime.seconds as i64),
+                            mtime_nsec: Some(attrs.mtime.nseconds as i32),
+                            atime_sec: Some(attrs.atime.seconds as i64),
+                            atime_nsec: Some(attrs.atime.nseconds as i32),
+                            ctime_sec: Some(attrs.ctime.seconds as i64),
+                            ctime_nsec: Some(attrs.ctime.nseconds as i32),
                             blksize: 4096, // NFS3 doesn't provide blksize
                             blocks: (attrs.used + 511) / 512, // Convert used bytes to 512-byte blocks
                         };

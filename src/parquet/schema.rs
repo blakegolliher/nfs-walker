@@ -25,6 +25,12 @@ pub fn parquet_schema() -> Schema {
         Field::new("mtime_us", DataType::Int64, true),
         Field::new("atime_us", DataType::Int64, true),
         Field::new("ctime_us", DataType::Int64, true),
+        Field::new("mtime_sec", DataType::Int64, true),
+        Field::new("mtime_nsec", DataType::Int32, true),
+        Field::new("atime_sec", DataType::Int64, true),
+        Field::new("atime_nsec", DataType::Int32, true),
+        Field::new("ctime_sec", DataType::Int64, true),
+        Field::new("ctime_nsec", DataType::Int32, true),
         Field::new("depth", DataType::UInt16, false),
         Field::new("parent_path", DataType::Utf8, false),
         Field::new("scan_id", DataType::Utf8, false),
@@ -97,6 +103,12 @@ mod tests {
                 "mtime_us",
                 "atime_us",
                 "ctime_us",
+                "mtime_sec",
+                "mtime_nsec",
+                "atime_sec",
+                "atime_nsec",
+                "ctime_sec",
+                "ctime_nsec",
                 "depth",
                 "parent_path",
                 "scan_id",
@@ -115,7 +127,7 @@ mod tests {
             .collect();
         // Only extension, mtime_us, atime_us, ctime_us should be nullable
         for (name, is_nullable) in &nullable {
-            let expected = matches!(*name, "extension" | "mtime_us" | "atime_us" | "ctime_us");
+            let expected = matches!(*name, "extension" | "mtime_us" | "atime_us" | "ctime_us" | "mtime_sec" | "mtime_nsec" | "atime_sec" | "atime_nsec" | "ctime_sec" | "ctime_nsec");
             assert_eq!(
                 *is_nullable, expected,
                 "Field '{}' nullable={}, expected={}",

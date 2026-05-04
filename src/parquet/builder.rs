@@ -11,7 +11,7 @@ use crate::nfs::types::DbEntry;
 use crate::parquet::schema::{compute_parent_path, file_type_string, parquet_schema_ref};
 use crate::rocksdb::schema::RocksEntry;
 use arrow::array::{
-    ArrayRef, Int64Builder, StringBuilder, UInt16Builder, UInt32Builder, UInt64Builder,
+    ArrayRef, Int32Builder, Int64Builder, StringBuilder, UInt16Builder, UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
@@ -65,6 +65,12 @@ pub struct RowBuilder {
     b_mtime: Int64Builder,
     b_atime: Int64Builder,
     b_ctime: Int64Builder,
+    b_mtime_sec: Int64Builder,
+    b_mtime_nsec: Int32Builder,
+    b_atime_sec: Int64Builder,
+    b_atime_nsec: Int32Builder,
+    b_ctime_sec: Int64Builder,
+    b_ctime_nsec: Int32Builder,
     b_depth: UInt16Builder,
     b_parent_path: StringBuilder,
     b_scan_id: StringBuilder,
@@ -91,6 +97,12 @@ impl RowBuilder {
             b_mtime: Int64Builder::new(),
             b_atime: Int64Builder::new(),
             b_ctime: Int64Builder::new(),
+            b_mtime_sec: Int64Builder::new(),
+            b_mtime_nsec: Int32Builder::new(),
+            b_atime_sec: Int64Builder::new(),
+            b_atime_nsec: Int32Builder::new(),
+            b_ctime_sec: Int64Builder::new(),
+            b_ctime_nsec: Int32Builder::new(),
             b_depth: UInt16Builder::new(),
             b_parent_path: StringBuilder::new(),
             b_scan_id: StringBuilder::new(),
@@ -129,6 +141,12 @@ impl RowBuilder {
             entry.mtime,
             entry.atime,
             entry.ctime,
+            entry.mtime_sec,
+            entry.mtime_nsec,
+            entry.atime_sec,
+            entry.atime_nsec,
+            entry.ctime_sec,
+            entry.ctime_nsec,
             entry.depth,
             parent,
         );
@@ -158,6 +176,12 @@ impl RowBuilder {
             entry.mtime,
             entry.atime,
             entry.ctime,
+            entry.mtime_sec,
+            entry.mtime_nsec,
+            entry.atime_sec,
+            entry.atime_nsec,
+            entry.ctime_sec,
+            entry.ctime_nsec,
             entry.depth,
             &parent_owned,
         );
@@ -182,6 +206,12 @@ impl RowBuilder {
             Arc::new(self.b_mtime.finish()),
             Arc::new(self.b_atime.finish()),
             Arc::new(self.b_ctime.finish()),
+            Arc::new(self.b_mtime_sec.finish()),
+            Arc::new(self.b_mtime_nsec.finish()),
+            Arc::new(self.b_atime_sec.finish()),
+            Arc::new(self.b_atime_nsec.finish()),
+            Arc::new(self.b_ctime_sec.finish()),
+            Arc::new(self.b_ctime_nsec.finish()),
             Arc::new(self.b_depth.finish()),
             Arc::new(self.b_parent_path.finish()),
             Arc::new(self.b_scan_id.finish()),
@@ -210,6 +240,12 @@ impl RowBuilder {
         mtime: Option<i64>,
         atime: Option<i64>,
         ctime: Option<i64>,
+        mtime_sec: Option<i64>,
+        mtime_nsec: Option<i32>,
+        atime_sec: Option<i64>,
+        atime_nsec: Option<i32>,
+        ctime_sec: Option<i64>,
+        ctime_nsec: Option<i32>,
         depth: u32,
         parent_path: &str,
     ) {
@@ -240,6 +276,33 @@ impl RowBuilder {
         match ctime {
             Some(t) => self.b_ctime.append_value(t.saturating_mul(scale)),
             None => self.b_ctime.append_null(),
+        }
+        // High-precision time companions. No mtime_scale applied — these
+        // carry libnfs's full nanosecond precision directly. None for
+        // legacy rows that didn't capture nsec.
+        match mtime_sec {
+            Some(v) => self.b_mtime_sec.append_value(v),
+            None => self.b_mtime_sec.append_null(),
+        }
+        match mtime_nsec {
+            Some(v) => self.b_mtime_nsec.append_value(v),
+            None => self.b_mtime_nsec.append_null(),
+        }
+        match atime_sec {
+            Some(v) => self.b_atime_sec.append_value(v),
+            None => self.b_atime_sec.append_null(),
+        }
+        match atime_nsec {
+            Some(v) => self.b_atime_nsec.append_value(v),
+            None => self.b_atime_nsec.append_null(),
+        }
+        match ctime_sec {
+            Some(v) => self.b_ctime_sec.append_value(v),
+            None => self.b_ctime_sec.append_null(),
+        }
+        match ctime_nsec {
+            Some(v) => self.b_ctime_nsec.append_value(v),
+            None => self.b_ctime_nsec.append_null(),
         }
         self.b_depth.append_value(depth as u16);
         self.b_parent_path.append_value(parent_path);

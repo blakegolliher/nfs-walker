@@ -17,9 +17,11 @@ fn micros_to_system_time(us: i64) -> SystemTime {
 
 /// Type of filesystem entry
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 #[repr(u8)]
 pub enum EntryType {
     /// Regular file
+    #[default]
     File = 0,
     /// Directory
     Directory = 1,
@@ -158,6 +160,18 @@ pub struct NfsStat {
     /// Status change time (microseconds since Unix epoch)
     pub ctime: Option<i64>,
 
+    // High-precision time companions. When `Some`, these carry full
+    // nanosecond resolution from libnfs (the `*_us` fields above are
+    // a microsecond-truncated form of the same instant). When `None`
+    // (e.g. legacy DBs or sources that did not expose nsec), consumers
+    // fall back to splitting the `*_us` values.
+    pub mtime_sec: Option<i64>,
+    pub mtime_nsec: Option<i32>,
+    pub atime_sec: Option<i64>,
+    pub atime_nsec: Option<i32>,
+    pub ctime_sec: Option<i64>,
+    pub ctime_nsec: Option<i32>,
+
     /// Block size
     pub blksize: u64,
 
@@ -243,6 +257,31 @@ impl NfsDirEntry {
         self.stat.as_ref().and_then(|s| s.ctime)
     }
 
+    /// High-precision mtime: seconds component
+    pub fn mtime_sec(&self) -> Option<i64> {
+        self.stat.as_ref().and_then(|s| s.mtime_sec)
+    }
+    /// High-precision mtime: nanoseconds component
+    pub fn mtime_nsec(&self) -> Option<i32> {
+        self.stat.as_ref().and_then(|s| s.mtime_nsec)
+    }
+    /// High-precision atime: seconds component
+    pub fn atime_sec(&self) -> Option<i64> {
+        self.stat.as_ref().and_then(|s| s.atime_sec)
+    }
+    /// High-precision atime: nanoseconds component
+    pub fn atime_nsec(&self) -> Option<i32> {
+        self.stat.as_ref().and_then(|s| s.atime_nsec)
+    }
+    /// High-precision ctime: seconds component
+    pub fn ctime_sec(&self) -> Option<i64> {
+        self.stat.as_ref().and_then(|s| s.ctime_sec)
+    }
+    /// High-precision ctime: nanoseconds component
+    pub fn ctime_nsec(&self) -> Option<i32> {
+        self.stat.as_ref().and_then(|s| s.ctime_nsec)
+    }
+
     /// Get mode bits
     pub fn mode(&self) -> Option<u32> {
         self.stat.as_ref().map(|s| s.mode)
@@ -324,7 +363,7 @@ impl DirStats {
 }
 
 /// A database entry ready for insertion
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DbEntry {
     /// Parent directory path (None for root, resolved to ID by writer)
     pub parent_path: Option<String>,
@@ -349,6 +388,27 @@ pub struct DbEntry {
 
     /// Status change time (microseconds since Unix epoch)
     pub ctime: Option<i64>,
+
+    /// High-precision modification time: seconds component since Unix epoch.
+    /// When `Some`, paired with `mtime_nsec` for nanosecond precision.
+    /// When `None`, consumers should fall back to splitting `mtime` (us).
+    pub mtime_sec: Option<i64>,
+
+    /// High-precision modification time: nanoseconds component (0..999_999_999).
+    /// See `mtime_sec` for pairing semantics.
+    pub mtime_nsec: Option<i32>,
+
+    /// High-precision access time: seconds component. Pairs with `atime_nsec`.
+    pub atime_sec: Option<i64>,
+
+    /// High-precision access time: nanoseconds component (0..999_999_999).
+    pub atime_nsec: Option<i32>,
+
+    /// High-precision change time: seconds component. Pairs with `ctime_nsec`.
+    pub ctime_sec: Option<i64>,
+
+    /// High-precision change time: nanoseconds component (0..999_999_999).
+    pub ctime_nsec: Option<i32>,
 
     /// Permission mode
     pub mode: Option<u32>,
@@ -419,6 +479,12 @@ impl DbEntry {
             mtime: dir_entry.mtime(),
             atime: dir_entry.atime(),
             ctime: dir_entry.ctime(),
+            mtime_sec: dir_entry.mtime_sec(),
+            mtime_nsec: dir_entry.mtime_nsec(),
+            atime_sec: dir_entry.atime_sec(),
+            atime_nsec: dir_entry.atime_nsec(),
+            ctime_sec: dir_entry.ctime_sec(),
+            ctime_nsec: dir_entry.ctime_nsec(),
             mode: dir_entry.mode(),
             uid: dir_entry.uid(),
             gid: dir_entry.gid(),
@@ -472,6 +538,12 @@ impl DbEntry {
             mtime: stat.mtime,
             atime: stat.atime,
             ctime: stat.ctime,
+            mtime_sec: stat.mtime_sec,
+            mtime_nsec: stat.mtime_nsec,
+            atime_sec: stat.atime_sec,
+            atime_nsec: stat.atime_nsec,
+            ctime_sec: stat.ctime_sec,
+            ctime_nsec: stat.ctime_nsec,
             mode: Some(stat.mode),
             uid: Some(stat.uid),
             gid: Some(stat.gid),
@@ -496,6 +568,12 @@ impl DbEntry {
             mtime: None,
             atime: None,
             ctime: None,
+            mtime_sec: None,
+            mtime_nsec: None,
+            atime_sec: None,
+            atime_nsec: None,
+            ctime_sec: None,
+            ctime_nsec: None,
             mode: None,
             uid: None,
             gid: None,
