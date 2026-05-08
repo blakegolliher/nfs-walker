@@ -29,6 +29,7 @@ notes/
 NOTES.md
 PROMPTS.md
 TODO.md
+tasks/
 
 # Credentials
 .env

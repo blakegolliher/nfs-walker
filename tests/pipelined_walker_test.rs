@@ -18,8 +18,8 @@
 //! See `docs/PIPELINED_READDIRPLUS_DESIGN.md` §8 for the full test plan.
 
 use nfs_walker::config::{NfsUrl, WalkConfig};
+use nfs_walker::rocksdb::RocksHandle;
 use nfs_walker::walker::SimpleWalker;
-use rusqlite::Connection;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -34,8 +34,6 @@ fn make_config(url: NfsUrl, output_path: PathBuf, pipeline_depth: usize) -> Walk
     WalkConfig {
         nfs_url: url,
         output_path,
-        output_format: nfs_walker::config::OutputFormat::Sqlite,
-        #[cfg(feature = "rocksdb")]
         baseline_path: None,
         worker_count: 4,
         queue_size: 1000,
@@ -48,31 +46,27 @@ fn make_config(url: NfsUrl, output_path: PathBuf, pipeline_depth: usize) -> Walk
         exclude_patterns: vec![],
         timeout_secs: 30,
         retry_count: 1,
-        big_dir_hunt: false,
-        big_dir_threshold: 1_000_000,
         compute_checksum: false,
         detect_file_type: false,
         max_checksum_size: 1_073_741_824,
-        #[cfg(feature = "parquet")]
-        stream_parquet: false,
         pipeline_depth,
+        writer_shards: 1,
+        log: None,
     }
 }
 
-/// Pull every (path, entry_type) from the SQLite DB and return a
-/// stable, comparable representation. We use BTreeSet so order
-/// differences between the two walkers don't fail equality.
+/// Pull every (path, entry_type) from the RocksDB and return a stable,
+/// comparable representation. We use BTreeSet so order differences
+/// between the two walkers don't fail equality.
 fn paths_in_db(db: &PathBuf) -> BTreeSet<(String, i64)> {
-    let conn = Connection::open(db).expect("open db");
-    let mut stmt = conn
-        .prepare("SELECT path, entry_type FROM entries")
-        .expect("prepare");
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    let handle = RocksHandle::open_readonly(db).expect("open rocksdb readonly");
+    handle
+        .iter_by_path()
+        .map(|res| {
+            let entry = res.expect("iterate entry");
+            (entry.path, entry.entry_type as i64)
         })
-        .expect("query");
-    rows.map(|r| r.expect("row")).collect()
+        .collect()
 }
 
 #[test]
@@ -87,8 +81,8 @@ fn pipelined_and_legacy_produce_equal_path_sets() {
     };
 
     let workdir = tempdir().expect("tempdir");
-    let baseline_db = workdir.path().join("baseline.db");
-    let pipelined_db = workdir.path().join("pipelined.db");
+    let baseline_db = workdir.path().join("baseline.rocks");
+    let pipelined_db = workdir.path().join("pipelined.rocks");
 
     // Run baseline (legacy serial worker).
     let baseline_cfg = make_config(url.clone(), baseline_db.clone(), 0);
@@ -116,8 +110,6 @@ fn pipelined_and_legacy_produce_equal_path_sets() {
         pipelined_stats.duration
     );
 
-    // Counts must match exactly. (Bytes can drift fractionally if the
-    // server is live; the test doc warns to point at a static export.)
     assert_eq!(
         baseline_stats.dirs, pipelined_stats.dirs,
         "dir count mismatch"
@@ -146,9 +138,6 @@ fn pipelined_and_legacy_produce_equal_path_sets() {
         only_pipelined
     );
 
-    // Loose timing assertion: pipelined should not be markedly slower
-    // than baseline. We don't enforce the ≥4× target here — that's the
-    // §8 benchmark's job; this is just a smoke test.
     let baseline_secs = baseline_stats.duration.as_secs_f64().max(0.001);
     let pipelined_secs = pipelined_stats.duration.as_secs_f64().max(0.001);
     let ratio = baseline_secs / pipelined_secs;

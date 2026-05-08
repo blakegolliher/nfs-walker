@@ -250,8 +250,6 @@ mod tests {
                 entry_type: EntryType::File,
                 size: 1024,
                 mtime: Some(1234567890),
-                atime: None,
-                ctime: None,
                 mode: Some(0o644),
                 uid: Some(1000),
                 gid: Some(1000),
@@ -260,8 +258,7 @@ mod tests {
                 depth: 1,
                 extension: Some("txt".to_string()),
                 blocks: 8,
-                checksum: None,
-                file_type: None,
+                ..Default::default()
             },
         ];
 
@@ -289,9 +286,6 @@ mod tests {
                 path: format!("/data/file-{:04}.bin", i),
                 entry_type: EntryType::File,
                 size: i,
-                mtime: None,
-                atime: None,
-                ctime: None,
                 mode: Some(0o644),
                 uid: Some(1000),
                 gid: Some(1000),
@@ -299,9 +293,7 @@ mod tests {
                 inode: i + 1,
                 depth: 2,
                 extension: Some("bin".to_string()),
-                blocks: 0,
-                checksum: None,
-                file_type: None,
+                ..Default::default()
             })
             .collect();
 

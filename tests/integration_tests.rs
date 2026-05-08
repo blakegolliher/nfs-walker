@@ -76,8 +76,6 @@ fn test_db_entry_types() {
         entry_type: EntryType::File,
         size: 1024,
         mtime: Some(1234567890),
-        atime: None,
-        ctime: None,
         mode: Some(0o644),
         uid: Some(1000),
         gid: Some(1000),
@@ -86,6 +84,7 @@ fn test_db_entry_types() {
         depth: 2,
         extension: Some("txt".to_string()),
         blocks: 8,
+        ..Default::default()
     };
 
     assert!(entry.entry_type.is_file());

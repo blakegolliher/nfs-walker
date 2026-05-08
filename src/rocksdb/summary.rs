@@ -285,19 +285,15 @@ mod tests {
             path: path.to_string(),
             entry_type: EntryType::File,
             size,
-            mtime: None,
-            atime: None,
-            ctime: None,
             mode: Some(0o644),
             uid: Some(uid),
             gid: Some(uid),
             nlink: Some(1),
-            inode: 0,
             depth: 1,
             extension: ext.map(String::from),
             blocks: size.div_ceil(512),
-            checksum: None,
             file_type: ft.map(String::from),
+            ..Default::default()
         }
     }
 
@@ -308,19 +304,13 @@ mod tests {
             path: path.to_string(),
             entry_type: EntryType::Directory,
             size: 4096,
-            mtime: None,
-            atime: None,
-            ctime: None,
             mode: Some(0o755),
             uid: Some(uid),
             gid: Some(uid),
             nlink: Some(2),
-            inode: 0,
             depth,
-            extension: None,
             blocks: 8,
-            checksum: None,
-            file_type: None,
+            ..Default::default()
         }
     }
 

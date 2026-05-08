@@ -182,8 +182,6 @@ mod tests {
                 entry_type: EntryType::File,
                 size: 1024,
                 mtime: Some(1000),
-                atime: None,
-                ctime: None,
                 mode: Some(0o644),
                 uid: Some(1000),
                 gid: Some(1000),
@@ -192,8 +190,7 @@ mod tests {
                 depth: 1,
                 extension: Some("txt".to_string()),
                 blocks: 8,
-                checksum: None,
-                file_type: None,
+                ..Default::default()
             },
             DbEntry {
                 parent_path: Some("/".to_string()),
@@ -202,8 +199,6 @@ mod tests {
                 entry_type: EntryType::File,
                 size: 2048,
                 mtime: Some(2000),
-                atime: None,
-                ctime: None,
                 mode: Some(0o644),
                 uid: Some(1000),
                 gid: Some(1000),
@@ -212,8 +207,7 @@ mod tests {
                 depth: 1,
                 extension: Some("txt".to_string()),
                 blocks: 16,
-                checksum: None,
-                file_type: None,
+                ..Default::default()
             },
         ];
 

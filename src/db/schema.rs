@@ -58,15 +58,6 @@ CREATE TABLE IF NOT EXISTS walk_info (
 )
 "#;
 
-/// SQL to create big directories table (for big-dir-hunt mode)
-const CREATE_BIG_DIRS_TABLE: &str = r#"
-CREATE TABLE IF NOT EXISTS big_directories (
-    id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL UNIQUE,
-    file_count INTEGER NOT NULL
-)
-"#;
-
 /// SQL to create indexes for common queries
 const CREATE_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_entries_parent ON entries(parent_id)",
@@ -107,7 +98,6 @@ pub fn create_database(conn: &Connection) -> DbResult<()> {
     conn.execute(CREATE_ENTRIES_TABLE, [])?;
     conn.execute(CREATE_DIR_STATS_TABLE, [])?;
     conn.execute(CREATE_WALK_INFO_TABLE, [])?;
-    conn.execute(CREATE_BIG_DIRS_TABLE, [])?;
 
     Ok(())
 }

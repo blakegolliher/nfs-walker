@@ -308,15 +308,6 @@ impl NfsDirEntry {
     }
 }
 
-/// Entry for big directory hunting mode
-#[derive(Debug, Clone)]
-pub struct BigDirEntry {
-    /// Full path of the directory
-    pub path: String,
-    /// Number of files (non-directory entries) in this directory
-    pub file_count: u64,
-}
-
 /// Statistics collected while walking a directory
 #[derive(Debug, Clone, Default)]
 pub struct DirStats {

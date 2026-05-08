@@ -26,7 +26,6 @@ pub enum WalkerError {
     Database(#[from] DbError),
 
     /// RocksDB errors
-    #[cfg(feature = "rocksdb")]
     #[error("RocksDB error: {0}")]
     Rocks(#[from] RocksError),
 
@@ -34,11 +33,6 @@ pub enum WalkerError {
     #[cfg(feature = "parquet")]
     #[error("Parquet error: {0}")]
     Parquet(#[from] ParquetError),
-
-    /// CSV export errors
-    #[cfg(feature = "csv-export")]
-    #[error("CSV error: {0}")]
-    Csv(#[from] CsvError),
 
     /// Server errors
     #[cfg(feature = "server")]
@@ -205,10 +199,6 @@ pub enum ConfigError {
     /// Writer-shard count out of range
     #[error("Invalid writer-shards {shards}: must be between 1 and {max}")]
     InvalidWriterShards { shards: usize, max: usize },
-
-    /// Two CLI flags can't be combined
-    #[error("Incompatible flag combination: {reason}")]
-    IncompatibleFlags { reason: String },
 }
 
 /// Worker thread errors
@@ -240,7 +230,6 @@ pub enum WorkerError {
 }
 
 /// RocksDB errors
-#[cfg(feature = "rocksdb")]
 #[derive(Error, Debug)]
 pub enum RocksError {
     /// RocksDB operation failed
@@ -265,7 +254,6 @@ pub enum RocksError {
 }
 
 /// Result type alias for RocksError
-#[cfg(feature = "rocksdb")]
 pub type RocksResult<T> = std::result::Result<T, RocksError>;
 
 /// Parquet export errors
@@ -296,27 +284,6 @@ pub enum ParquetError {
 /// Result type alias for ParquetError
 #[cfg(feature = "parquet")]
 pub type ParquetResult<T> = std::result::Result<T, ParquetError>;
-
-/// CSV export errors
-#[cfg(feature = "csv-export")]
-#[derive(Error, Debug)]
-pub enum CsvError {
-    /// CSV writer error
-    #[error("CSV error: {0}")]
-    Csv(#[from] csv::Error),
-
-    /// I/O error
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-
-    /// General error with context
-    #[error("{0}")]
-    Other(String),
-}
-
-/// Result type alias for CsvError
-#[cfg(feature = "csv-export")]
-pub type CsvResult<T> = std::result::Result<T, CsvError>;
 
 /// Analytics server errors
 #[cfg(feature = "server")]

@@ -6,10 +6,11 @@
 //! - NFS URL parsing
 
 use crate::error::{ConfigError, NfsError};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 /// Maximum reasonable worker count.
 /// Past ~1000-2000 the work-stealing loop scans every other worker's
@@ -41,50 +42,41 @@ static NFS_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:nfs://)?([^:/]+)(:\d+)?(/[^\s]*)$").expect("Invalid NFS URL regex")
 });
 
-/// Simple NFS filesystem walker with SQLite/RocksDB output
+/// High-performance NFS filesystem walker. Scans to RocksDB; export to Parquet or SQLite afterwards.
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "nfs-walker",
     version,
-    about = "High-performance NFS filesystem scanner with RocksDB storage and multiple export formats",
+    about = "High-performance NFS filesystem scanner (RocksDB output, Parquet/SQLite export)",
     long_about = "Walks an NFS filesystem using direct libnfs READDIRPLUS calls with parallel workers.\n\n\
-                  Default output is RocksDB (.rocks) for maximum write throughput on large filesystems.\n\
-                  After scanning, export to CSV, Parquet, or SQLite, or query stats directly.\n\n\
+                  Output is always RocksDB (.rocks). Export to Parquet for analytics, or SQLite for ad-hoc SQL, after the scan.\n\n\
                   Typical workflow:\n\
-                  1. Scan:   nfs-walker nfs://server/export -o scan.rocks -w 32\n\
-                  2. Export: nfs-walker export-csv scan.rocks ./csv-output -p --gzip\n\
-                  3. Query:  nfs-walker stats scan.rocks --by-extension --largest-files",
+                  1. Scan:    nfs-walker nfs://server/export -o scan.rocks -w 32\n\
+                  2. Export:  nfs-walker export-parquet scan.rocks ./parquet-out -p --parallelism 64\n\
+                              (or: nfs-walker export-sql scan.rocks scan.db -p)\n\
+                  3. Stats:   nfs-walker stats scan.rocks",
     after_help = "\
 EXAMPLES:
-  Scan an NFS export to RocksDB (recommended):
+  Scan an NFS export to RocksDB:
     nfs-walker nfs://server/export -o scan.rocks -w 32
 
   Scan with exclusions and depth limit:
     nfs-walker nfs://server/data --exclude '.snapshot' --exclude '\\.Trash' -d 10 -o scan.rocks
 
-  Scan directly to SQLite (slower, but single-file output):
-    nfs-walker nfs://server/export -o scan.db --sqlite
+  Export RocksDB to Parquet for analytics (DuckDB / DataFusion):
+    nfs-walker export-parquet scan.rocks ./parquet-out -p --parallelism 64
 
-  Hunt for large directories (>1M files):
-    nfs-walker nfs://server/export -o bigdirs.rocks --big-dir-hunt --threshold 1000000
+  Export RocksDB to SQLite for ad-hoc SQL queries:
+    nfs-walker export-sql scan.rocks scan.db -p
 
-  Export RocksDB to gzip-compressed CSV (splits at 10M rows per file):
-    nfs-walker export-csv scan.rocks ./csv-output -p --gzip
-
-  Export with custom split size (50M rows per file):
-    nfs-walker export-csv scan.rocks ./csv-output -p --gzip --rows-per-file 50000000
-
-  Convert RocksDB to SQLite for ad-hoc SQL queries:
-    nfs-walker convert scan.rocks scan.db -p
-
-  Show overall scan statistics:
+  Show scan overview (counts, total size, max depth):
     nfs-walker stats scan.rocks
 
-  Analyze by file extension, largest files, and ownership:
-    nfs-walker stats scan.rocks --by-extension --largest-files --by-uid -n 50
+  Disable the per-scan progress logfile (default writes <output>.log):
+    nfs-walker nfs://server/export -o scan.rocks --no-log
 
-  Find oldest files and directories with most entries:
-    nfs-walker stats scan.rocks --oldest-files --largest-dirs
+  Emit JSON-lines progress log every 10s instead of text every 5s:
+    nfs-walker nfs://server/export -o scan.rocks --log-fmt json --log-interval-secs 10
 
 NOTE: For large scans (>100M files), write output to a filesystem with enough space.
       Use 'ulimit -n 65536' if you hit 'too many open files' errors.",
@@ -100,17 +92,11 @@ pub struct CliArgs {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Output database file (.db for SQLite, .rocks for RocksDB)
-    #[arg(short, long, default_value = "walk.db", value_name = "FILE")]
+    /// Output RocksDB directory (default: walk.rocks)
+    #[arg(short, long, default_value = "walk.rocks", value_name = "PATH")]
     pub output: PathBuf,
 
-    /// Force SQLite output mode (slower, but single step)
-    #[cfg(feature = "rocksdb")]
-    #[arg(long, help = "Use SQLite directly instead of RocksDB (slower but simpler)")]
-    pub sqlite: bool,
-
     /// RocksDB baseline for incremental scans
-    #[cfg(feature = "rocksdb")]
     #[arg(long, value_name = "PATH", help = "RocksDB baseline for incremental scan comparison")]
     pub baseline: Option<PathBuf>,
 
@@ -168,14 +154,6 @@ pub struct CliArgs {
     #[arg(long, default_value = "3", value_name = "NUM")]
     pub retries: u32,
 
-    /// Hunt for directories with more than threshold files (stores only big dirs)
-    #[arg(long)]
-    pub big_dir_hunt: bool,
-
-    /// File count threshold for big-dir-hunt mode (default 1M)
-    #[arg(long, default_value = "1000000", value_name = "COUNT")]
-    pub threshold: u64,
-
     /// Explicit NFS export path (overrides auto-detection from URL)
     /// Use when the export has multiple path components, e.g., /volumes/uuid
     #[arg(long, value_name = "PATH")]
@@ -194,15 +172,6 @@ pub struct CliArgs {
     #[arg(long, default_value = "1073741824", value_name = "BYTES")]
     pub max_checksum_size: u64,
 
-    /// Stream a rolled Parquet directory alongside RocksDB during the
-    /// scan. Files land in `<output>.parquet/scans/<scan_id>/part-NNNNN.parquet`
-    /// and are queryable with DuckDB / DataFusion while the scan runs.
-    /// Backpressure on the parquet writer drops batches rather than
-    /// stalling ingest; the drop count is reported at end-of-scan.
-    #[cfg(feature = "parquet")]
-    #[arg(long)]
-    pub stream_parquet: bool,
-
     /// Number of READDIRPLUS RPCs to keep in flight per worker.
     /// 0 disables pipelining (uses the legacy serial worker loop, current
     /// behavior). 8 is the recommended setting once validated.
@@ -216,19 +185,43 @@ pub struct CliArgs {
     /// `put_cf` rate. Recommended range on a many-core box pointed at a
     /// large NFS export is 8 (strong baseline) — 16 (lift further only
     /// if profiling still shows writer saturation). Above 32 the
-    /// background compaction pool starts to thrash. Incompatible with
-    /// `--stream-parquet` in v1; run `export-parquet --parallelism N`
-    /// after the scan instead.
+    /// background compaction pool starts to thrash.
     #[arg(long, default_value = "1", value_name = "N")]
     pub writer_shards: usize,
+
+    /// Override the per-scan progress logfile path. Default is `<output>.log`
+    /// (sidecar next to the RocksDB directory). Disabled with --no-log.
+    #[arg(long, value_name = "PATH")]
+    pub log: Option<PathBuf>,
+
+    /// Disable the per-scan progress logfile entirely.
+    #[arg(long)]
+    pub no_log: bool,
+
+    /// Logfile record format. `text` (default) emits human-readable snapshot
+    /// blocks; `json` emits one JSON object per snapshot (newline-delimited).
+    #[arg(long, value_enum, default_value_t = LogFormat::Text, value_name = "FMT")]
+    pub log_fmt: LogFormat,
+
+    /// Snapshot interval in seconds for the progress logfile.
+    #[arg(long, default_value = "5", value_name = "SECS")]
+    pub log_interval_secs: u64,
+}
+
+/// Output format for the per-scan progress logfile.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LogFormat {
+    /// Human-readable multi-line snapshot blocks.
+    Text,
+    /// JSON-Lines: one JSON object per snapshot.
+    Json,
 }
 
 /// Subcommands
 #[derive(clap::Subcommand, Debug, Clone)]
 pub enum Command {
-    /// Convert RocksDB scan to SQLite for ad-hoc SQL queries
-    #[cfg(feature = "rocksdb")]
-    Convert {
+    /// Export RocksDB scan to a SQLite database (for ad-hoc SQL queries).
+    ExportSql {
         /// Input RocksDB directory from a previous scan
         #[arg(value_name = "INPUT")]
         input: PathBuf,
@@ -280,34 +273,6 @@ pub enum Command {
         parallelism: usize,
     },
 
-    /// Export RocksDB scan to CSV files (auto-splits by row count)
-    #[cfg(feature = "csv-export")]
-    ExportCsv {
-        /// Input RocksDB directory from a previous scan
-        #[arg(value_name = "INPUT")]
-        input: PathBuf,
-
-        /// Output directory for CSV files (created if it doesn't exist)
-        #[arg(value_name = "OUTPUT_DIR")]
-        output_dir: PathBuf,
-
-        /// Show export progress
-        #[arg(short = 'p', long)]
-        progress: bool,
-
-        /// Maximum rows per output file before splitting (default: 10M)
-        #[arg(long, default_value = "10000000")]
-        rows_per_file: usize,
-
-        /// Compress output with gzip (.csv.gz) - recommended for large exports
-        #[arg(long)]
-        gzip: bool,
-
-        /// Gzip compression level 1-9 (default: 6)
-        #[arg(long, default_value = "6")]
-        gzip_level: u32,
-    },
-
     /// Start analytics server for querying scan data
     #[cfg(feature = "server")]
     Serve {
@@ -324,60 +289,11 @@ pub enum Command {
         bind: String,
     },
 
-    /// Query statistics from a RocksDB scan (extensions, largest files, ownership, etc.)
-    #[cfg(feature = "rocksdb")]
+    /// Show overview statistics for a RocksDB scan (counts, total size, max depth).
     Stats {
         /// RocksDB database path from a previous scan
         #[arg(value_name = "DB")]
         db: PathBuf,
-
-        /// Show files grouped by extension
-        #[arg(long)]
-        by_extension: bool,
-
-        /// Show largest files
-        #[arg(long)]
-        largest_files: bool,
-
-        /// Show directories with most files
-        #[arg(long)]
-        largest_dirs: bool,
-
-        /// Show oldest files (by mtime)
-        #[arg(long)]
-        oldest_files: bool,
-
-        /// Show files with most hard links
-        #[arg(long)]
-        most_links: bool,
-
-        /// Show usage by user ID
-        #[arg(long)]
-        by_uid: bool,
-
-        /// Show usage by group ID
-        #[arg(long)]
-        by_gid: bool,
-
-        /// Find duplicate files by checksum
-        #[arg(long)]
-        duplicates: bool,
-
-        /// Show file type distribution (by detected MIME type)
-        #[arg(long)]
-        by_file_type: bool,
-
-        /// Find hard link groups (files sharing same inode)
-        #[arg(long)]
-        hardlink_groups: bool,
-
-        /// Minimum file size for duplicate detection (default: 1KB)
-        #[arg(long, default_value = "1024")]
-        min_size: u64,
-
-        /// Number of results to show
-        #[arg(short = 'n', long, default_value = "20")]
-        top: usize,
 
         /// Open the database in RocksDB secondary mode for live querying
         /// while a scan is still writing to it. Slightly slower than the
@@ -385,44 +301,6 @@ pub enum Command {
         #[arg(long)]
         live: bool,
     },
-}
-
-/// Output format for scan results
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputFormat {
-    /// SQLite database (.db)
-    Sqlite,
-    /// RocksDB directory (.rocks)
-    #[cfg(feature = "rocksdb")]
-    RocksDb,
-}
-
-impl CliArgs {
-    /// Determine output format from file extension and flags
-    pub fn output_format(&self) -> OutputFormat {
-        #[cfg(feature = "rocksdb")]
-        {
-            // --sqlite flag forces SQLite mode
-            if self.sqlite {
-                return OutputFormat::Sqlite;
-            }
-
-            // Check file extension
-            if let Some(ext) = self.output.extension() {
-                if ext == "rocks" {
-                    return OutputFormat::RocksDb;
-                }
-            }
-
-            // Default to RocksDB when feature is enabled
-            OutputFormat::RocksDb
-        }
-
-        #[cfg(not(feature = "rocksdb"))]
-        {
-            OutputFormat::Sqlite
-        }
-    }
 }
 
 fn default_workers() -> usize {
@@ -577,14 +455,10 @@ pub struct WalkConfig {
     /// Parsed NFS URL
     pub nfs_url: NfsUrl,
 
-    /// Output database path
+    /// Output RocksDB directory path
     pub output_path: PathBuf,
 
-    /// Output format (SQLite or RocksDB)
-    pub output_format: OutputFormat,
-
     /// RocksDB baseline path for incremental scans
-    #[cfg(feature = "rocksdb")]
     pub baseline_path: Option<PathBuf>,
 
     /// Number of worker threads
@@ -593,7 +467,7 @@ pub struct WalkConfig {
     /// Work queue capacity
     pub queue_size: usize,
 
-    /// SQLite batch size
+    /// Writer batch size
     pub batch_size: usize,
 
     /// Maximum traversal depth
@@ -620,12 +494,6 @@ pub struct WalkConfig {
     /// Retry count for transient errors
     pub retry_count: u32,
 
-    /// Big directory hunt mode (only stores dirs over threshold)
-    pub big_dir_hunt: bool,
-
-    /// File count threshold for big-dir-hunt mode
-    pub big_dir_threshold: u64,
-
     /// Calculate gxhash checksum for files
     pub compute_checksum: bool,
 
@@ -635,20 +503,24 @@ pub struct WalkConfig {
     /// Maximum file size for checksum calculation
     pub max_checksum_size: u64,
 
-    /// Stream a parallel rolled-Parquet directory alongside RocksDB
-    /// during the scan. Enables ad-hoc DuckDB / DataFusion queries on
-    /// the live data. Only meaningful when output_format=RocksDb.
-    #[cfg(feature = "parquet")]
-    pub stream_parquet: bool,
-
     /// Number of READDIRPLUS RPCs to keep in flight per worker.
     /// 0 = legacy serial worker loop. >0 selects the pipelined worker.
     pub pipeline_depth: usize,
 
     /// Number of RocksDB writer shards (1 = legacy single-writer path).
-    /// Validated to 1..=32 in `from_args` and rejected when combined
-    /// with `--stream-parquet`.
+    /// Validated to 1..=32 in `from_args`.
     pub writer_shards: usize,
+
+    /// Resolved progress-logfile config, or `None` if `--no-log` was passed.
+    pub log: Option<LogSettings>,
+}
+
+/// Resolved progress-logfile settings (after CLI parsing).
+#[derive(Debug, Clone)]
+pub struct LogSettings {
+    pub path: PathBuf,
+    pub format: LogFormat,
+    pub interval: Duration,
 }
 
 impl WalkConfig {
@@ -732,20 +604,6 @@ impl WalkConfig {
                 max: MAX_WRITER_SHARDS,
             });
         }
-        // The streaming Parquet writer is single-threaded by design and
-        // would become the new bottleneck under multi-shard ingest. The
-        // recommended workflow is to run a regular scan and then
-        // `nfs-walker export-parquet --parallelism N` afterwards.
-        #[cfg(feature = "parquet")]
-        if args.writer_shards > 1 && args.stream_parquet {
-            return Err(ConfigError::IncompatibleFlags {
-                reason: "--writer-shards > 1 is not yet compatible with --stream-parquet. \
-                         Either drop --stream-parquet or set --writer-shards 1, then run \
-                         `nfs-walker export-parquet --parallelism N` after the scan."
-                    .to_string(),
-            });
-        }
-
         // Compile exclude patterns
         let exclude_patterns = args
             .exclude_patterns
@@ -769,7 +627,6 @@ impl WalkConfig {
         }
 
         // Validate baseline path if provided
-        #[cfg(feature = "rocksdb")]
         if let Some(ref baseline) = args.baseline {
             if !baseline.exists() {
                 return Err(ConfigError::InvalidResumeDb {
@@ -779,13 +636,26 @@ impl WalkConfig {
             }
         }
 
-        let output_format = args.output_format();
+        // Resolve the progress-logfile destination.
+        // Default sidecar path is `<output>.log` (e.g. scan.rocks.log).
+        let log = if args.no_log {
+            None
+        } else {
+            let path = args.log.clone().unwrap_or_else(|| {
+                let mut p = args.output.as_os_str().to_owned();
+                p.push(".log");
+                PathBuf::from(p)
+            });
+            Some(LogSettings {
+                path,
+                format: args.log_fmt,
+                interval: Duration::from_secs(args.log_interval_secs.max(1)),
+            })
+        };
 
         Ok(Self {
             nfs_url,
             output_path: args.output,
-            output_format,
-            #[cfg(feature = "rocksdb")]
             baseline_path: args.baseline,
             worker_count: args.workers,
             queue_size: args.queue_size,
@@ -798,15 +668,12 @@ impl WalkConfig {
             exclude_patterns,
             timeout_secs: args.timeout,
             retry_count: args.retries,
-            big_dir_hunt: args.big_dir_hunt,
-            big_dir_threshold: args.threshold,
             compute_checksum: args.checksum,
             detect_file_type: args.file_type,
             max_checksum_size: args.max_checksum_size,
-            #[cfg(feature = "parquet")]
-            stream_parquet: args.stream_parquet,
             pipeline_depth: args.pipeline_depth,
             writer_shards: args.writer_shards,
+            log,
         })
     }
 
@@ -870,9 +737,7 @@ mod tests {
     fn test_exclude_pattern() {
         let config = WalkConfig {
             nfs_url: NfsUrl::parse("nfs://s/e").unwrap(),
-            output_path: PathBuf::from("test.db"),
-            output_format: OutputFormat::Sqlite,
-            #[cfg(feature = "rocksdb")]
+            output_path: PathBuf::from("test.rocks"),
             baseline_path: None,
             worker_count: 4,
             queue_size: 1000,
@@ -885,15 +750,12 @@ mod tests {
             exclude_patterns: vec![Regex::new(r"\.snapshot").unwrap()],
             timeout_secs: 30,
             retry_count: 3,
-            big_dir_hunt: false,
-            big_dir_threshold: 1_000_000,
             compute_checksum: false,
             detect_file_type: false,
             max_checksum_size: 1_073_741_824,
-            #[cfg(feature = "parquet")]
-            stream_parquet: false,
             pipeline_depth: 0,
             writer_shards: 1,
+            log: None,
         };
 
         assert!(config.is_excluded("/data/.snapshot/hourly.0"));

@@ -2,7 +2,7 @@
 //!
 //! A high-performance tool for scanning NFS filesystems at scale, using
 //! READDIRPLUS for efficient directory traversal with work-stealing parallelism.
-//! Outputs to RocksDB (primary) with SQLite export capability.
+//! Outputs to RocksDB; convert to SQLite or export to Parquet after the scan.
 //!
 //! # Features
 //!
@@ -15,8 +15,8 @@
 //! - **Work-Stealing Parallelism**: Multiple workers with work-stealing deques
 //!   for efficient load balancing across workers.
 //!
-//! - **Dual Storage**: RocksDB for fast primary storage with SQLite export
-//!   for SQL-based analysis.
+//! - **RocksDB Storage**: Fast primary storage; export to SQLite (`export-sql`)
+//!   or Parquet (`export-parquet`) after the scan.
 //!
 //! - **Big-Dir Hunt Mode**: Specialized mode to quickly find directories
 //!   with many files (useful for identifying hot spots).
@@ -30,7 +30,7 @@
 //! ├── Worker 1: pop dir → READDIRPLUS → send entries → push subdirs
 //! └── Worker N: pop dir → READDIRPLUS → send entries → push subdirs
 //! │
-//! └── Writer Thread: recv entries → batch insert to RocksDB/SQLite
+//! └── Writer Thread: recv entries → batch insert to RocksDB
 //! ```
 //!
 //! # Example
@@ -39,14 +39,9 @@
 //! # Basic scan to RocksDB
 //! nfs-walker nfs://server/export -o scan.rocks
 //!
-//! # Convert to SQLite for analysis
-//! nfs-walker convert scan.rocks scan.db --progress
+//! # Export to SQLite for ad-hoc SQL
+//! nfs-walker export-sql scan.rocks scan.db --progress
 //!
-//! # Query results
-//! sqlite3 scan.db "SELECT path, size, extension FROM entries WHERE size > 1000000000"
-//!
-//! # Big-dir hunt mode
-//! nfs-walker nfs://server/export --big-dir-hunt --big-dir-threshold 10000 -o big-dirs.rocks
 //! ```
 
 pub mod config;
@@ -55,12 +50,10 @@ pub mod db;
 pub mod error;
 pub mod nfs;
 pub mod progress;
-#[cfg(feature = "csv-export")]
-pub mod csv_export;
+pub mod rocksdb;
+pub mod scanlog;
 #[cfg(feature = "parquet")]
 pub mod parquet;
-#[cfg(feature = "rocksdb")]
-pub mod rocksdb;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod walker;

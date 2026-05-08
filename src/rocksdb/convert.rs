@@ -87,15 +87,7 @@ where
     ).map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
 
     // Convert entries
-    let mut stats = convert_entries(&rocks, &mut conn, config.batch_size, progress_callback)?;
-
-    // Convert big directories if present
-    let big_dirs_count = convert_big_dirs(&rocks, &mut conn)?;
-    stats.big_dirs_converted = big_dirs_count;
-
-    if big_dirs_count > 0 {
-        info!("Converted {} big directories", big_dirs_count);
-    }
+    let stats = convert_entries(&rocks, &mut conn, config.batch_size, progress_callback)?;
 
     // Finalize
     info!("Creating indexes...");
@@ -216,44 +208,10 @@ fn convert_entries(
     Ok(stats)
 }
 
-/// Convert big directories from RocksDB to SQLite
-fn convert_big_dirs(rocks: &RocksHandle, conn: &mut Connection) -> Result<u64, WalkerError> {
-    let mut count = 0u64;
-
-    let tx = conn
-        .transaction()
-        .map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
-
-    {
-        let mut stmt = tx
-            .prepare_cached(
-                "INSERT INTO big_directories (path, file_count) VALUES (?1, ?2)",
-            )
-            .map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
-
-        for result in rocks.iter_big_dirs() {
-            let (path, file_count) = result.map_err(|e| {
-                WalkerError::Database(DbError::Schema(format!("Failed to read big dir: {}", e)))
-            })?;
-
-            stmt.execute(params![path, file_count as i64])
-                .map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
-
-            count += 1;
-        }
-    }
-
-    tx.commit()
-        .map_err(|e| WalkerError::Database(DbError::Sqlite(e)))?;
-
-    Ok(count)
-}
-
 /// Statistics from conversion
 #[derive(Debug, Clone, Default)]
 pub struct ConvertStats {
     pub entries_converted: u64,
-    pub big_dirs_converted: u64,
 }
 
 #[cfg(test)]
@@ -281,8 +239,6 @@ mod tests {
                 entry_type: EntryType::File,
                 size: 1024,
                 mtime: Some(1234567890),
-                atime: None,
-                ctime: None,
                 mode: Some(0o644),
                 uid: Some(1000),
                 gid: Some(1000),
@@ -291,8 +247,7 @@ mod tests {
                 depth: 1,
                 extension: Some("txt".to_string()),
                 blocks: 8,
-                checksum: None,
-                file_type: None,
+                ..Default::default()
             },
             DbEntry {
                 parent_path: Some("/".to_string()),
@@ -301,18 +256,13 @@ mod tests {
                 entry_type: EntryType::Directory,
                 size: 0,
                 mtime: Some(1234567890),
-                atime: None,
-                ctime: None,
                 mode: Some(0o755),
                 uid: Some(1000),
                 gid: Some(1000),
                 nlink: Some(2),
                 inode: 200,
                 depth: 1,
-                extension: None,
-                blocks: 0,
-                checksum: None,
-                file_type: None,
+                ..Default::default()
             },
         ];
 

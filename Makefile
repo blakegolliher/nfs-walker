@@ -94,7 +94,7 @@ release-rocks:
 		exit 1; \
 	fi
 	@mkdir -p $(BUILD_DIR)
-	@RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target $(MUSL_TARGET) --features rocksdb 2>&1 | tee $(BUILD_DIR)/build-release-rocks.log; \
+	@RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target $(MUSL_TARGET) 2>&1 | tee $(BUILD_DIR)/build-release-rocks.log; \
 	BUILD_STATUS=$${PIPESTATUS[0]}; \
 	if [ $$BUILD_STATUS -eq 0 ]; then \
 		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-rocks"; \

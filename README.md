@@ -6,36 +6,29 @@ High-performance NFS filesystem scanner. Scans millions of files directly via NF
 
 - **Fast**: 48,000+ files/sec using READDIRPLUS and parallel workers
 - **Direct NFS Protocol**: Bypasses kernel NFS client for maximum throughput
-- **RocksDB Storage**: Write-optimized for large scans, with built-in analytics
-- **Analytics Dashboard**: Web UI with 36 pre-built queries across 9 categories
-- **SQLite Export**: Convert to SQLite for complex SQL queries
+- **RocksDB Storage**: Write-optimized for large scans, with a built-in scan-overview stat
+- **Parquet Export**: Run `export-parquet`, then query in DuckDB / DataFusion / Polars / the bundled dashboard
+- **SQLite Export**: Run `export-sql` for ad-hoc `sqlite3` queries against the same data
 - **Content Analysis**: Optional checksum (gxhash) and file type detection (magic bytes)
-- **Duplicate Detection**: Find duplicate files by content hash across the entire filesystem
-- **Memory Efficient**: Periodic flushing keeps memory bounded
+- **Per-scan progress logfile**: Sidecar `<output>.log` records active workers, queue depth, write latency every 5s
 
 ## Quick Start
 
 ```bash
-# Scan an NFS export
+# Scan an NFS export to RocksDB
 nfs-walker nfs://server/export -o scan.rocks -w 16
 
-# View statistics
+# View overview statistics (counts, total size, max depth)
 nfs-walker stats scan.rocks
 
-# Query by extension, largest files, etc.
-nfs-walker stats scan.rocks --by-extension -n 20
-nfs-walker stats scan.rocks --largest-files -n 10
-nfs-walker stats scan.rocks --largest-dirs -n 10
+# Export to Parquet for analytics (DuckDB / DataFusion / dashboard)
+nfs-walker export-parquet scan.rocks ./parquet-out -p --parallelism 64
 
 # Scan with content analysis (checksum + file type detection)
 nfs-walker nfs://server/export -o scan.rocks -c -t
 
-# Find duplicate files and analyze file types
-nfs-walker stats scan.rocks --duplicates
-nfs-walker stats scan.rocks --by-file-type
-
-# Convert to SQLite for complex queries
-nfs-walker convert scan.rocks scan.db
+# Export to SQLite for ad-hoc SQL
+nfs-walker export-sql scan.rocks scan.db -p
 sqlite3 scan.db "SELECT path, size FROM entries ORDER BY size DESC LIMIT 10"
 ```
 
@@ -97,47 +90,65 @@ These fields are `NULL` when the corresponding flag is not enabled, or when the 
 
 ### Querying Results
 
-**RocksDB** (fast, built-in queries):
+**Overview from RocksDB** — fast counts, total size, max depth:
 ```bash
-nfs-walker stats scan.rocks                    # Overview
-nfs-walker stats scan.rocks --by-extension     # Files by type
-nfs-walker stats scan.rocks --largest-files    # Biggest files
-nfs-walker stats scan.rocks --largest-dirs     # Fullest directories
-nfs-walker stats scan.rocks --by-uid           # Usage by owner
-nfs-walker stats scan.rocks --duplicates       # Duplicate files (requires -c scan)
-nfs-walker stats scan.rocks --by-file-type     # MIME type distribution (requires -t scan)
-nfs-walker stats scan.rocks --hardlink-groups  # Hard link groups
-nfs-walker stats scan.rocks --by-extension --live  # Query while a scan is still writing
+nfs-walker stats scan.rocks               # Overview (default mode)
+nfs-walker stats scan.rocks --live        # Same, but works while a scan is still writing
 ```
+
+The previous per-flag stat helpers (`--by-extension`, `--largest-files`, `--by-uid`,
+`--duplicates`, etc.) were removed — convert to Parquet or SQLite and query there
+instead. The Parquet path is the recommended one (DuckDB queries 4 B rows in seconds).
 
 > **Querying during an active scan:** add `--live` to open the database in
 > RocksDB secondary mode. The default read-only mode breaks under concurrent
 > compactions ("No such file or directory: .../NNNNNN.sst"). See
-> [docs/QUERY_ROCKSDB.md](docs/QUERY_ROCKSDB.md#live-querying-during-an-active-scan---live)
-> for details and caveats.
+> [docs/QUERY_ROCKSDB.md](docs/QUERY_ROCKSDB.md#live-querying-during-an-active-scan---live).
 
-> **DuckDB SQL during an active scan:** start the scan with `--stream-parquet`
-> and Parquet parts land in `<output>.parquet/scans/<scan_id>/` as the scan
-> runs. Query with DuckDB or DataFusion against the directory glob — see
-> [docs/QUERY_ROCKSDB.md](docs/QUERY_ROCKSDB.md#live-duckdb-queries-with---stream-parquet).
-
-**SQLite** (full SQL power):
+**Parquet** (recommended for analytics):
 ```bash
-nfs-walker convert scan.rocks scan.db
+nfs-walker export-parquet scan.rocks ./parquet-out -p --parallelism 64
 
-# Duplicate files by checksum
+# DuckDB
+duckdb -c "SELECT entry_type, COUNT(*), SUM(size)/1e9 AS gb \
+           FROM read_parquet('parquet-out/scans/*/part-*.parquet') GROUP BY 1"
+```
+
+**SQLite** (single-file, full SQL):
+```bash
+nfs-walker export-sql scan.rocks scan.db -p
+
 sqlite3 scan.db "SELECT checksum, COUNT(*) as copies, SUM(size) as wasted
                  FROM entries WHERE checksum IS NOT NULL
                  GROUP BY checksum HAVING copies > 1
                  ORDER BY wasted DESC LIMIT 20"
 
-# File type distribution
 sqlite3 scan.db "SELECT file_type, COUNT(*), SUM(size)/1e9 as gb
                  FROM entries WHERE file_type IS NOT NULL
                  GROUP BY file_type ORDER BY gb DESC"
 ```
 
 See [docs/QUERY_ROCKSDB.md](docs/QUERY_ROCKSDB.md) and [docs/QUERY_SQLITE.md](docs/QUERY_SQLITE.md) for query examples.
+
+### Per-scan progress logfile
+
+Every scan writes a sidecar logfile next to the output (`<output>.log` by default).
+Snapshots fire every 5 s and capture: timestamp, elapsed, dirs/files/bytes, throughput,
+active workers / total, write-batch latency (avg + p99), write-channel queue depth, and
+on-disk RocksDB size. Tail it during a long scan to spot stalls:
+
+```bash
+nfs-walker nfs://server/export -o scan.rocks -w 32   # writes scan.rocks.log
+tail -f scan.rocks.log
+```
+
+```
+nfs-walker [OPTIONS]
+  --log <PATH>           Override sidecar log path
+  --no-log               Disable the progress logfile
+  --log-fmt <text|json>  Snapshot format [default: text]
+  --log-interval-secs N  Snapshot interval [default: 5]
+```
 
 ### Analytics Dashboard
 
@@ -212,37 +223,31 @@ cd web && npm run dev
 
 ```
 nfs-walker [OPTIONS] <NFS_URL>
-nfs-walker stats <DB_PATH> [QUERY_OPTIONS]
-nfs-walker convert <INPUT> <OUTPUT> [--progress]
+nfs-walker stats <DB_PATH> [--live]
+nfs-walker export-sql <INPUT> <OUTPUT> [--progress]
 nfs-walker export-parquet <INPUT> <OUTPUT_DIR>
 nfs-walker serve --data-dir <DIR> [--port 8080] [--bind 0.0.0.0]
 
 Scan Options:
-  -o, --output <FILE>     Output database [default: walk.db]
+  -o, --output <PATH>     Output RocksDB directory [default: walk.rocks]
   -w, --workers <NUM>     Worker threads [default: CPU count × 2]
   -d, --max-depth <NUM>   Maximum directory depth
   -q, --quiet             Suppress progress
   -v, --verbose           Show errors
   --dirs-only             Only record directories
   --exclude <PATTERN>     Exclude paths (repeatable)
-  --sqlite                Force SQLite output (slower)
   -c, --checksum          Compute gxhash checksum per file (reads full content)
   -t, --file-type         Detect MIME type via magic bytes (reads first 8KB)
   --max-checksum-size N   Skip checksum for files larger than N bytes [default: 1GB]
 
+Progress logfile:
+  --log <PATH>            Override sidecar log path
+  --no-log                Disable the progress logfile
+  --log-fmt <text|json>   Snapshot format [default: text]
+  --log-interval-secs N   Snapshot interval in seconds [default: 5]
+
 Stats Options:
-  --by-extension          Files by extension
-  --largest-files         Biggest files
-  --largest-dirs          Directories with most files
-  --oldest-files          Oldest by mtime
-  --most-links            Most hard links
-  --by-uid                Usage by user ID
-  --by-gid                Usage by group ID
-  --duplicates            Duplicate files by checksum (requires -c scan)
-  --by-file-type          MIME type distribution (requires -t scan)
-  --hardlink-groups       Files sharing same inode
-  --min-size <BYTES>      Minimum size for duplicate detection [default: 1024]
-  -n, --top <N>           Limit results [default: 20]
+  --live                  Open RocksDB in secondary mode (works during a live scan)
 ```
 
 ## Performance
@@ -255,11 +260,10 @@ Tested on a real NFS export: **4.1M files, 17,919 directories, 1.32 TiB** over N
 |------|------|------|-----------|---------------|
 | 1 | **nfs-walker (RocksDB)** | **35.1s** | **119,883** | — |
 | 2 | dust | 45.4s | ~91K | 1.3× slower |
-| 3 | nfs-walker (SQLite) | 63.3s | 65,731 | 1.8× slower |
-| 4 | rsync --dry-run | 3m 15s | ~21K | **5.6× slower** |
-| 5 | fd-find | 3m 43s | ~18.6K | **6.3× slower** |
-| 6 | find | 28m 20s | ~2.4K | **48× slower** |
-| 7 | du | 28m 52s | ~2.4K | **49× slower** |
+| 3 | rsync --dry-run | 3m 15s | ~21K | **5.6× slower** |
+| 4 | fd-find | 3m 43s | ~18.6K | **6.3× slower** |
+| 5 | find | 28m 20s | ~2.4K | **48× slower** |
+| 6 | du | 28m 52s | ~2.4K | **49× slower** |
 
 *All kernel-client tools (rsync, fd, find, du) use the standard NFS mount. nfs-walker bypasses the kernel and speaks NFS protocol directly.*
 
@@ -358,7 +362,6 @@ The Parquet directory is one logical scan (`metadata.json` lists every part), so
 > - Bump the producer→writer channel and the writer batch size on many-core boxes — defaults are 1024 / 5000 respectively.
 > - `--pipeline-depth 8` is a sweet spot; `16` adds nothing on a server-bound target and adds memory pressure (16 in-flight READDIRPLUS responses per worker).
 > - **The only client-side lever left after `--writer-shards 1 --pipeline-depth 8` is multi-host scan-out** — split the tree across N transfer hosts, each scanning a disjoint subtree. Per-client throttling at the NFS server is what the experiments above measure; running two clients should roughly double aggregate throughput on this class of cluster.
-> - `--stream-parquet` stays single-threaded by design; use it only with `--writer-shards 1`.
 
 ### Content Analysis Performance
 
@@ -399,7 +402,7 @@ Content analysis is I/O-bound (reading file data over NFS), so throughput depend
 └──────────────────────┬──────────────────────────┘
                        ▼
               ┌────────────────┐
-              │ RocksDB/SQLite │
+              │    RocksDB     │
               └────────────────┘
 ```
 

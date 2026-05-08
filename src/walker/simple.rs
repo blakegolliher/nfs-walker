@@ -13,26 +13,20 @@
 //! ├── Worker 1: pop dir → READDIRPLUS → send entries → push subdirs
 //! └── Worker N: pop dir → READDIRPLUS → send entries → push subdirs
 //! │
-//! └── Writer Thread: recv entries → batch insert to SQLite/RocksDB
+//! └── Writer Thread: recv entries → batch insert to RocksDB
 //! ```
 
 use crate::config::WalkConfig;
-#[cfg(feature = "rocksdb")]
-use crate::config::OutputFormat;
-#[cfg(feature = "rocksdb")]
 use crate::rocksdb::schema::path_to_shard;
 use crate::content::{checksum::compute_gxhash, filetype::detect_file_type as detect_mime_type};
-use crate::db::schema::{create_database, create_indexes, keys, optimize_for_reads, set_walk_info};
 use crate::error::{Result, WalkerError};
 use crate::nfs::{resolve_dns, NfsConnection, NfsConnectionBuilder};
-use crate::nfs::types::{BigDirEntry, DbEntry, EntryType};
-#[cfg(feature = "rocksdb")]
+use crate::nfs::types::{DbEntry, EntryType};
 use crate::rocksdb::{
     finalize_rocks_db, meta_keys, RocksHandle, RocksWriter, RocksWriterConfig, WalkStatsSnapshot,
 };
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
-use rusqlite::{params, Connection};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -53,7 +47,7 @@ struct DirWork {
 /// path-shard channel by `path_to_shard(entry.path, shards)`. Workers
 /// hold N partial batches in parallel; shards == 1 collapses to a
 /// single channel and matches the legacy behavior bit-for-bit.
-#[cfg(feature = "rocksdb")]
+
 struct ShardedSender {
     senders: Vec<Sender<Vec<DbEntry>>>,
     batches: Vec<Vec<DbEntry>>,
@@ -61,7 +55,7 @@ struct ShardedSender {
     shards: usize,
 }
 
-#[cfg(feature = "rocksdb")]
+
 impl ShardedSender {
     fn new(senders: Vec<Sender<Vec<DbEntry>>>, batch_size: usize) -> Self {
         let shards = senders.len();
@@ -112,10 +106,6 @@ pub struct WalkStats {
     pub errors: u64,
     pub duration: Duration,
     pub completed: bool,
-    /// Number of big directories found (only set in big-dir-hunt mode)
-    pub big_dirs_found: u64,
-    /// Whether this was a big-dir-hunt run
-    pub big_dir_hunt_mode: bool,
 }
 
 /// Progress information for display
@@ -150,7 +140,6 @@ pub struct SimpleWalker {
     files_count: Arc<AtomicU64>,
     bytes_count: Arc<AtomicU64>,
     errors_count: Arc<AtomicU64>,
-    big_dirs_count: Arc<AtomicU64>,
 }
 
 impl SimpleWalker {
@@ -162,7 +151,6 @@ impl SimpleWalker {
             files_count: Arc::new(AtomicU64::new(0)),
             bytes_count: Arc::new(AtomicU64::new(0)),
             errors_count: Arc::new(AtomicU64::new(0)),
-            big_dirs_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -184,177 +172,12 @@ impl SimpleWalker {
     }
 
     pub fn run(&self) -> Result<WalkStats> {
-        // Dispatch based on output format and mode
-        #[cfg(feature = "rocksdb")]
-        {
-            if self.config.big_dir_hunt {
-                return self.run_big_dir_hunt();
-            }
-            match self.config.output_format {
-                OutputFormat::Sqlite => self.run_sqlite(),
-                OutputFormat::RocksDb => self.run_rocksdb(),
-            }
-        }
-
-        #[cfg(not(feature = "rocksdb"))]
-        {
-            if self.config.big_dir_hunt {
-                return self.run_big_dir_hunt_sqlite();
-            }
-            self.run_sqlite()
-        }
-    }
-
-    /// Run walker with SQLite output
-    fn run_sqlite(&self) -> Result<WalkStats> {
-        let start = Instant::now();
-
-        // Open SQLite database
-        info!("Opening SQLite database: {}", self.config.output_path.display());
-        let db = self.open_sqlite_database()?;
-
-        // Channel for entries to write (workers -> writer).
-        // SQLite path stays single-shard: there is one writer thread.
-        let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(1024);
-
-        // Spawn dedicated writer thread
-        let writer_handle = self.spawn_sqlite_writer(db, entry_rx);
-
-        // Run workers (single-channel fan-in)
-        self.run_workers(vec![entry_tx])?;
-
-        // Wait for writer to finish
-        let db = writer_handle.join().expect("Writer thread panicked");
-
-        // Finalize database
-        info!("Finalizing SQLite database...");
-        self.finalize_sqlite_database(&db, start.elapsed(), !self.shutdown.load(Ordering::Relaxed))?;
-
-        let stats = WalkStats {
-            dirs: self.dirs_count.load(Ordering::Relaxed),
-            files: self.files_count.load(Ordering::Relaxed),
-            bytes: self.bytes_count.load(Ordering::Relaxed),
-            errors: self.errors_count.load(Ordering::Relaxed),
-            duration: start.elapsed(),
-            completed: !self.shutdown.load(Ordering::Relaxed),
-            big_dirs_found: 0,
-            big_dir_hunt_mode: false,
-        };
-
-        Ok(stats)
-    }
-
-    /// Run walker in big-dir-hunt mode with SQLite output
-    #[cfg(not(feature = "rocksdb"))]
-    fn run_big_dir_hunt_sqlite(&self) -> Result<WalkStats> {
-        let start = Instant::now();
-
-        info!(
-            "Starting big-dir-hunt mode (SQLite) with threshold {} files",
-            self.config.big_dir_threshold
-        );
-
-        // Open SQLite database
-        info!("Opening SQLite database: {}", self.config.output_path.display());
-        let db = self.open_sqlite_database()?;
-
-        // Create big_dirs table
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS big_dirs (
-                path TEXT PRIMARY KEY,
-                file_count INTEGER NOT NULL,
-                discovered_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )",
-            [],
-        ).map_err(|e| WalkerError::Database(crate::error::DbError::Sqlite(e)))?;
-
-        // Channel for big directory entries (workers -> writer)
-        let (big_dir_tx, big_dir_rx) = bounded::<BigDirEntry>(1024);
-
-        // Spawn dedicated writer thread for big dirs
-        let writer_handle = self.spawn_big_dir_writer_sqlite(db, big_dir_rx);
-
-        // Run workers in big-dir-hunt mode
-        self.run_big_dir_workers(big_dir_tx)?;
-
-        // Wait for writer to finish
-        let db = writer_handle.join().expect("Big-dir writer thread panicked");
-
-        // Finalize database
-        info!("Finalizing SQLite database...");
-        let stats_snapshot = (
-            self.dirs_count.load(Ordering::Relaxed),
-            self.files_count.load(Ordering::Relaxed),
-            self.bytes_count.load(Ordering::Relaxed),
-            self.errors_count.load(Ordering::Relaxed),
-        );
-
-        // Record metadata
-        let _ = db.execute(
-            "INSERT OR REPLACE INTO walk_info (key, value) VALUES ('big_dir_hunt', 'true')",
-            [],
-        );
-        let _ = db.execute(
-            "INSERT OR REPLACE INTO walk_info (key, value) VALUES ('big_dir_threshold', ?1)",
-            params![self.config.big_dir_threshold.to_string()],
-        );
-        let _ = db.execute(
-            "INSERT OR REPLACE INTO walk_info (key, value) VALUES ('dirs_scanned', ?1)",
-            params![stats_snapshot.0.to_string()],
-        );
-        let _ = db.execute(
-            "INSERT OR REPLACE INTO walk_info (key, value) VALUES ('big_dirs_found', ?1)",
-            params![self.big_dirs_count.load(Ordering::Relaxed).to_string()],
-        );
-        let _ = db.execute(
-            "INSERT OR REPLACE INTO walk_info (key, value) VALUES ('duration_secs', ?1)",
-            params![start.elapsed().as_secs().to_string()],
-        );
-
-        let stats = WalkStats {
-            dirs: stats_snapshot.0,
-            files: stats_snapshot.1,
-            bytes: stats_snapshot.2,
-            errors: stats_snapshot.3,
-            duration: start.elapsed(),
-            completed: !self.shutdown.load(Ordering::Relaxed),
-            big_dirs_found: self.big_dirs_count.load(Ordering::Relaxed),
-            big_dir_hunt_mode: true,
-        };
-
-        Ok(stats)
-    }
-
-    /// Spawn SQLite writer thread for big-dir-hunt mode
-    #[cfg(not(feature = "rocksdb"))]
-    fn spawn_big_dir_writer_sqlite(
-        &self,
-        db: Connection,
-        big_dir_rx: Receiver<BigDirEntry>,
-    ) -> JoinHandle<Connection> {
-        thread::Builder::new()
-            .name("big-dir-sqlite-writer".into())
-            .spawn(move || {
-                let mut stmt = db
-                    .prepare_cached("INSERT OR REPLACE INTO big_dirs (path, file_count) VALUES (?1, ?2)")
-                    .expect("Failed to prepare statement");
-
-                for entry in big_dir_rx {
-                    if let Err(e) = stmt.execute(params![entry.path, entry.file_count as i64]) {
-                        error!("Failed to insert big dir: {}", e);
-                    }
-                }
-
-                drop(stmt);
-                db
-            })
-            .expect("Failed to spawn big-dir-sqlite-writer thread")
+        self.run_rocksdb()
     }
 
     /// Run walker with RocksDB output. Fans out to `writer_shards`
     /// independent writer threads when `--writer-shards N > 1`; legacy
     /// single-writer behavior for shards == 1.
-    #[cfg(feature = "rocksdb")]
     fn run_rocksdb(&self) -> Result<WalkStats> {
         let start = Instant::now();
 
@@ -362,47 +185,32 @@ impl SimpleWalker {
         let rocks_path = self.config.output_path.clone();
         let shards = self.config.writer_shards.max(1);
 
-        // Decide whether to fan out to a streaming Parquet writer.
-        // Streaming Parquet is single-threaded and not yet sharded, so
-        // it's only allowed when shards == 1 (validated at config parse).
-        #[cfg(feature = "parquet")]
-        let parquet_spawn = self.maybe_spawn_parquet_writer(&rocks_path)?;
-        #[cfg(not(feature = "parquet"))]
-        let parquet_tx: Option<Sender<Vec<DbEntry>>> = None;
+        // Build the per-scan metrics handle. The walker's existing atomic
+        // counters are passed by reference so the snapshot thread reads
+        // what the walker writes (no double-bookkeeping).
+        let metrics = self.build_metrics(shards);
+        metrics.set_output_path(rocks_path.clone());
 
-        #[cfg(feature = "parquet")]
-        let parquet_tx_root = parquet_spawn.tx.clone();
-
-        let scan_id_for_rocks: Option<(String, i64)>;
-        #[cfg(feature = "parquet")]
-        {
-            scan_id_for_rocks = parquet_spawn
-                .scan_id
-                .as_ref()
-                .map(|id| (id.clone(), chrono::Utc::now().timestamp_micros()));
-        }
-        #[cfg(not(feature = "parquet"))]
-        {
-            scan_id_for_rocks = None;
-        }
+        // Spawn the progress-logfile snapshot thread.
+        let logger_handle = self.maybe_start_logger(metrics.clone(), start);
 
         let rocks_handle: Arc<RocksHandle> = if shards <= 1 {
-            // Single-shard path: keep the legacy single rocks-writer
-            // thread so streaming-parquet keeps working unchanged.
+            // Single-shard path: legacy single rocks-writer thread.
             let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(1024);
-            #[cfg(feature = "parquet")]
-            let parquet_tx = parquet_tx_root.clone();
-            #[cfg(not(feature = "parquet"))]
-            let parquet_tx: Option<Sender<Vec<DbEntry>>> = None;
+            metrics.register_write_sender(entry_tx.clone());
 
             let writer_handle = self.spawn_rocksdb_writer(
                 rocks_path.clone(),
                 entry_rx,
-                parquet_tx,
-                scan_id_for_rocks,
+                metrics.clone(),
             )?;
 
             self.run_workers(vec![entry_tx])?;
+
+            // Release the cloned sender so the writer's recv() unblocks
+            // when the workers' senders drop. (Sender clones held here for
+            // queue-depth observation otherwise keep the channel alive.)
+            metrics.release_write_senders();
 
             let h = writer_handle
                 .join()
@@ -414,10 +222,17 @@ impl SimpleWalker {
             // shard CF. Final summary is the merge of each shard's
             // accumulator.
             let (rocks_handle, writer_handles, txs) =
-                self.spawn_sharded_rocksdb_writers(rocks_path.clone(), shards)?;
+                self.spawn_sharded_rocksdb_writers(rocks_path.clone(), shards, metrics.clone())?;
+            for tx in &txs {
+                metrics.register_write_sender(tx.clone());
+            }
 
             // Run workers (route per-entry into shard channels).
             self.run_workers(txs)?;
+
+            // Same fix as the single-shard path: release the cloned
+            // senders so each per-shard writer's recv() unblocks.
+            metrics.release_write_senders();
 
             // Join all shard writers; merge their accumulators into a
             // single summary and flush it to the summary CF.
@@ -446,18 +261,6 @@ impl SimpleWalker {
             rocks_handle
         };
 
-        // Wait for the streaming Parquet writer if it was spawned.
-        #[cfg(feature = "parquet")]
-        if let Some(join) = parquet_spawn.join {
-            match join.join().expect("streaming parquet writer thread panicked") {
-                Ok(stats) => info!(
-                    "Streaming Parquet finished: {} rows in {} parts ({} bytes)",
-                    stats.rows_written, stats.parts_written, stats.bytes_written
-                ),
-                Err(e) => warn!("Streaming Parquet writer error: {}", e),
-            }
-        }
-
         // Finalize database
         info!("Finalizing RocksDB...");
         let stats_snapshot = WalkStatsSnapshot {
@@ -480,281 +283,56 @@ impl SimpleWalker {
             errors: stats_snapshot.errors,
             duration: start.elapsed(),
             completed: !self.shutdown.load(Ordering::Relaxed),
-            big_dirs_found: 0,
-            big_dir_hunt_mode: false,
         };
+
+        // Final-flush the progress logfile.
+        metrics.signal_shutdown();
+        if let Some(h) = logger_handle {
+            let _ = h.join();
+        }
 
         Ok(stats)
     }
 
-    /// If `--stream-parquet` is enabled, prepare the streaming writer:
-    /// generate the scan_id, refuse to overwrite an existing scan dir,
-    /// open the writer, and spawn its thread.
-    #[cfg(all(feature = "rocksdb", feature = "parquet"))]
-    fn maybe_spawn_parquet_writer(
+    /// Build a fresh `ScanMetrics` populated with references to the walker's
+    /// existing scan counters.
+    fn build_metrics(&self, shards: usize) -> Arc<crate::scanlog::ScanMetrics> {
+        let counters = crate::scanlog::CounterRefs {
+            dirs: Arc::clone(&self.dirs_count),
+            files: Arc::clone(&self.files_count),
+            bytes: Arc::clone(&self.bytes_count),
+            errors: Arc::clone(&self.errors_count),
+            // Active-worker tracking is currently per-run inside the worker
+            // pool. Hand the snapshot thread a fresh atomic — it'll show 0
+            // until the per-run instrumentation lands. (Phase-2 follow-up.)
+            active_workers: Arc::new(AtomicUsize::new(0)),
+        };
+        crate::scanlog::ScanMetrics::new(self.config.worker_count, shards, counters)
+    }
+
+    /// Spawn the per-scan progress logger if `--log` is enabled. Returns
+    /// `None` when the user passed `--no-log`.
+    fn maybe_start_logger(
         &self,
-        rocks_path: &std::path::Path,
-    ) -> Result<StreamingParquetSpawn> {
-        if !self.config.stream_parquet {
-            return Ok(StreamingParquetSpawn::default());
-        }
-
-        use crate::parquet::{StreamingParquetConfig, StreamingParquetWriter};
-
-        let scan_id = uuid::Uuid::new_v4().to_string();
-        let scan_timestamp_us = chrono::Utc::now().timestamp_micros();
-
-        let scan_dir = streaming_parquet_dir(rocks_path, &scan_id);
-        if scan_dir.exists() {
-            return Err(WalkerError::Parquet(crate::error::ParquetError::Other(format!(
-                "Streaming Parquet target {} already exists. Refusing to overwrite -- \
-                 delete it or run without --stream-parquet.",
-                scan_dir.display()
-            ))));
-        }
-
-        let cfg = StreamingParquetConfig::defaults_for(scan_dir.clone(), scan_id.clone(), scan_timestamp_us);
-        let writer = StreamingParquetWriter::open(cfg)?;
-
-        info!(
-            "Streaming Parquet enabled: scan_id={} dir={}",
-            scan_id,
-            scan_dir.display()
+        metrics: Arc<crate::scanlog::ScanMetrics>,
+        started_at: Instant,
+    ) -> Option<JoinHandle<()>> {
+        let cfg = self.config.log.as_ref()?;
+        let log_cfg = crate::scanlog::LogConfig::new(
+            cfg.path.clone(),
+            cfg.format,
+            cfg.interval,
         );
-
-        // Channel sized to match the rocks/worker channel (1024 batches).
-        let (tx, rx) = bounded::<Vec<DbEntry>>(1024);
-        let join = spawn_parquet_writer(writer, rx);
-        Ok(StreamingParquetSpawn {
-            tx: Some(tx),
-            join: Some(join),
-            scan_id: Some(scan_id),
-        })
-    }
-
-    /// Run walker in big-dir-hunt mode (RocksDB only)
-    #[cfg(feature = "rocksdb")]
-    fn run_big_dir_hunt(&self) -> Result<WalkStats> {
-        let start = Instant::now();
-
-        info!(
-            "Starting big-dir-hunt mode with threshold {} files",
-            self.config.big_dir_threshold
-        );
-
-        // Open RocksDB
-        info!("Opening RocksDB: {}", self.config.output_path.display());
-        let rocks_path = self.config.output_path.clone();
-
-        // Channel for big directory entries (workers -> writer)
-        let (big_dir_tx, big_dir_rx) = bounded::<BigDirEntry>(1024);
-
-        // Spawn dedicated big-dir writer thread
-        let writer_handle = self.spawn_big_dir_writer(rocks_path.clone(), big_dir_rx)?;
-
-        // Run workers in big-dir-hunt mode
-        self.run_big_dir_workers(big_dir_tx)?;
-
-        // Wait for writer to finish
-        let rocks_handle = writer_handle
-            .join()
-            .expect("Big-dir writer thread panicked")
-            .map_err(WalkerError::Rocks)?;
-
-        // Finalize database
-        info!("Finalizing RocksDB...");
-        let stats_snapshot = WalkStatsSnapshot {
-            dirs: self.dirs_count.load(Ordering::Relaxed),
-            files: self.files_count.load(Ordering::Relaxed),
-            bytes: self.bytes_count.load(Ordering::Relaxed),
-            errors: self.errors_count.load(Ordering::Relaxed),
-        };
-        finalize_rocks_db(
-            &rocks_handle,
-            start.elapsed(),
-            !self.shutdown.load(Ordering::Relaxed),
-            &stats_snapshot,
-        )
-        .map_err(WalkerError::Rocks)?;
-
-        // Also record big-dir-hunt metadata
-        rocks_handle
-            .set_metadata("big_dir_hunt", "true")
-            .map_err(|e| WalkerError::Rocks(crate::error::RocksError::Rocks(e)))?;
-        rocks_handle
-            .set_metadata("big_dir_threshold", &self.config.big_dir_threshold.to_string())
-            .map_err(|e| WalkerError::Rocks(crate::error::RocksError::Rocks(e)))?;
-
-        let stats = WalkStats {
-            dirs: stats_snapshot.dirs,
-            files: stats_snapshot.files,
-            bytes: stats_snapshot.bytes,
-            errors: stats_snapshot.errors,
-            duration: start.elapsed(),
-            completed: !self.shutdown.load(Ordering::Relaxed),
-            big_dirs_found: self.big_dirs_count.load(Ordering::Relaxed),
-            big_dir_hunt_mode: true,
-        };
-
-        Ok(stats)
-    }
-
-    /// Run workers for big-dir-hunt mode
-    fn run_big_dir_workers(&self, big_dir_tx: Sender<BigDirEntry>) -> Result<()> {
-        // Work-stealing deque for directories
-        let injector: Arc<Injector<DirWork>> = Arc::new(Injector::new());
-
-        // Track active workers and pending work
-        let active_workers = Arc::new(AtomicUsize::new(0));
-        let pending_work = Arc::new(AtomicU64::new(1)); // Start with 1 for root
-
-        // Push root directory (no cached file handle - will do path lookup)
-        let start_path = self.config.nfs_url.walk_start_path();
-        injector.push(DirWork {
-            path: start_path.clone(),
-            depth: 0,
-            file_handle: None,
-        });
-
-        // Create worker local queues and stealers
-        let mut workers_local: Vec<DequeWorker<DirWork>> = Vec::new();
-        let mut stealers: Vec<Stealer<DirWork>> = Vec::new();
-
-        for _ in 0..self.config.worker_count {
-            let w = DequeWorker::new_fifo();
-            stealers.push(w.stealer());
-            workers_local.push(w);
-        }
-
-        let stealers = Arc::new(stealers);
-
-        // Resolve DNS to get all server IPs for round-robin load balancing
-        let server_ips = resolve_dns(&self.config.nfs_url.server);
-        if server_ips.len() > 1 {
-            info!(
-                "DNS resolved {} to {} IPs: {:?}",
-                self.config.nfs_url.server,
-                server_ips.len(),
-                server_ips
-            );
-        }
-
-        // Spawn workers
-        let mut handles: Vec<JoinHandle<()>> = Vec::new();
-
-        for (id, local) in workers_local.into_iter().enumerate() {
-            // Round-robin across server IPs
-            let ip = if !server_ips.is_empty() {
-                Some(server_ips[id % server_ips.len()].clone())
-            } else {
+        match crate::scanlog::start_logger(metrics, log_cfg, started_at) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!("Failed to start progress logfile: {}", e);
                 None
-            };
-
-            // Create NfsUrl for this worker, potentially with resolved IP
-            let mut nfs_url = self.config.nfs_url.clone();
-            if let Some(resolved_ip) = ip {
-                nfs_url.server = resolved_ip;
             }
-            info!("Worker {} will connect to {}:{}", id, nfs_url.server, nfs_url.export);
-
-            let injector = Arc::clone(&injector);
-            let stealers = Arc::clone(&stealers);
-            let big_dir_tx = big_dir_tx.clone();
-            let shutdown = Arc::clone(&self.shutdown);
-            let dirs_count = Arc::clone(&self.dirs_count);
-            let files_count = Arc::clone(&self.files_count);
-            let bytes_count = Arc::clone(&self.bytes_count);
-            let errors_count = Arc::clone(&self.errors_count);
-            let big_dirs_count = Arc::clone(&self.big_dirs_count);
-            let active_workers = Arc::clone(&active_workers);
-            let pending_work = Arc::clone(&pending_work);
-            let max_depth = self.config.max_depth;
-            let threshold = self.config.big_dir_threshold;
-            let worker_count = self.config.worker_count;
-            let timeout_secs = self.config.timeout_secs;
-
-            let handle = thread::Builder::new()
-                .name(format!("big-dir-{}", id))
-                .spawn(move || {
-                    big_dir_worker_loop(
-                        id,
-                        nfs_url,
-                        local,
-                        injector,
-                        stealers,
-                        big_dir_tx,
-                        shutdown,
-                        dirs_count,
-                        files_count,
-                        bytes_count,
-                        errors_count,
-                        big_dirs_count,
-                        active_workers,
-                        pending_work,
-                        max_depth,
-                        threshold,
-                        worker_count,
-                        timeout_secs,
-                    );
-                })
-                .expect("Failed to spawn big-dir worker thread");
-
-            handles.push(handle);
         }
-
-        // Drop our sender so writer knows when to stop
-        drop(big_dir_tx);
-
-        // Wait for workers
-        for handle in handles {
-            let _ = handle.join();
-        }
-
-        Ok(())
     }
 
-    /// Spawn big-dir writer thread
-    #[cfg(feature = "rocksdb")]
-    fn spawn_big_dir_writer(
-        &self,
-        path: std::path::PathBuf,
-        big_dir_rx: Receiver<BigDirEntry>,
-    ) -> Result<JoinHandle<std::result::Result<RocksHandle, crate::error::RocksError>>> {
-        // Remove existing directory if present
-        if path.exists() {
-            std::fs::remove_dir_all(&path).map_err(WalkerError::Io)?;
-        }
-
-        // Create RocksDB with metadata
-        let config = RocksWriterConfig::default();
-        let writer = RocksWriter::open(&path, config).map_err(WalkerError::Rocks)?;
-
-        // Set initial metadata
-        writer
-            .set_metadata(meta_keys::SOURCE_URL, &self.config.nfs_url.to_display_string())
-            .map_err(WalkerError::Rocks)?;
-        writer
-            .set_metadata(meta_keys::START_TIME, &chrono::Utc::now().to_rfc3339())
-            .map_err(WalkerError::Rocks)?;
-        writer
-            .set_metadata(meta_keys::STATUS, "running")
-            .map_err(WalkerError::Rocks)?;
-        writer
-            .set_metadata(meta_keys::WORKER_COUNT, &self.config.worker_count.to_string())
-            .map_err(WalkerError::Rocks)?;
-
-        let handle = writer.into_handle();
-
-        // Spawn writer thread
-        let handle = thread::Builder::new()
-            .name("big-dir-writer".to_string())
-            .spawn(move || big_dir_writer_loop(handle, big_dir_rx))
-            .expect("Failed to spawn big-dir writer thread");
-
-        Ok(handle)
-    }
-
-    /// Run worker threads (shared between SQLite and RocksDB modes).
+    /// Run worker threads.
     ///
     /// `entry_txs` carries one sender per writer shard. Length 1 selects
     /// the legacy single-writer fan-in; length N (with the RocksDB
@@ -943,54 +521,6 @@ impl SimpleWalker {
         result
     }
 
-    fn open_sqlite_database(&self) -> Result<Connection> {
-        let path = &self.config.output_path;
-
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|e| WalkerError::Io(e))?;
-        }
-
-        let conn = Connection::open(path)
-            .map_err(|e| WalkerError::Database(e.into()))?;
-
-        create_database(&conn).map_err(|e| WalkerError::Database(e))?;
-
-        set_walk_info(&conn, keys::SOURCE_URL, &self.config.nfs_url.to_display_string())
-            .map_err(|e| WalkerError::Database(e))?;
-        set_walk_info(&conn, keys::START_TIME, &chrono::Utc::now().to_rfc3339())
-            .map_err(|e| WalkerError::Database(e))?;
-        set_walk_info(&conn, keys::STATUS, "running")
-            .map_err(|e| WalkerError::Database(e))?;
-        set_walk_info(&conn, keys::WORKER_COUNT, &self.config.worker_count.to_string())
-            .map_err(|e| WalkerError::Database(e))?;
-
-        Ok(conn)
-    }
-
-    fn finalize_sqlite_database(&self, conn: &Connection, duration: Duration, completed: bool) -> Result<()> {
-        info!("Creating indexes...");
-        create_indexes(conn).map_err(|e| WalkerError::Database(e))?;
-
-        set_walk_info(conn, keys::END_TIME, &chrono::Utc::now().to_rfc3339())
-            .map_err(|e| WalkerError::Database(e))?;
-        set_walk_info(conn, keys::DURATION_SECS, &duration.as_secs().to_string())
-            .map_err(|e| WalkerError::Database(e))?;
-        set_walk_info(conn, keys::TOTAL_DIRS, &self.dirs_count.load(Ordering::Relaxed).to_string())
-            .map_err(|e| WalkerError::Database(e))?;
-        set_walk_info(conn, keys::TOTAL_FILES, &self.files_count.load(Ordering::Relaxed).to_string())
-            .map_err(|e| WalkerError::Database(e))?;
-        set_walk_info(conn, keys::TOTAL_BYTES, &self.bytes_count.load(Ordering::Relaxed).to_string())
-            .map_err(|e| WalkerError::Database(e))?;
-        set_walk_info(conn, keys::ERROR_COUNT, &self.errors_count.load(Ordering::Relaxed).to_string())
-            .map_err(|e| WalkerError::Database(e))?;
-        set_walk_info(conn, keys::STATUS, if completed { "completed" } else { "interrupted" })
-            .map_err(|e| WalkerError::Database(e))?;
-
-        optimize_for_reads(conn).map_err(|e| WalkerError::Database(e))?;
-
-        Ok(())
-    }
-
     fn create_connection_with_ip(&self, ip: Option<&str>) -> Result<NfsConnection> {
         let timeout = Duration::from_secs(self.config.timeout_secs as u64);
         let mut builder = NfsConnectionBuilder::new(self.config.nfs_url.clone())
@@ -1004,41 +534,6 @@ impl SimpleWalker {
         builder.connect().map_err(|e| WalkerError::Nfs(e))
     }
 
-    /// Create connection for big-dir-hunt with small readdir buffer
-    /// Small buffer = fewer entries per RPC = faster early termination
-    /// Note: Currently unused - big-dir-hunt now uses RawRpcContext instead
-    #[cfg(feature = "rocksdb")]
-    #[allow(dead_code)]
-    fn create_connection_for_big_dir_hunt(&self, ip: Option<&str>) -> Result<NfsConnection> {
-        let timeout = Duration::from_secs(self.config.timeout_secs as u64);
-
-        // Use small readdir buffer (4KB) to limit entries per RPC
-        // This allows us to stop early after hitting the threshold
-        // Without this, server might send thousands of entries before we can stop
-        let readdir_buffer = 4096; // 4KB - minimum practical size
-
-        let mut builder = NfsConnectionBuilder::new(self.config.nfs_url.clone())
-            .timeout(timeout)
-            .retries(self.config.retry_count)
-            .readdir_buffer_size(readdir_buffer);
-
-        if let Some(ip) = ip {
-            builder = builder.with_ip(ip.to_string());
-        }
-
-        builder.connect().map_err(|e| WalkerError::Nfs(e))
-    }
-
-    fn spawn_sqlite_writer(&self, conn: Connection, entry_rx: Receiver<Vec<DbEntry>>) -> JoinHandle<Connection> {
-        let batch_size = self.config.batch_size;
-        thread::Builder::new()
-            .name("sqlite-writer".to_string())
-            .spawn(move || {
-                sqlite_writer_loop(conn, entry_rx, batch_size)
-            })
-            .expect("Failed to spawn SQLite writer thread")
-    }
-
     /// Spawn N RocksDB writer threads, one per path-CF shard. Returns:
     ///   - the shared `Arc<RocksHandle>` (kept alive by every writer
     ///     thread for the duration of the scan; the caller also keeps a
@@ -1046,16 +541,12 @@ impl SimpleWalker {
     ///   - the join handles, in shard order — each yields the shard's
     ///     `SummaryAccumulator` on success,
     ///   - the per-shard `Sender<Vec<DbEntry>>` to thread into workers.
-    ///
-    /// Streaming Parquet is intentionally **not** wired into this path:
-    /// `--stream-parquet` requires `--writer-shards 1` (config validation
-    /// rejects the combination at startup).
-    #[cfg(feature = "rocksdb")]
     #[allow(clippy::type_complexity)]
     fn spawn_sharded_rocksdb_writers(
         &self,
         path: std::path::PathBuf,
         shards: usize,
+        metrics: Arc<crate::scanlog::ScanMetrics>,
     ) -> Result<(
         Arc<RocksHandle>,
         Vec<JoinHandle<std::result::Result<crate::rocksdb::summary::SummaryAccumulator, crate::error::RocksError>>>,
@@ -1110,10 +601,11 @@ impl SimpleWalker {
             let h = Arc::clone(&handle);
             let fl = Arc::clone(&flush_lock);
             let fc = Arc::clone(&flush_counter);
+            let m = Arc::clone(&metrics);
             let join = thread::Builder::new()
                 .name(format!("rocks-writer-{}", shard_idx))
                 .spawn(move || {
-                    rocksdb_writer_loop_shard(h, shard_idx, rx, None, batch_size, fl, fc)
+                    rocksdb_writer_loop_shard(h, shard_idx, rx, batch_size, fl, fc, m)
                 })
                 .expect("Failed to spawn RocksDB shard writer thread");
             joins.push(join);
@@ -1122,13 +614,12 @@ impl SimpleWalker {
         Ok((handle, joins, txs))
     }
 
-    #[cfg(feature = "rocksdb")]
+    
     fn spawn_rocksdb_writer(
         &self,
         path: std::path::PathBuf,
         entry_rx: Receiver<Vec<DbEntry>>,
-        parquet_tx: Option<Sender<Vec<DbEntry>>>,
-        scan_id_meta: Option<(String, i64)>,
+        metrics: Arc<crate::scanlog::ScanMetrics>,
     ) -> Result<RocksWriterSpawn> {
         // Create RocksDB with metadata
         let config = RocksWriterConfig::default();
@@ -1152,14 +643,6 @@ impl SimpleWalker {
         writer.set_metadata(meta_keys::WORKER_COUNT, &self.config.worker_count.to_string())
             .map_err(WalkerError::Rocks)?;
 
-        // When streaming is enabled, persist SCAN_ID so a later post-scan
-        // export-parquet can detect the streamed dir and reuse the id.
-        if let Some((scan_id, _ts_us)) = scan_id_meta {
-            writer
-                .set_metadata(meta_keys::SCAN_ID, &scan_id)
-                .map_err(WalkerError::Rocks)?;
-        }
-
         let handle = writer.into_handle();
         let batch_size = self.config.batch_size;
 
@@ -1167,7 +650,7 @@ impl SimpleWalker {
         let join = thread::Builder::new()
             .name("rocks-writer".to_string())
             .spawn(move || {
-                rocksdb_writer_loop(handle, entry_rx, parquet_tx, batch_size)
+                rocksdb_writer_loop(handle, entry_rx, batch_size, metrics)
             })
             .expect("Failed to spawn RocksDB writer thread");
 
@@ -1176,7 +659,7 @@ impl SimpleWalker {
 }
 
 /// Type alias for the rocksdb writer thread join handle.
-#[cfg(feature = "rocksdb")]
+
 type RocksWriterSpawn = JoinHandle<std::result::Result<RocksHandle, crate::error::RocksError>>;
 
 /// Worker thread - processes directories using READDIRPLUS.
@@ -1945,65 +1428,12 @@ fn ffi_rpc_status_success() -> i32 {
     crate::nfs::connection::ffi::RPC_STATUS_SUCCESS as i32
 }
 
-/// SQLite writer thread - handles all database writes with optimized bulk loading
-fn sqlite_writer_loop(mut conn: Connection, entry_rx: Receiver<Vec<DbEntry>>, batch_size: usize) -> Connection {
-    debug!("SQLite writer thread started with batch_size={}", batch_size);
-
-    // Optimize for bulk loading - these settings dramatically improve write performance
-    conn.execute_batch(
-        "PRAGMA synchronous = OFF;
-         PRAGMA journal_mode = OFF;
-         PRAGMA cache_size = -64000;
-         PRAGMA temp_store = MEMORY;"
-    ).expect("Failed to set bulk load pragmas");
-
-    let mut total_written = 0u64;
-    let mut pending: Vec<DbEntry> = Vec::with_capacity(batch_size * 2);
-
-    // Receive batches and write to DB
-    while let Ok(entries) = entry_rx.recv() {
-        pending.extend(entries);
-
-        // Write when we have enough
-        if pending.len() >= batch_size {
-            if let Err(e) = write_sqlite_batch(&mut conn, &pending) {
-                error!("SQLite write failed: {}", e);
-            } else {
-                total_written += pending.len() as u64;
-            }
-            pending.clear();
-        }
-    }
-
-    // Write remaining entries
-    if !pending.is_empty() {
-        if let Err(e) = write_sqlite_batch(&mut conn, &pending) {
-            error!("Final SQLite write failed: {}", e);
-        } else {
-            total_written += pending.len() as u64;
-        }
-    }
-
-    // Re-enable safety for final operations
-    conn.execute_batch("PRAGMA synchronous = NORMAL;").ok();
-
-    debug!("SQLite writer thread finished, wrote {} entries", total_written);
-    conn
-}
-
 /// RocksDB writer thread - handles all database writes (single-shard).
-///
-/// `parquet_tx` is `Some` only when `--stream-parquet` is enabled. Each
-/// successfully-written pending batch is forwarded via `try_send`; on a
-/// full channel the batch is dropped and `parquet_drops` increments.
-/// Drops surface in the writer-thread's final log line so they're
-/// visible at end-of-scan -- ingest never blocks on the parquet writer.
-#[cfg(feature = "rocksdb")]
 fn rocksdb_writer_loop(
     handle: RocksHandle,
     entry_rx: Receiver<Vec<DbEntry>>,
-    parquet_tx: Option<Sender<Vec<DbEntry>>>,
     batch_size: usize,
+    metrics: Arc<crate::scanlog::ScanMetrics>,
 ) -> std::result::Result<RocksHandle, crate::error::RocksError> {
     use crate::error::RocksError;
     use crate::rocksdb::summary::SummaryAccumulator;
@@ -2017,8 +1447,6 @@ fn rocksdb_writer_loop(
     let mut entries_since_flush = 0u64;
     let mut writes_since_summary_flush = 0u32;
     let mut summary = SummaryAccumulator::new();
-    let mut parquet_drops: u64 = 0;
-    let mut parquet_drop_rows: u64 = 0;
 
     const FLUSH_INTERVAL: u64 = 1_000_000;
     const SUMMARY_FLUSH_EVERY_N_WRITES: u32 = 100;
@@ -2030,20 +1458,14 @@ fn rocksdb_writer_loop(
         pending.extend(entries);
 
         if pending.len() >= batch_size {
+            let t = Instant::now();
             write_rocks_batch_shard(&handle, 0, &pending, &write_opts)?;
+            metrics.record_write_latency(0, t.elapsed());
             summary.update(&pending);
             total_written += pending.len() as u64;
             entries_since_flush += pending.len() as u64;
             writes_since_summary_flush += 1;
-
-            let written_batch = std::mem::replace(&mut pending, Vec::with_capacity(batch_size * 2));
-            if let Some(ref tx) = parquet_tx {
-                let row_count = written_batch.len();
-                if let Err(crossbeam_channel::TrySendError::Full(_)) = tx.try_send(written_batch) {
-                    parquet_drops += 1;
-                    parquet_drop_rows += row_count as u64;
-                }
-            }
+            pending.clear();
 
             if writes_since_summary_flush >= SUMMARY_FLUSH_EVERY_N_WRITES {
                 summary.touch_now();
@@ -2060,34 +1482,18 @@ fn rocksdb_writer_loop(
     }
 
     if !pending.is_empty() {
+        let t = Instant::now();
         write_rocks_batch_shard(&handle, 0, &pending, &write_opts)?;
+        metrics.record_write_latency(0, t.elapsed());
         summary.update(&pending);
         total_written += pending.len() as u64;
-
-        let final_batch = std::mem::take(&mut pending);
-        if let Some(ref tx) = parquet_tx {
-            let row_count = final_batch.len();
-            if let Err(crossbeam_channel::TrySendError::Full(_)) = tx.try_send(final_batch) {
-                parquet_drops += 1;
-                parquet_drop_rows += row_count as u64;
-            }
-        }
+        pending.clear();
     }
-
-    drop(parquet_tx);
 
     summary.touch_now();
     flush_summary_to_cf(&handle, &summary, &write_opts)?;
     handle.db.flush().map_err(RocksError::Rocks)?;
 
-    if parquet_drops > 0 {
-        warn!(
-            "Streaming Parquet dropped {} batches ({} rows) under backpressure -- \
-             ingest was not stalled, but the parquet directory is missing those rows. \
-             Re-running export-parquet against the finished RocksDB will produce a complete export.",
-            parquet_drops, parquet_drop_rows
-        );
-    }
     debug!(
         "RocksDB writer thread finished, wrote {} entries (summary: {} files, {} dirs)",
         total_written, summary.total.total_files, summary.total.total_dirs
@@ -2102,16 +1508,16 @@ fn rocksdb_writer_loop(
 /// safe). Periodic `db.flush()` is serialized via `flush_lock` so two
 /// shards don't issue overlapping flushes; the accumulator is updated
 /// per-shard and merged once at end-of-scan in the spawning thread.
-#[cfg(feature = "rocksdb")]
+
 #[allow(clippy::too_many_arguments)]
 fn rocksdb_writer_loop_shard(
     handle: Arc<RocksHandle>,
     shard_idx: usize,
     entry_rx: Receiver<Vec<DbEntry>>,
-    parquet_tx: Option<Sender<Vec<DbEntry>>>,
     batch_size: usize,
     flush_lock: Arc<std::sync::Mutex<()>>,
     flush_counter: Arc<AtomicU64>,
+    metrics: Arc<crate::scanlog::ScanMetrics>,
 ) -> std::result::Result<crate::rocksdb::summary::SummaryAccumulator, crate::error::RocksError> {
     use crate::error::RocksError;
     use crate::rocksdb::summary::SummaryAccumulator;
@@ -2125,8 +1531,6 @@ fn rocksdb_writer_loop_shard(
     let mut total_written = 0u64;
     let mut pending: Vec<DbEntry> = Vec::with_capacity(batch_size * 2);
     let mut summary = SummaryAccumulator::new();
-    let mut parquet_drops: u64 = 0;
-    let mut parquet_drop_rows: u64 = 0;
 
     // Across-shard flush threshold. Any single shard crossing this since
     // its last contribution triggers one global db.flush(); sharing the
@@ -2142,18 +1546,12 @@ fn rocksdb_writer_loop_shard(
 
         if pending.len() >= batch_size {
             let batch_len = pending.len() as u64;
+            let t = Instant::now();
             write_rocks_batch_shard(&handle, shard_idx, &pending, &write_opts)?;
+            metrics.record_write_latency(shard_idx, t.elapsed());
             summary.update(&pending);
             total_written += batch_len;
-
-            let written_batch = std::mem::replace(&mut pending, Vec::with_capacity(batch_size * 2));
-            if let Some(ref tx) = parquet_tx {
-                let row_count = written_batch.len();
-                if let Err(crossbeam_channel::TrySendError::Full(_)) = tx.try_send(written_batch) {
-                    parquet_drops += 1;
-                    parquet_drop_rows += row_count as u64;
-                }
-            }
+            pending.clear();
 
             // Bump the shared cross-shard counter; check the threshold
             // outside the mutex so the lock is held only when an actual
@@ -2178,28 +1576,14 @@ fn rocksdb_writer_loop_shard(
     }
 
     if !pending.is_empty() {
+        let t = Instant::now();
         write_rocks_batch_shard(&handle, shard_idx, &pending, &write_opts)?;
+        metrics.record_write_latency(shard_idx, t.elapsed());
         summary.update(&pending);
         total_written += pending.len() as u64;
-
-        let final_batch = std::mem::take(&mut pending);
-        if let Some(ref tx) = parquet_tx {
-            let row_count = final_batch.len();
-            if let Err(crossbeam_channel::TrySendError::Full(_)) = tx.try_send(final_batch) {
-                parquet_drops += 1;
-                parquet_drop_rows += row_count as u64;
-            }
-        }
+        pending.clear();
     }
 
-    drop(parquet_tx);
-
-    if parquet_drops > 0 {
-        warn!(
-            "Streaming Parquet dropped {} batches ({} rows) on shard {} under backpressure",
-            parquet_drops, parquet_drop_rows, shard_idx
-        );
-    }
     debug!(
         "RocksDB writer thread (shard {}) finished, wrote {} entries (shard summary: {} files, {} dirs)",
         shard_idx, total_written, summary.total.total_files, summary.total.total_dirs
@@ -2210,7 +1594,7 @@ fn rocksdb_writer_loop_shard(
 
 /// Serialize the in-memory accumulator into the five summary keys and
 /// flush them via a single WAL-disabled WriteBatch.
-#[cfg(feature = "rocksdb")]
+
 fn flush_summary_to_cf(
     handle: &RocksHandle,
     summary: &crate::rocksdb::summary::SummaryAccumulator,
@@ -2248,7 +1632,7 @@ fn flush_summary_to_cf(
 /// and the inode entry goes to the (shared) inode CF. Inode-CF
 /// concurrent writes from N shards are safe because RocksDB has
 /// `allow_concurrent_memtable_write = true` set globally.
-#[cfg(feature = "rocksdb")]
+
 fn write_rocks_batch_shard(
     handle: &RocksHandle,
     shard_idx: usize,
@@ -2279,331 +1663,6 @@ fn write_rocks_batch_shard(
     handle.db.write_opt(batch, write_opts).map_err(RocksError::Rocks)
 }
 
-/// Big directory worker thread - counts files per directory and reports large ones
-fn big_dir_worker_loop(
-    id: usize,
-    nfs_url: crate::config::NfsUrl,
-    local: DequeWorker<DirWork>,
-    injector: Arc<Injector<DirWork>>,
-    stealers: Arc<Vec<Stealer<DirWork>>>,
-    big_dir_tx: Sender<BigDirEntry>,
-    shutdown: Arc<AtomicBool>,
-    dirs_count: Arc<AtomicU64>,
-    _files_count: Arc<AtomicU64>,
-    _bytes_count: Arc<AtomicU64>,
-    errors_count: Arc<AtomicU64>,
-    big_dirs_count: Arc<AtomicU64>,
-    active_workers: Arc<AtomicUsize>,
-    pending_work: Arc<AtomicU64>,
-    max_depth: Option<usize>,
-    threshold: u64,
-    _worker_count: usize,
-    timeout_secs: u32,
-) {
-    use crate::nfs::types::EntryType;
-
-    debug!("Big-dir worker {} started (threshold={})", id, threshold);
-
-    // Create NfsConnection for this worker using the full NfsUrl config
-    let conn = match NfsConnectionBuilder::new(nfs_url)
-        .timeout(Duration::from_secs(timeout_secs as u64))
-        .retries(3)
-        .connect()
-    {
-        Ok(c) => {
-            debug!("Big-dir worker {} connected via NfsConnection", id);
-            c
-        }
-        Err(e) => {
-            error!("Big-dir worker {} failed to connect: {}", id, e);
-            return;
-        }
-    };
-
-    let mut idle_spins = 0;
-    const MAX_IDLE_SPINS: u32 = 1000;
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
-        // Try to get work: local queue first, then injector, then steal
-        let work = local.pop().or_else(|| {
-            // Try injector
-            loop {
-                match injector.steal() {
-                    crossbeam_deque::Steal::Success(w) => return Some(w),
-                    crossbeam_deque::Steal::Empty => break,
-                    crossbeam_deque::Steal::Retry => continue,
-                }
-            }
-            // Try stealing from other workers
-            for (i, stealer) in stealers.iter().enumerate() {
-                if i == id {
-                    continue;
-                }
-                loop {
-                    match stealer.steal() {
-                        crossbeam_deque::Steal::Success(w) => return Some(w),
-                        crossbeam_deque::Steal::Empty => break,
-                        crossbeam_deque::Steal::Retry => continue,
-                    }
-                }
-            }
-            None
-        });
-
-        let work = match work {
-            Some(w) => {
-                idle_spins = 0;
-                active_workers.fetch_add(1, Ordering::Relaxed);
-                w
-            }
-            None => {
-                // No work found - check if we should exit
-                idle_spins += 1;
-
-                if pending_work.load(Ordering::SeqCst) == 0
-                    && active_workers.load(Ordering::SeqCst) == 0
-                {
-                    // No pending work and no active workers - we're done
-                    break;
-                }
-
-                if idle_spins > MAX_IDLE_SPINS {
-                    // Yield to avoid busy spinning
-                    thread::sleep(Duration::from_micros(100));
-                    idle_spins = 0;
-                }
-                continue;
-            }
-        };
-
-        // Check max depth
-        if let Some(max) = max_depth {
-            if work.depth > max as u32 {
-                pending_work.fetch_sub(1, Ordering::SeqCst);
-                active_workers.fetch_sub(1, Ordering::Relaxed);
-                continue;
-            }
-        }
-
-        debug!("Big-dir worker {} READDIRPLUS: {}", id, work.path);
-
-        // Use readdir_plus_chunked to scan directory with early exit on threshold
-        let mut file_count: u64 = 0;
-        let mut threshold_hit = false;
-        let mut subdirs: Vec<String> = Vec::new();
-
-        let scan_result = conn.readdir_plus_chunked(&work.path, 1000, |entries| {
-            for entry in entries {
-                // Skip . and ..
-                if entry.name == "." || entry.name == ".." {
-                    continue;
-                }
-
-                if entry.entry_type == EntryType::Directory {
-                    subdirs.push(entry.name);
-                } else if !threshold_hit {
-                    file_count += 1;
-                    if file_count >= threshold {
-                        threshold_hit = true;
-                        // Return false to stop early - we found a big directory
-                        return false;
-                    }
-                }
-            }
-            // Continue reading
-            true
-        });
-
-        match scan_result {
-            Ok(_) => {
-                dirs_count.fetch_add(1, Ordering::Relaxed);
-
-                // Queue subdirectories for processing
-                for subdir_name in &subdirs {
-                    let full_path = if work.path == "/" {
-                        format!("/{}", subdir_name)
-                    } else {
-                        format!("{}/{}", work.path, subdir_name)
-                    };
-                    pending_work.fetch_add(1, Ordering::SeqCst);
-                    local.push(DirWork {
-                        path: full_path,
-                        depth: work.depth + 1,
-                        file_handle: None, // big-dir-hunt mode doesn't have cached handles
-                    });
-                }
-
-                // If this directory hit/exceeded threshold, record it
-                if threshold_hit || file_count >= threshold {
-                    big_dirs_count.fetch_add(1, Ordering::Relaxed);
-                    let big_dir = BigDirEntry {
-                        path: work.path.clone(),
-                        file_count,
-                    };
-                    if big_dir_tx.send(big_dir).is_err() {
-                        // Channel closed, shutdown
-                        break;
-                    }
-                    info!(
-                        "Found big directory: {} ({}+ files)",
-                        work.path, file_count
-                    );
-                }
-
-                debug!(
-                    "Big-dir worker {} complete: {} -> {} subdirs, {} files (threshold_hit={})",
-                    id, work.path, subdirs.len(), file_count, threshold_hit
-                );
-            }
-            Err(e) => {
-                errors_count.fetch_add(1, Ordering::Relaxed);
-                let err_str = format!("{:?}", e);
-                if err_str.contains("NotFound") || err_str.contains("not found")
-                    || err_str.contains("PermissionDenied") || err_str.contains("Permission denied") {
-                    debug!("Big-dir worker {} READDIRPLUS error: {} -> {:?}", id, work.path, e);
-                } else {
-                    warn!(
-                        "Big-dir worker {} READDIRPLUS failed: {} -> {:?}",
-                        id, work.path, e
-                    );
-                }
-            }
-        }
-
-        // Mark this work item as done
-        pending_work.fetch_sub(1, Ordering::SeqCst);
-        active_workers.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    debug!("Big-dir worker {} finished", id);
-}
-
-/// Big directory writer thread - writes big directories to RocksDB
-#[cfg(feature = "rocksdb")]
-fn big_dir_writer_loop(
-    handle: RocksHandle,
-    big_dir_rx: Receiver<BigDirEntry>,
-) -> std::result::Result<RocksHandle, crate::error::RocksError> {
-    use crate::error::RocksError;
-
-    debug!("Big-dir writer thread started");
-
-    let mut total_written = 0u64;
-
-    // Receive big directories and write to DB
-    while let Ok(big_dir) = big_dir_rx.recv() {
-        handle
-            .put_big_dir(&big_dir.path, big_dir.file_count)
-            .map_err(RocksError::Rocks)?;
-        total_written += 1;
-    }
-
-    // Flush memtables
-    handle.db.flush().map_err(RocksError::Rocks)?;
-
-    debug!(
-        "Big-dir writer thread finished, wrote {} big directories",
-        total_written
-    );
-    Ok(handle)
-}
-
-/// Write a batch of entries to SQLite using prepared statement
-fn write_sqlite_batch(conn: &mut Connection, entries: &[DbEntry]) -> Result<()> {
-    let tx = conn.transaction()
-        .map_err(|e| WalkerError::Database(e.into()))?;
-
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO entries (parent_id, name, path, entry_type, size, mtime, atime, ctime, mode, uid, gid, nlink, inode, depth, extension, blocks, checksum, file_type)
-             VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
-        ).map_err(|e| WalkerError::Database(e.into()))?;
-
-        for entry in entries {
-            stmt.execute(params![
-                entry.name,
-                entry.path,
-                entry.entry_type.as_db_int(),
-                entry.size as i64,
-                entry.mtime,
-                entry.atime,
-                entry.ctime,
-                entry.mode.map(|m| m as i64),
-                entry.uid.map(|u| u as i64),
-                entry.gid.map(|g| g as i64),
-                entry.nlink.map(|n| n as i64),
-                entry.inode as i64,
-                entry.depth as i64,
-                entry.extension,
-                entry.blocks as i64,
-                entry.checksum,
-                entry.file_type,
-            ]).map_err(|e| WalkerError::Database(e.into()))?;
-        }
-    }
-
-    tx.commit().map_err(|e| WalkerError::Database(e.into()))?;
-    Ok(())
-}
-
-/// Build the canonical streaming-Parquet directory for a RocksDB path.
-///
-/// Format: `<rocks_path>.parquet/scans/<scan_id>/`
-/// Example: `/data/scan.rocks` + `abc123` → `/data/scan.rocks.parquet/scans/abc123/`
-#[cfg(all(feature = "rocksdb", feature = "parquet"))]
-fn streaming_parquet_dir(rocks_path: &std::path::Path, scan_id: &str) -> std::path::PathBuf {
-    let mut sibling = rocks_path.as_os_str().to_owned();
-    sibling.push(".parquet");
-    std::path::PathBuf::from(sibling).join("scans").join(scan_id)
-}
-
-/// Bundle of items returned when the streaming Parquet writer is spawned.
-#[cfg(all(feature = "rocksdb", feature = "parquet"))]
-#[derive(Default)]
-struct StreamingParquetSpawn {
-    /// Sender threaded into the rocksdb writer loop. None = streaming off.
-    tx: Option<Sender<Vec<DbEntry>>>,
-    /// Join handle for the streaming writer thread.
-    join: Option<JoinHandle<Result<crate::parquet::StreamingParquetStats>>>,
-    /// scan_id generated at scan start (used to populate RocksDB metadata).
-    scan_id: Option<String>,
-}
-
-/// Spawn the streaming Parquet writer thread. Consumes batches from
-/// `parquet_rx`, drives the writer to rotation, and closes cleanly when
-/// the channel disconnects (which happens when the rocksdb writer
-/// thread drops its `Sender`).
-#[cfg(all(feature = "rocksdb", feature = "parquet"))]
-fn spawn_parquet_writer(
-    mut writer: crate::parquet::StreamingParquetWriter,
-    parquet_rx: Receiver<Vec<DbEntry>>,
-) -> JoinHandle<Result<crate::parquet::StreamingParquetStats>> {
-    thread::Builder::new()
-        .name("parquet-writer".to_string())
-        .spawn(move || -> Result<crate::parquet::StreamingParquetStats> {
-            debug!("Streaming Parquet writer thread started");
-            while let Ok(entries) = parquet_rx.recv() {
-                if let Err(e) = writer.write_batch(&entries) {
-                    warn!(
-                        "Streaming Parquet write_batch failed: {} (skipping {} rows)",
-                        e,
-                        entries.len()
-                    );
-                    // On a write failure we keep running; the rocksdb
-                    // writer is the source of truth and a later
-                    // export-parquet against the finished DB can
-                    // produce a clean export.
-                }
-            }
-            debug!("Streaming Parquet writer thread closing");
-            writer.close()
-        })
-        .expect("Failed to spawn streaming Parquet writer thread")
-}
 
 #[cfg(test)]
 mod tests {
@@ -2626,125 +1685,4 @@ mod tests {
         assert!((progress.files_per_second() - 110.0).abs() < 0.1);
     }
 
-    /// End-to-end test for the PR #2 streaming pipeline.
-    ///
-    /// Drives `rocksdb_writer_loop` directly (skipping the NFS workers)
-    /// with a synthetic batch stream, fans out to `spawn_parquet_writer`,
-    /// then verifies both stores end up with the same row count and that
-    /// the streamed Parquet files round-trip through the Arrow reader.
-    #[cfg(all(feature = "rocksdb", feature = "parquet"))]
-    #[test]
-    fn streaming_writer_pipeline_round_trips_through_parquet() {
-        use crate::nfs::types::EntryType;
-        use crate::parquet::{StreamingParquetConfig, StreamingParquetWriter};
-        use crate::rocksdb::RocksWriterConfig;
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-        use std::fs::File;
-        use tempfile::tempdir;
-
-        let dir = tempdir().unwrap();
-        let rocks_path = dir.path().join("scan.rocks");
-        let scan_dir = dir.path().join("scan.rocks.parquet/scans/test");
-
-        // Open a fresh RocksDB and pull out the handle.
-        let writer = RocksWriter::open(&rocks_path, RocksWriterConfig::default()).unwrap();
-        let rocks_handle = writer.into_handle();
-
-        // Open a streaming parquet writer.
-        let pq_cfg = StreamingParquetConfig {
-            scan_dir: scan_dir.clone(),
-            row_group_size: 100,
-            target_file_size: 1_000_000_000,
-            compression_level: 3,
-            scan_id: "test".to_string(),
-            scan_timestamp_us: 1_700_000_000_000_000,
-        };
-        let pq_writer = StreamingParquetWriter::open(pq_cfg).unwrap();
-
-        // Channels.
-        let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(100);
-        let (pq_tx, pq_rx) = bounded::<Vec<DbEntry>>(100);
-
-        // Spawn parquet writer thread.
-        let pq_join = spawn_parquet_writer(pq_writer, pq_rx);
-
-        // Drive the rocksdb writer in another thread so we can feed batches.
-        let rocks_join = thread::Builder::new()
-            .name("rocks-writer-test".to_string())
-            .spawn(move || rocksdb_writer_loop(rocks_handle, entry_rx, Some(pq_tx), 100))
-            .unwrap();
-
-        // Synthetic batches: 5 batches of 250 entries each = 1250 rows total,
-        // which exceeds batch_size=100 multiple times so the forward path
-        // is exercised.
-        for chunk in 0..5 {
-            let batch: Vec<DbEntry> = (0..250)
-                .map(|i| DbEntry {
-                    parent_path: Some("/".to_string()),
-                    name: format!("file_{}_{}.txt", chunk, i),
-                    path: format!("/file_{}_{}.txt", chunk, i),
-                    entry_type: EntryType::File,
-                    size: 100 + i as u64,
-                    mtime: None,
-                    atime: None,
-                    ctime: None,
-                    mode: Some(0o644),
-                    uid: Some(1000),
-                    gid: Some(1000),
-                    nlink: Some(1),
-                    inode: (chunk * 1000 + i) as u64,
-                    depth: 1,
-                    extension: Some("txt".to_string()),
-                    blocks: 1,
-                    checksum: None,
-                    file_type: None,
-                })
-                .collect();
-            entry_tx.send(batch).unwrap();
-        }
-        drop(entry_tx);
-
-        let _rocks_handle = rocks_join.join().unwrap().unwrap();
-        let pq_stats = pq_join.join().unwrap().unwrap();
-
-        // All 1250 rows landed in Parquet.
-        assert_eq!(pq_stats.rows_written, 1250);
-        assert!(pq_stats.parts_written >= 1);
-
-        // Re-read the parquet directory and count rows.
-        let mut total = 0usize;
-        for entry in std::fs::read_dir(&scan_dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path
-                .extension()
-                .map(|e| e == "parquet")
-                .unwrap_or(false)
-                && !path
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with('.')
-            {
-                let file = File::open(&path).unwrap();
-                let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-                    .unwrap()
-                    .build()
-                    .unwrap();
-                for batch in reader {
-                    total += batch.unwrap().num_rows();
-                }
-            }
-        }
-        assert_eq!(total, 1250);
-
-        // No leftover .tmp files.
-        for entry in std::fs::read_dir(&scan_dir).unwrap() {
-            let name = entry.unwrap().file_name().to_string_lossy().to_string();
-            assert!(
-                !name.ends_with(".tmp"),
-                "stray .tmp file: {}",
-                name
-            );
-        }
-    }
 }

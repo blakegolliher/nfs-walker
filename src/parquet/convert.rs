@@ -101,9 +101,8 @@ where
         WalkerError::Parquet(ParquetError::Other(format!("Failed to open RocksDB: {}", e)))
     })?;
 
-    // Reuse the scan_id persisted at scan start (when --stream-parquet
-    // ran), otherwise mint a fresh one. Sharing the id lets a streamed
-    // scan and a later export point at the same logical artifact.
+    // Reuse the scan_id persisted at scan start when present, otherwise
+    // mint a fresh one.
     let scan_id = rocks
         .get_metadata(meta_keys::SCAN_ID)
         .ok()
@@ -131,16 +130,12 @@ where
         .unwrap_or_default();
 
     // Create output directory. Refuse to overwrite an existing scan dir
-    // with the same id -- this guards against converting on top of a
-    // streamed Parquet directory (which would mix old and new parts
-    // sharing the scan_id) and against re-running convert without first
-    // cleaning up.
+    // with the same id, so a re-run can't mix old + new parts.
     let scan_dir = output_dir.join("scans").join(&scan_id);
     if scan_dir.exists() {
         return Err(WalkerError::Parquet(ParquetError::Other(format!(
             "Refusing to convert: {} already exists. Delete it (or pass a different output_dir) \
-             before re-running. If --stream-parquet was used during the scan the directory is \
-             already populated and another conversion would mix new parts under the same scan_id.",
+             before re-running.",
             scan_dir.display()
         ))));
     }
@@ -359,8 +354,7 @@ mod tests {
                 depth: 1,
                 extension: Some("txt".to_string()),
                 blocks: 8,
-                checksum: None,
-                file_type: None,
+                ..Default::default()
             },
             DbEntry {
                 parent_path: Some("/".to_string()),
@@ -369,18 +363,14 @@ mod tests {
                 entry_type: EntryType::Directory,
                 size: 4096,
                 mtime: Some(1700000000),
-                atime: None,
-                ctime: None,
                 mode: Some(0o755),
                 uid: Some(0),
                 gid: Some(0),
                 nlink: Some(2),
                 inode: 200,
                 depth: 1,
-                extension: None,
                 blocks: 8,
-                checksum: None,
-                file_type: None,
+                ..Default::default()
             },
             DbEntry {
                 parent_path: Some("/dir1".to_string()),
@@ -389,18 +379,15 @@ mod tests {
                 entry_type: EntryType::File,
                 size: 2048,
                 mtime: Some(1700001000),
-                atime: None,
                 ctime: Some(1700001000),
                 mode: Some(0o600),
                 uid: Some(1000),
                 gid: Some(100),
-                nlink: None,
                 inode: 300,
                 depth: 2,
                 extension: Some("log".to_string()),
                 blocks: 16,
-                checksum: None,
-                file_type: None,
+                ..Default::default()
             },
         ];
 

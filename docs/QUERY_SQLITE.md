@@ -1,12 +1,18 @@
 # Querying SQLite Scans
 
-After converting RocksDB to SQLite (or using `--sqlite` directly), you can run arbitrary SQL queries.
+`nfs-walker` always writes to RocksDB during a scan. To query the data with
+ad-hoc SQL, run `nfs-walker export-sql` to materialise a SQLite database, then
+use any SQLite client.
 
-## Converting from RocksDB
+## Exporting from RocksDB
 
 ```bash
-nfs-walker convert scan.rocks scan.db --progress
+nfs-walker export-sql scan.rocks scan.db --progress
 ```
+
+> For analytics on large scans, prefer `nfs-walker export-parquet` plus DuckDB
+> or DataFusion — much faster than SQLite at scale, and what the bundled
+> dashboard uses. SQLite stays useful for small/medium scans and one-off scripts.
 
 ## Basic Queries
 

@@ -122,7 +122,7 @@ where
     })?);
 
     // Reuse the persisted scan_id when present (consistent with the
-    // single-threaded converter and with --stream-parquet artifacts).
+    // single-threaded converter).
     let scan_id = rocks
         .get_metadata(meta_keys::SCAN_ID)
         .ok()
@@ -639,8 +639,6 @@ mod tests {
                 entry_type: EntryType::File,
                 size: i as u64,
                 mtime: Some(1_700_000_000 + i as i64),
-                atime: None,
-                ctime: None,
                 mode: Some(0o644),
                 uid: Some(1000),
                 gid: Some(1000),
@@ -648,9 +646,7 @@ mod tests {
                 inode: i as u64 + 1,
                 depth: 2,
                 extension: Some("bin".to_string()),
-                blocks: 0,
-                checksum: None,
-                file_type: None,
+                ..Default::default()
             })
             .collect();
 

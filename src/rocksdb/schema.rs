@@ -28,7 +28,6 @@ pub enum OpenMode {
 pub const CF_ENTRIES_BY_PATH: &str = "entries_by_path";
 pub const CF_ENTRIES_BY_INODE: &str = "entries_by_inode";
 pub const CF_METADATA: &str = "metadata";
-pub const CF_BIG_DIRS: &str = "big_directories";
 /// Pre-computed summary aggregates flushed periodically by the writer
 /// thread. Optional -- legacy databases without this CF still open.
 pub const CF_SUMMARY: &str = "summary";
@@ -58,7 +57,6 @@ const ALL_CF_NAMES: &[&str] = &[
     CF_ENTRIES_BY_PATH,
     CF_ENTRIES_BY_INODE,
     CF_METADATA,
-    CF_BIG_DIRS,
     CF_SUMMARY,
 ];
 
@@ -331,7 +329,6 @@ fn existing_known_cfs<P: AsRef<Path>>(path: P, opts: &Options) -> Vec<String> {
                 CF_ENTRIES_BY_PATH.to_string(),
                 CF_ENTRIES_BY_INODE.to_string(),
                 CF_METADATA.to_string(),
-                CF_BIG_DIRS.to_string(),
             ];
         }
     };
@@ -425,10 +422,6 @@ pub fn open_rocks_db_with_shards<P: AsRef<Path>>(
     ));
     cf_descriptors.push(ColumnFamilyDescriptor::new(
         CF_METADATA,
-        metadata_cf_options(),
-    ));
-    cf_descriptors.push(ColumnFamilyDescriptor::new(
-        CF_BIG_DIRS,
         metadata_cf_options(),
     ));
     cf_descriptors.push(ColumnFamilyDescriptor::new(
@@ -650,13 +643,6 @@ impl RocksHandle {
             .expect("metadata CF missing")
     }
 
-    /// Get big directories column family
-    pub fn cf_big_dirs(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_BIG_DIRS)
-            .expect("big_directories CF missing")
-    }
-
     /// Get the summary column family if the DB was opened with it.
     ///
     /// Returns `None` for legacy databases that predate the summary CF;
@@ -824,43 +810,6 @@ impl RocksHandle {
         Ok(count)
     }
 
-    /// Put a big directory entry (path -> file_count)
-    pub fn put_big_dir(&self, path: &str, file_count: u64) -> Result<(), rocksdb::Error> {
-        let key = encode_path_key(path);
-        let value = file_count.to_be_bytes();
-        self.db.put_cf(self.cf_big_dirs(), &key, &value)
-    }
-
-    /// Iterate all big directories
-    pub fn iter_big_dirs(&self) -> impl Iterator<Item = Result<(String, u64), crate::error::RocksError>> + '_ {
-        self.db
-            .iterator_cf(self.cf_big_dirs(), rocksdb::IteratorMode::Start)
-            .map(|result| {
-                let (key, value) = result.map_err(crate::error::RocksError::Rocks)?;
-                let path = decode_path_key(&key)
-                    .map_err(|e| crate::error::RocksError::Bincode(e.to_string()))?;
-                let file_count = if value.len() == 8 {
-                    let mut bytes = [0u8; 8];
-                    bytes.copy_from_slice(&value);
-                    u64::from_be_bytes(bytes)
-                } else {
-                    0
-                };
-                Ok((path, file_count))
-            })
-    }
-
-    /// Count big directories (by iterating - O(n))
-    pub fn count_big_dirs(&self) -> Result<u64, rocksdb::Error> {
-        let mut count = 0u64;
-        let iter = self
-            .db
-            .iterator_cf(self.cf_big_dirs(), rocksdb::IteratorMode::Start);
-        for _ in iter {
-            count += 1;
-        }
-        Ok(count)
-    }
 }
 
 /// Read the persisted shard count from the metadata CF. Absent, empty,
@@ -1156,6 +1105,12 @@ mod tests {
                 mtime: None,
                 atime: None,
                 ctime: None,
+                mtime_sec: None,
+                mtime_nsec: None,
+                atime_sec: None,
+                atime_nsec: None,
+                ctime_sec: None,
+                ctime_nsec: None,
                 mode: Some(0o644),
                 uid: Some(1000),
                 gid: Some(1000),
@@ -1211,6 +1166,12 @@ mod tests {
             mtime: Some(1234567890),
             atime: None,
             ctime: Some(1234567890),
+            mtime_sec: Some(1234567890),
+            mtime_nsec: Some(0),
+            atime_sec: None,
+            atime_nsec: None,
+            ctime_sec: Some(1234567890),
+            ctime_nsec: Some(0),
             mode: Some(0o644),
             uid: Some(1000),
             gid: Some(1000),

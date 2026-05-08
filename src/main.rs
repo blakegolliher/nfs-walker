@@ -5,10 +5,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use humansize::{format_size, BINARY};
-use nfs_walker::config::{CliArgs, WalkConfig};
-#[cfg(feature = "rocksdb")]
-use nfs_walker::config::{Command, OutputFormat};
-use nfs_walker::progress::{format_elapsed, print_big_dir_hunt_summary, print_header, print_summary, ProgressReporter};
+use nfs_walker::config::{CliArgs, Command, WalkConfig};
+use nfs_walker::progress::{format_elapsed, print_header, print_summary, ProgressReporter};
 use nfs_walker::walker::{SimpleWalker, WalkStats};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
@@ -81,7 +79,6 @@ fn run() -> Result<()> {
     raise_fd_limit();
 
     // Handle subcommands
-    #[cfg(feature = "rocksdb")]
     if let Some(ref cmd) = args.command {
         return handle_command(cmd);
     }
@@ -97,81 +94,44 @@ fn run() -> Result<()> {
             config.worker_count,
             &config.output_path.display().to_string(),
         );
-        #[cfg(feature = "rocksdb")]
-        {
-            if config.big_dir_hunt {
-                eprintln!("Mode: BIG-DIR-HUNT (threshold: {} files)", config.big_dir_threshold);
-            } else {
-                let mode = match config.output_format {
-                    OutputFormat::Sqlite => "READDIRPLUS (SQLite)",
-                    OutputFormat::RocksDb => "READDIRPLUS (RocksDB)",
-                };
-                eprintln!("Mode: {}", mode);
-            }
-        }
-        #[cfg(not(feature = "rocksdb"))]
-        eprintln!("Mode: READDIRPLUS");
+        eprintln!("Mode: READDIRPLUS (RocksDB)");
     }
 
     // Save output path before moving config
     let output_path = config.output_path.clone();
-    #[cfg(feature = "rocksdb")]
-    let output_format = config.output_format;
 
     // Run the walker
     let result = run_simple_walker(config)?;
 
     // Get database file size
-    #[cfg(feature = "rocksdb")]
-    let db_size = match output_format {
-        OutputFormat::Sqlite => std::fs::metadata(&output_path).map(|m| m.len()).ok(),
-        OutputFormat::RocksDb => get_rocks_db_size(&output_path),
-    };
-    #[cfg(not(feature = "rocksdb"))]
-    let db_size = std::fs::metadata(&output_path).map(|m| m.len()).ok();
+    let db_size = get_rocks_db_size(&output_path);
 
     // Print summary
-    if result.big_dir_hunt_mode {
-        print_big_dir_hunt_summary(
-            result.dirs,
-            result.big_dirs_found,
-            result.errors,
-            result.duration,
-            &output_path.display().to_string(),
-            db_size,
-        );
-    } else {
-        print_summary(
-            result.dirs,
-            result.files,
-            result.bytes,
-            result.errors,
-            result.duration,
-            &output_path.display().to_string(),
-            db_size,
-        );
-    }
+    print_summary(
+        result.dirs,
+        result.files,
+        result.bytes,
+        result.errors,
+        result.duration,
+        &output_path.display().to_string(),
+        db_size,
+    );
 
     Ok(())
 }
 
-/// Handle subcommands (convert, stats, export-parquet, etc.)
-#[cfg(feature = "rocksdb")]
+/// Handle subcommands (export-sql, export-parquet, stats, serve).
 fn handle_command(cmd: &Command) -> Result<()> {
     match cmd {
-        Command::Convert { input, output, progress } => {
-            run_convert(input, output, *progress)
+        Command::ExportSql { input, output, progress } => {
+            run_export_sql(input, output, *progress)
         }
         #[cfg(feature = "parquet")]
         Command::ExportParquet { input, output_dir, progress, file_size_mb, row_group_size, compression_level, parallelism } => {
             run_export_parquet(input, output_dir, *progress, *file_size_mb, *row_group_size, *compression_level, *parallelism)
         }
-        Command::Stats { db, by_extension, largest_files, largest_dirs, oldest_files, most_links, by_uid, by_gid, duplicates, by_file_type, hardlink_groups, min_size, top, live } => {
-            run_stats(db, *by_extension, *largest_files, *largest_dirs, *oldest_files, *most_links, *by_uid, *by_gid, *duplicates, *by_file_type, *hardlink_groups, *min_size, *top, *live)
-        }
-        #[cfg(feature = "csv-export")]
-        Command::ExportCsv { input, output_dir, progress, rows_per_file, gzip, gzip_level } => {
-            run_export_csv(input, output_dir, *progress, *rows_per_file, *gzip, *gzip_level)
+        Command::Stats { db, live } => {
+            run_stats(db, *live)
         }
         #[cfg(feature = "server")]
         Command::Serve { data_dir, port, bind } => {
@@ -180,38 +140,17 @@ fn handle_command(cmd: &Command) -> Result<()> {
     }
 }
 
-/// Run RocksDB stats queries
-#[cfg(feature = "rocksdb")]
-fn run_stats(
-    db: &std::path::Path,
-    by_extension: bool,
-    largest_files_flag: bool,
-    largest_dirs: bool,
-    oldest_files_flag: bool,
-    most_links: bool,
-    by_uid: bool,
-    by_gid: bool,
-    duplicates: bool,
-    by_file_type: bool,
-    hardlink_groups: bool,
-    min_size: u64,
-    top: usize,
-    live: bool,
-) -> Result<()> {
-    use nfs_walker::rocksdb::{
-        compute_stats, find_duplicates, find_hardlink_groups, largest_directories, largest_files,
-        most_hardlinks, oldest_files, stats_by_extension, stats_by_file_type, stats_by_gid,
-        stats_by_uid, OpenMode,
-    };
+/// Print the RocksDB scan overview (counts, total size, max depth).
+///
+/// Detail-level analytics (largest files, by-extension, duplicates, etc.) are
+/// no longer emitted from here — `nfs-walker export-parquet` followed by
+/// DuckDB / DataFusion queries gives a much faster path for that work.
+fn run_stats(db: &std::path::Path, live: bool) -> Result<()> {
+    use nfs_walker::rocksdb::{compute_stats, OpenMode};
 
     let mode = if live { OpenMode::Secondary } else { OpenMode::Readonly };
 
-    // If no specific query requested, show overall stats
-    let show_overview = !by_extension && !largest_files_flag && !largest_dirs
-        && !oldest_files_flag && !most_links && !by_uid && !by_gid
-        && !duplicates && !by_file_type && !hardlink_groups;
-
-    if show_overview {
+    {
         let stats = compute_stats(db, mode).context("Failed to compute stats")?;
         println!();
         println!("Database Statistics");
@@ -226,202 +165,11 @@ fn run_stats(
         println!();
     }
 
-    if by_extension {
-        let ext_stats = stats_by_extension(db, top, mode).context("Failed to get extension stats")?;
-        println!();
-        println!("Files by Extension (top {}):", top);
-        println!("─────────────────────────────────────────────────");
-        println!("{:<12} {:>12} {:>14} {:>14}", "Extension", "Count", "Size", "Allocated");
-        println!("{:<12} {:>12} {:>14} {:>14}", "---------", "-----", "----", "---------");
-        for stat in ext_stats {
-            let ext = if stat.extension.is_empty() { "(none)" } else { &stat.extension };
-            println!(
-                "{:<12} {:>12} {:>14} {:>14}",
-                ext,
-                format_number(stat.count),
-                format_size(stat.total_bytes, BINARY),
-                format_size(stat.total_blocks * 512, BINARY),
-            );
-        }
-        println!();
-    }
-
-    if largest_files_flag {
-        let files = largest_files(db, top, mode).context("Failed to get largest files")?;
-        println!();
-        println!("Largest Files (top {}):", top);
-        println!("─────────────────────────────────────────────────");
-        for (path, size) in files {
-            println!("{:>14}  {}", format_size(size, BINARY), path);
-        }
-        println!();
-    }
-
-    if largest_dirs {
-        let dirs = largest_directories(db, top, mode).context("Failed to get largest directories")?;
-        println!();
-        println!("Directories with Most Files (top {}):", top);
-        println!("─────────────────────────────────────────────────");
-        println!("{:>12}  Path", "Files");
-        println!("{:>12}  ----", "-----");
-        for (path, count) in dirs {
-            println!("{:>12}  {}", format_number(count), path);
-        }
-        println!();
-    }
-
-    if oldest_files_flag {
-        let files = oldest_files(db, top, mode).context("Failed to get oldest files")?;
-        println!();
-        println!("Oldest Files (top {}):", top);
-        println!("─────────────────────────────────────────────────");
-        for (path, mtime_us, size) in files {
-            // mtime is microseconds since epoch; chrono wants seconds + nanos.
-            let time_str = mtime_us
-                .map(|us| {
-                    let secs = us.div_euclid(1_000_000);
-                    let nsec = (us.rem_euclid(1_000_000) as u32) * 1_000;
-                    chrono::DateTime::from_timestamp(secs, nsec)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_else(|| us.to_string())
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-            println!("{:>16}  {:>10}  {}", time_str, format_size(size, BINARY), path);
-        }
-        println!();
-    }
-
-    if most_links {
-        let files = most_hardlinks(db, top, mode).context("Failed to get files with most links")?;
-        println!();
-        println!("Files with Most Hard Links (top {}):", top);
-        println!("─────────────────────────────────────────────────");
-        println!("{:>8}  {:>12}  Path", "Links", "Size");
-        println!("{:>8}  {:>12}  ----", "-----", "----");
-        for (path, nlink, size) in files {
-            println!("{:>8}  {:>12}  {}", nlink, format_size(size, BINARY), path);
-        }
-        println!();
-    }
-
-    if by_uid {
-        let stats = stats_by_uid(db, top, mode).context("Failed to get stats by UID")?;
-        println!();
-        println!("Usage by User ID (top {}):", top);
-        println!("─────────────────────────────────────────────────");
-        println!("{:>8}  {:>12}  {:>10}  {:>14}", "UID", "Files", "Dirs", "Total Size");
-        println!("{:>8}  {:>12}  {:>10}  {:>14}", "---", "-----", "----", "----------");
-        for stat in stats {
-            println!(
-                "{:>8}  {:>12}  {:>10}  {:>14}",
-                stat.id,
-                format_number(stat.file_count),
-                format_number(stat.dir_count),
-                format_size(stat.total_bytes, BINARY),
-            );
-        }
-        println!();
-    }
-
-    if by_gid {
-        let stats = stats_by_gid(db, top, mode).context("Failed to get stats by GID")?;
-        println!();
-        println!("Usage by Group ID (top {}):", top);
-        println!("─────────────────────────────────────────────────");
-        println!("{:>8}  {:>12}  {:>10}  {:>14}", "GID", "Files", "Dirs", "Total Size");
-        println!("{:>8}  {:>12}  {:>10}  {:>14}", "---", "-----", "----", "----------");
-        for stat in stats {
-            println!(
-                "{:>8}  {:>12}  {:>10}  {:>14}",
-                stat.id,
-                format_number(stat.file_count),
-                format_number(stat.dir_count),
-                format_size(stat.total_bytes, BINARY),
-            );
-        }
-        println!();
-    }
-
-    if duplicates {
-        let groups = find_duplicates(db, min_size, top, mode).context("Failed to find duplicates")?;
-        if groups.is_empty() {
-            println!();
-            println!("No duplicate files found (min size: {})", format_size(min_size, BINARY));
-            println!("Note: Requires --checksum flag during scan.");
-            println!();
-        } else {
-            println!();
-            println!("Duplicate Files (top {} groups, min size {}):", top, format_size(min_size, BINARY));
-            println!("─────────────────────────────────────────────────");
-            for group in groups {
-                println!();
-                println!("  Checksum: {}  Size: {}  Wasted: {}",
-                    &group.checksum[..16], // Show first 16 chars of checksum
-                    format_size(group.file_size, BINARY),
-                    format_size(group.wasted_bytes, BINARY));
-                for path in &group.paths {
-                    println!("    {}", path);
-                }
-            }
-            println!();
-        }
-    }
-
-    if by_file_type {
-        let stats = stats_by_file_type(db, top, mode).context("Failed to get file type stats")?;
-        if stats.is_empty() || (stats.len() == 1 && stats[0].mime_type == "unknown") {
-            println!();
-            println!("No file type data available.");
-            println!("Note: Requires --file-type flag during scan.");
-            println!();
-        } else {
-            println!();
-            println!("Files by Detected Type (top {}):", top);
-            println!("─────────────────────────────────────────────────");
-            println!("{:<40} {:>12} {:>14}", "MIME Type", "Count", "Size");
-            println!("{:<40} {:>12} {:>14}", "---------", "-----", "----");
-            for stat in stats {
-                println!(
-                    "{:<40} {:>12} {:>14}",
-                    stat.mime_type,
-                    format_number(stat.count),
-                    format_size(stat.total_bytes, BINARY),
-                );
-            }
-            println!();
-        }
-    }
-
-    if hardlink_groups {
-        let groups = find_hardlink_groups(db, 2, top, mode).context("Failed to find hardlink groups")?;
-        if groups.is_empty() {
-            println!();
-            println!("No hard link groups found.");
-            println!();
-        } else {
-            println!();
-            println!("Hard Link Groups (top {}):", top);
-            println!("─────────────────────────────────────────────────");
-            for group in groups {
-                println!();
-                println!("  Inode: {}  Links: {}  Size: {}",
-                    group.inode,
-                    group.nlink,
-                    format_size(group.size, BINARY));
-                for path in &group.paths {
-                    println!("    {}", path);
-                }
-            }
-            println!();
-        }
-    }
-
     Ok(())
 }
 
-/// Run RocksDB to SQLite conversion
-#[cfg(feature = "rocksdb")]
-fn run_convert(
+/// Export a RocksDB scan to a SQLite database for ad-hoc SQL.
+fn run_export_sql(
     input: &std::path::Path,
     output: &std::path::Path,
     show_progress: bool,
@@ -605,69 +353,6 @@ fn run_export_parquet_parallel(
         .context("Parallel Parquet export failed")
 }
 
-/// Run RocksDB to CSV export
-#[cfg(feature = "csv-export")]
-fn run_export_csv(
-    input: &std::path::Path,
-    output_dir: &std::path::Path,
-    show_progress: bool,
-    rows_per_file: usize,
-    gzip: bool,
-    gzip_level: u32,
-) -> Result<()> {
-    use nfs_walker::csv_export::{convert_rocks_to_csv, CsvExportConfig};
-
-    eprintln!("Exporting RocksDB to CSV...");
-    eprintln!("  Input:      {}", input.display());
-    eprintln!("  Output dir: {}", output_dir.display());
-    eprintln!("  Rows/file:  {}", format_number(rows_per_file as u64));
-    if gzip {
-        eprintln!("  Compression: gzip (level {})", gzip_level);
-    }
-
-    let config = CsvExportConfig {
-        rows_per_file,
-        gzip,
-        gzip_level,
-        progress: show_progress,
-    };
-
-    let progress_reporter = if show_progress {
-        let reporter = ProgressReporter::new();
-        reporter.set_status("Exporting...");
-        Some(reporter)
-    } else {
-        None
-    };
-
-    let callback: Option<Box<dyn Fn(u64, u64) + Send>> = if let Some(ref p) = progress_reporter {
-        let p_clone = p.clone();
-        Some(Box::new(move |exported, _total| {
-            let msg = format!("Exported {} entries", format_number(exported));
-            p_clone.set_status(&msg);
-        }))
-    } else {
-        None
-    };
-
-    let stats = convert_rocks_to_csv(input, output_dir, config, callback)
-        .context("CSV export failed")?;
-
-    if let Some(ref p) = progress_reporter {
-        p.finish("Export complete");
-    }
-
-    eprintln!("Export complete:");
-    eprintln!("  Entries:    {}", format_number(stats.entries_exported));
-    eprintln!("  Files:      {}", stats.files_written);
-    eprintln!(
-        "  Total size: {}",
-        format_size(stats.total_bytes_written, BINARY)
-    );
-
-    Ok(())
-}
-
 /// Start the analytics server
 #[cfg(feature = "server")]
 fn run_server(
@@ -683,7 +368,6 @@ fn run_server(
 }
 
 /// Get total size of a RocksDB directory
-#[cfg(feature = "rocksdb")]
 fn get_rocks_db_size(path: &std::path::Path) -> Option<u64> {
     if !path.is_dir() {
         return None;
