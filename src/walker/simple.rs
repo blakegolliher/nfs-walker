@@ -41,6 +41,44 @@ struct DirWork {
     /// Cached file handle from parent's READDIRPLUS response
     /// When set, we can skip LOOKUP RPCs and use this handle directly
     file_handle: Option<Vec<u8>>,
+    /// Set only on continuation items produced by `worker_loop_pipelined`
+    /// when a directory crosses `--big-dir-split-after` mid-enumeration.
+    /// Carries the NFS cookie/cookieverf from the last completed page so
+    /// the stealing worker resumes reading at exactly the next page,
+    /// avoiding both double-reads and gaps.
+    resume: Option<DirResume>,
+}
+
+/// Resume hint embedded in a continuation `DirWork`.
+#[derive(Debug, Clone, Copy)]
+struct DirResume {
+    cookie: u64,
+    cookieverf: [i8; 8],
+}
+
+impl DirWork {
+    /// Construct a fresh work item — full enumeration from page 0.
+    fn fresh(path: String, depth: u32, file_handle: Option<Vec<u8>>) -> Self {
+        Self { path, depth, file_handle, resume: None }
+    }
+
+    /// Construct a continuation produced by an in-flight pipelined slot
+    /// that bailed at a page boundary. The file handle is mandatory
+    /// (mid-dir resume requires it; a path-LOOKUP would not be safe).
+    fn continuation(
+        path: String,
+        depth: u32,
+        file_handle: Vec<u8>,
+        cookie: u64,
+        cookieverf: [i8; 8],
+    ) -> Self {
+        Self {
+            path,
+            depth,
+            file_handle: Some(file_handle),
+            resume: Some(DirResume { cookie, cookieverf }),
+        }
+    }
 }
 
 /// Per-worker fan-out helper. Each entry is routed to its owning
@@ -369,11 +407,7 @@ impl SimpleWalker {
 
         // Push root directory (no cached file handle - will do path lookup)
         let start_path = self.config.nfs_url.walk_start_path();
-        injector.push(DirWork {
-            path: start_path.clone(),
-            depth: 0,
-            file_handle: None,
-        });
+        injector.push(DirWork::fresh(start_path.clone(), 0, None));
 
         // Create worker local queues and stealers
         let mut workers_local: Vec<DequeWorker<DirWork>> = Vec::new();
@@ -426,6 +460,7 @@ impl SimpleWalker {
             let detect_file_type = self.config.detect_file_type;
             let max_checksum_size = self.config.max_checksum_size;
             let pipeline_depth = self.config.pipeline_depth;
+            let big_dir_split_after = self.config.big_dir_split_after;
 
             let handle = thread::Builder::new()
                 .name(format!("walker-{}", id))
@@ -449,6 +484,7 @@ impl SimpleWalker {
                             dirs_only,
                             batch_size,
                             pipeline_depth,
+                            big_dir_split_after,
                             metrics,
                         );
                     } else {
@@ -746,6 +782,23 @@ fn worker_loop(
             Some(w) => {
                 idle_spins = 0;
                 active_workers.fetch_add(1, Ordering::Relaxed);
+                // Continuations are produced only by
+                // worker_loop_pipelined; pipeline_depth is fixed per
+                // run so this branch should never see one. Refuse
+                // explicitly rather than silently re-reading from
+                // cookie 0 (which would double-count every page the
+                // producing worker already emitted).
+                if w.resume.is_some() {
+                    error!(
+                        "Worker {} (legacy) refusing continuation work for {} — \
+                         continuations require --pipeline-depth > 0",
+                        id, w.path
+                    );
+                    pending_work.fetch_sub(1, Ordering::SeqCst);
+                    active_workers.fetch_sub(1, Ordering::Relaxed);
+                    errors_count.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 // Legacy worker only has one in-flight at a time, so a
                 // fixed tag uniquely identifies its slot.
                 metrics.enter_dir(id, 0, w.path.clone());
@@ -872,11 +925,11 @@ fn worker_loop(
                     // Queue subdirectory for processing with cached file handle
                     subdir_count += 1;
                     pending_work.fetch_add(1, Ordering::SeqCst);
-                    local.push(DirWork {
-                        path: full_path.clone(),
-                        depth: work.depth + 1,
-                        file_handle: nfs_entry.file_handle.clone(),
-                    });
+                    local.push(DirWork::fresh(
+                        full_path.clone(),
+                        work.depth + 1,
+                        nfs_entry.file_handle.clone(),
+                    ));
                 } else {
                     chunk_file_count += 1;
                     chunk_byte_count += nfs_entry.size();
@@ -1060,6 +1113,20 @@ struct DirState {
     /// concurrent in-flight slots in the same worker don't clobber
     /// each other's tracking state.
     tag: u64,
+    /// Cumulative entries returned by READDIRPLUS pages for this slot
+    /// (across cookie-chain re-submits). Compared against
+    /// `--big-dir-split-after` to decide when to push a continuation.
+    entries_seen: u64,
+}
+
+/// Should the current dir bail at the next page boundary and push a
+/// continuation? Pure helper so the truth table is unit-testable.
+///
+/// `threshold == 0` disables splitting entirely. `eof` always wins —
+/// once the server reports EOF there's nothing left to hand off.
+#[inline]
+fn should_split_now(entries_seen: u64, threshold: u64, eof: bool) -> bool {
+    threshold > 0 && !eof && entries_seen >= threshold
 }
 
 /// Try to grab a work item from local / injector / stealers (mirrors
@@ -1114,6 +1181,7 @@ fn worker_loop_pipelined(
     dirs_only: bool,
     batch_size: usize,
     pipeline_depth: usize,
+    big_dir_split_after: u64,
     metrics: Arc<crate::scanlog::ScanMetrics>,
 ) {
     debug!("Worker {} (pipelined depth={}) started", id, pipeline_depth);
@@ -1175,24 +1243,43 @@ fn worker_loop_pipelined(
             let tag = next_tag;
             next_tag = next_tag.wrapping_add(1);
 
-            match nfs.submit_readdirplus_by_fh(&fh, 0, [0i8; 8], tag) {
+            // Resume cookie/cookieverf when this is a continuation
+            // produced by a prior split; (0, [0; 8]) for fresh items.
+            let (start_cookie, start_cookieverf) = work
+                .resume
+                .map_or((0u64, [0i8; 8]), |r| (r.cookie, r.cookieverf));
+
+            match nfs.submit_readdirplus_by_fh(&fh, start_cookie, start_cookieverf, tag) {
                 Ok(slot) => {
-                    debug!(
-                        "Worker {} pipelined submit: tag={:#x} {} (depth={})",
-                        id, tag, work.path, work.depth
-                    );
+                    if start_cookie == 0 {
+                        debug!(
+                            "Worker {} pipelined submit: tag={:#x} {} (depth={})",
+                            id, tag, work.path, work.depth
+                        );
+                    } else {
+                        debug!(
+                            "Worker {} pipelined submit (resume): tag={:#x} {} cookie={:#x}",
+                            id, tag, work.path, start_cookie
+                        );
+                    }
                     // Track this dir under the initial tag for the
                     // entire dir lifetime (across cookie-chain
                     // re-submits) so accumulated entries don't reset.
+                    // Continuations get a fresh tag — a giant flat dir
+                    // being read by N workers concurrently will appear
+                    // as N separate (worker, tag) entries in scanlog,
+                    // all pointing at the same path. That's the
+                    // diagnostic signal we want.
                     metrics.enter_dir(id, tag, work.path.clone());
                     slots.push(slot);
                     states.push(DirState {
                         work,
                         file_handle: fh,
-                        cookie: 0,
-                        cookieverf: [0i8; 8],
+                        cookie: start_cookie,
+                        cookieverf: start_cookieverf,
                         submitted_at: Instant::now(),
                         tag,
+                        entries_seen: 0,
                     });
                 }
                 Err(e) => {
@@ -1287,7 +1374,12 @@ fn worker_loop_pipelined(
                 let mut chunk_file_count = 0u64;
                 let mut chunk_byte_count = 0u64;
                 let mut channel_broken = false;
-                metrics.record_entries(id, state.tag, result.entries.len() as u64);
+                // Capture page entry count up front — `result.entries` is
+                // moved into the for loop below. We use the raw page count
+                // (including "." / "..") so threshold accounting is
+                // monotonic and matches what the server sent.
+                let entries_in_page = result.entries.len() as u64;
+                metrics.record_entries(id, state.tag, entries_in_page);
 
                 for nfs_entry in result.entries {
                     if nfs_entry.name == "." || nfs_entry.name == ".." {
@@ -1348,11 +1440,11 @@ fn worker_loop_pipelined(
                     if is_dir {
                         subdir_count += 1;
                         pending_work.fetch_add(1, Ordering::SeqCst);
-                        local.push(DirWork {
-                            path: full_path.clone(),
-                            depth: state.work.depth + 1,
-                            file_handle: nfs_entry.file_handle.clone(),
-                        });
+                        local.push(DirWork::fresh(
+                            full_path.clone(),
+                            state.work.depth + 1,
+                            nfs_entry.file_handle.clone(),
+                        ));
                     } else {
                         chunk_file_count += 1;
                         chunk_byte_count += nfs_entry.size();
@@ -1395,11 +1487,55 @@ fn worker_loop_pipelined(
                     break 'outer;
                 }
 
-                if result.eof {
+                state.entries_seen =
+                    state.entries_seen.saturating_add(entries_in_page);
+
+                if should_split_now(
+                    state.entries_seen,
+                    big_dir_split_after,
+                    result.eof,
+                ) {
+                    // SPLIT: hand the rest of this directory to the
+                    // deque so another worker (or this worker, later)
+                    // can resume from the saved cookie. dirs_count is
+                    // NOT incremented — the directory is not yet
+                    // exhausted; the worker that eventually hits EOF
+                    // for this dir is the one that bumps the counter.
+                    //
+                    // pending_work accounting is net-zero: +1 for the
+                    // continuation push, -1 for this slot's
+                    // abandonment. Done as two ops so the +/- model
+                    // stays grep-auditable alongside the EOF/error
+                    // sites that already pair with their pushes.
+                    //
+                    // BAD_COOKIE: if the directory is mutated between
+                    // now and the resume, the server returns an error
+                    // status; that lands on the existing error path
+                    // below (errors_count++, no retry).
+                    debug!(
+                        "Worker {} pipelined SPLIT: {} entries_seen={} cookie={:#x}",
+                        id, state.work.path, state.entries_seen, result.next_cookie
+                    );
+                    let cont = DirWork::continuation(
+                        state.work.path.clone(),
+                        state.work.depth,
+                        state.file_handle.clone(),
+                        result.next_cookie,
+                        result.next_cookieverf,
+                    );
+                    pending_work.fetch_add(1, Ordering::SeqCst);
+                    local.push(cont);
+                    pending_work.fetch_sub(1, Ordering::SeqCst);
+                    metrics.exit_dir(id, state.tag);
+                    // state + slot dropped here.
+                } else if result.eof {
                     debug!(
                         "Worker {} pipelined EOF: {} ({} subdirs in this page)",
                         id, state.work.path, subdir_count
                     );
+                    // dirs_count is bumped exactly once per directory —
+                    // here, by whichever worker hits EOF. Continuations
+                    // (split branch above) deliberately do NOT increment.
                     dirs_count.fetch_add(1, Ordering::Relaxed);
                     pending_work.fetch_sub(1, Ordering::SeqCst);
                     metrics.exit_dir(id, state.tag);
@@ -1736,6 +1872,217 @@ mod tests {
         progress.dirs = 100;
         progress.elapsed = Duration::from_secs(10);
         assert!((progress.files_per_second() - 110.0).abs() < 0.1);
+    }
+
+    // ------------------------------------------------------------------
+    // Big-dir continuation: split decision + entry conservation.
+    //
+    // These tests exercise the dispatch state machine without touching
+    // libnfs. The split decision is a pure function; the conservation
+    // test simulates a sequence of READDIRPLUS pages with the same
+    // cookie-handoff logic the real worker uses.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_should_split_now_truth_table() {
+        // (entries_seen, threshold, eof) -> expected
+        let cases = [
+            (0u64,         1_000_000u64, false, false),
+            (999_999,      1_000_000,    false, false),
+            (1_000_000,    1_000_000,    false, true),
+            (5_000_000,    1_000_000,    false, true),
+            (5_000_000,    1_000_000,    true,  false), // EOF wins
+            (5_000_000,    0,            false, false), // disabled
+            (0,            0,            false, false), // disabled, empty
+            (0,            0,            true,  false), // disabled + EOF
+            (1,            1,            false, true),  // exactly at threshold
+        ];
+        for (entries_seen, threshold, eof, expected) in cases {
+            let got = should_split_now(entries_seen, threshold, eof);
+            assert_eq!(
+                got, expected,
+                "should_split_now({entries_seen}, {threshold}, {eof}) = {got}, expected {expected}"
+            );
+        }
+    }
+
+    /// Synthetic READDIRPLUS reply.
+    #[derive(Clone)]
+    struct MockPage {
+        entries: u64,
+        next_cookie: u64,
+        eof: bool,
+    }
+
+    /// One DirWork in the simulation. Carries the cookie at which the
+    /// next page should be read (0 for a fresh dir, otherwise the
+    /// continuation cookie produced by a prior split).
+    #[derive(Debug, Clone)]
+    struct SimWork {
+        start_cookie: u64,
+    }
+
+    /// Drive the split-dispatch state machine end-to-end against a
+    /// canned page sequence. Returns `(total_entries_seen,
+    /// continuation_count)`. Asserts internally that no page is
+    /// re-read or skipped at any split boundary.
+    fn run_split_simulation(pages: &[MockPage], threshold: u64) -> (u64, u64) {
+        // Page lookup keyed by start cookie. A worker resuming at
+        // cookie K reads page index `cookie_index[&K]`.
+        let mut cookie_index = std::collections::HashMap::new();
+        cookie_index.insert(0u64, 0usize);
+        for (i, page) in pages.iter().enumerate() {
+            // Only register the next page's start cookie when there is
+            // a next page (skip for terminal eof page).
+            if !page.eof && i + 1 < pages.len() {
+                cookie_index.insert(page.next_cookie, i + 1);
+            }
+        }
+
+        let mut deque: Vec<SimWork> = vec![SimWork { start_cookie: 0 }];
+        let mut total_entries: u64 = 0;
+        let mut continuations: u64 = 0;
+        // Visited page indices — flag any re-read or skip.
+        let mut visited: Vec<bool> = vec![false; pages.len()];
+
+        while let Some(work) = deque.pop() {
+            // entries_seen is per-DirWork (not cumulative across
+            // continuations), matching the real DirState semantics.
+            let mut entries_seen: u64 = 0;
+            let mut idx = *cookie_index
+                .get(&work.start_cookie)
+                .expect("simulation: unknown resume cookie");
+
+            loop {
+                let page = &pages[idx];
+                assert!(
+                    !visited[idx],
+                    "page index {idx} read twice — cookie handoff is wrong"
+                );
+                visited[idx] = true;
+
+                let entries_in_page = page.entries;
+                total_entries += entries_in_page;
+                entries_seen = entries_seen.saturating_add(entries_in_page);
+
+                if should_split_now(entries_seen, threshold, page.eof) {
+                    // Push continuation; abandon this slot.
+                    continuations += 1;
+                    deque.push(SimWork {
+                        start_cookie: page.next_cookie,
+                    });
+                    break;
+                } else if page.eof {
+                    break;
+                } else {
+                    // Cookie-chain re-submit: same DirWork, advance to
+                    // the next page index.
+                    idx += 1;
+                    assert!(
+                        idx < pages.len(),
+                        "non-EOF page with no successor — bad fixture"
+                    );
+                }
+            }
+        }
+
+        // Conservation: every page must have been read exactly once.
+        for (i, v) in visited.iter().enumerate() {
+            assert!(*v, "page {i} was never read — split dispatch dropped a page");
+        }
+
+        (total_entries, continuations)
+    }
+
+    #[test]
+    fn test_split_dispatch_conserves_entries_no_threshold() {
+        // Threshold disabled: original DirWork chains through every page,
+        // produces zero continuations, sees all entries exactly once.
+        let pages: Vec<MockPage> = (0..10)
+            .map(|i| MockPage {
+                entries: 1_000,
+                next_cookie: (i + 1) as u64 * 100,
+                eof: i == 9,
+            })
+            .collect();
+        let (total, conts) = run_split_simulation(&pages, 0);
+        assert_eq!(total, 10_000);
+        assert_eq!(conts, 0);
+    }
+
+    #[test]
+    fn test_split_dispatch_conserves_entries_with_threshold() {
+        // 10 pages × 1000 entries each, threshold 2500. Expect a split
+        // after page 3 (3000 ≥ 2500), after page 6 of the continuation
+        // (3000 ≥ 2500), and no split at the EOF page even if over
+        // threshold.
+        let pages: Vec<MockPage> = (0..10)
+            .map(|i| MockPage {
+                entries: 1_000,
+                next_cookie: (i + 1) as u64 * 100,
+                eof: i == 9,
+            })
+            .collect();
+        let (total, conts) = run_split_simulation(&pages, 2_500);
+        assert_eq!(total, 10_000, "must read every page exactly once");
+        // 10 pages of 1000 each, splitting at every 2500 cumulative
+        // boundary (per-DirWork): 3 + 3 + 3 + 1(EOF) = 4 DirWorks =>
+        // 3 continuations from the 4 segments (original + 3 conts).
+        assert_eq!(conts, 3, "expected 3 split events for this fixture");
+    }
+
+    #[test]
+    fn test_split_dispatch_eof_at_threshold_does_not_split() {
+        // Single page, eof, exactly at threshold — must not split.
+        let pages = vec![MockPage {
+            entries: 5_000,
+            next_cookie: 0,
+            eof: true,
+        }];
+        let (total, conts) = run_split_simulation(&pages, 5_000);
+        assert_eq!(total, 5_000);
+        assert_eq!(conts, 0, "EOF wins over threshold");
+    }
+
+    #[test]
+    fn test_split_dispatch_recursive_resplit() {
+        // Tiny threshold forces a split on every page boundary.
+        // 5 pages × 100 entries with threshold 50: every page crosses
+        // threshold, every non-EOF page produces a continuation.
+        let pages: Vec<MockPage> = (0..5)
+            .map(|i| MockPage {
+                entries: 100,
+                next_cookie: (i + 1) as u64 * 100,
+                eof: i == 4,
+            })
+            .collect();
+        let (total, conts) = run_split_simulation(&pages, 50);
+        assert_eq!(total, 500);
+        // 4 non-EOF pages, each splits → 4 continuations.
+        assert_eq!(conts, 4);
+    }
+
+    #[test]
+    fn test_dirwork_continuation_carries_resume() {
+        let dw = DirWork::continuation(
+            "/a/b".into(),
+            3,
+            vec![1, 2, 3, 4],
+            42,
+            [9; 8],
+        );
+        assert!(dw.resume.is_some());
+        let r = dw.resume.unwrap();
+        assert_eq!(r.cookie, 42);
+        assert_eq!(r.cookieverf, [9i8; 8]);
+        assert_eq!(dw.file_handle.as_deref(), Some(&[1, 2, 3, 4][..]));
+    }
+
+    #[test]
+    fn test_dirwork_fresh_has_no_resume() {
+        let dw = DirWork::fresh("/a".into(), 0, None);
+        assert!(dw.resume.is_none());
+        assert!(dw.file_handle.is_none());
     }
 
 }

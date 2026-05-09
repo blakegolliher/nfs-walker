@@ -178,6 +178,17 @@ pub struct CliArgs {
     #[arg(long, default_value = "0", value_name = "N")]
     pub pipeline_depth: usize,
 
+    /// Stop reading any one directory at the next page boundary once
+    /// this many entries have been returned, then push a continuation
+    /// work item (file handle + cookie) onto the deque so other workers
+    /// can resume the same directory in parallel. Targets giant flat
+    /// directories where one worker would otherwise serialize the
+    /// entire scan tail. 0 disables; default 1_000_000. Pipelined-mode
+    /// only (--pipeline-depth > 0); ignored by the legacy serial
+    /// worker.
+    #[arg(long, default_value = "1000000", value_name = "N")]
+    pub big_dir_split_after: u64,
+
     /// Number of RocksDB writer shards. 1 = legacy single-writer path
     /// (current behavior). Higher values split the entries-by-path CF
     /// into N independent CFs each owned by its own writer thread, so a
@@ -511,6 +522,10 @@ pub struct WalkConfig {
     /// Validated to 1..=32 in `from_args`.
     pub writer_shards: usize,
 
+    /// Threshold for splitting a giant directory into a continuation
+    /// work item (pipelined worker only). 0 disables.
+    pub big_dir_split_after: u64,
+
     /// Resolved progress-logfile config, or `None` if `--no-log` was passed.
     pub log: Option<LogSettings>,
 }
@@ -673,6 +688,7 @@ impl WalkConfig {
             max_checksum_size: args.max_checksum_size,
             pipeline_depth: args.pipeline_depth,
             writer_shards: args.writer_shards,
+            big_dir_split_after: args.big_dir_split_after,
             log,
         })
     }
@@ -755,6 +771,7 @@ mod tests {
             max_checksum_size: 1_073_741_824,
             pipeline_depth: 0,
             writer_shards: 1,
+            big_dir_split_after: 0,
             log: None,
         };
 

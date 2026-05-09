@@ -51,6 +51,7 @@ fn make_config(url: NfsUrl, output_path: PathBuf, pipeline_depth: usize) -> Walk
         max_checksum_size: 1_073_741_824,
         pipeline_depth,
         writer_shards: 1,
+        big_dir_split_after: 0,
         log: None,
     }
 }
