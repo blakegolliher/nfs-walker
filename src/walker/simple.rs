@@ -205,7 +205,7 @@ impl SimpleWalker {
                 metrics.clone(),
             )?;
 
-            self.run_workers(vec![entry_tx])?;
+            self.run_workers(vec![entry_tx], metrics.clone())?;
 
             // Release the cloned sender so the writer's recv() unblocks
             // when the workers' senders drop. (Sender clones held here for
@@ -228,7 +228,7 @@ impl SimpleWalker {
             }
 
             // Run workers (route per-entry into shard channels).
-            self.run_workers(txs)?;
+            self.run_workers(txs, metrics.clone())?;
 
             // Same fix as the single-shard path: release the cloned
             // senders so each per-shard writer's recv() unblocks.
@@ -338,7 +338,11 @@ impl SimpleWalker {
     /// the legacy single-writer fan-in; length N (with the RocksDB
     /// multi-shard writer) makes each worker route per-entry via
     /// `gxhash(path) % N` into the matching writer's channel.
-    fn run_workers(&self, entry_txs: Vec<Sender<Vec<DbEntry>>>) -> Result<()> {
+    fn run_workers(
+        &self,
+        entry_txs: Vec<Sender<Vec<DbEntry>>>,
+        metrics: Arc<crate::scanlog::ScanMetrics>,
+    ) -> Result<()> {
         // Pipelined mode currently does not support per-file content
         // analysis (checksum / file-type detection). Warn loudly if the
         // combination is requested; the pipelined worker silently skips
@@ -357,8 +361,10 @@ impl SimpleWalker {
         // Work-stealing deque for directories
         let injector: Arc<Injector<DirWork>> = Arc::new(Injector::new());
 
-        // Track active workers and pending work
-        let active_workers = Arc::new(AtomicUsize::new(0));
+        // Track active workers and pending work. Sharing the
+        // active_workers atomic with `metrics` lets the snapshot thread
+        // read the same value without double-bookkeeping.
+        let active_workers = metrics.active_workers();
         let pending_work = Arc::new(AtomicU64::new(1)); // Start with 1 for root
 
         // Push root directory (no cached file handle - will do path lookup)
@@ -411,6 +417,7 @@ impl SimpleWalker {
             let errors_count = Arc::clone(&self.errors_count);
             let active_workers = Arc::clone(&active_workers);
             let pending_work = Arc::clone(&pending_work);
+            let metrics = Arc::clone(&metrics);
             let max_depth = self.config.max_depth;
             let dirs_only = self.config.dirs_only;
             let worker_count = self.config.worker_count;
@@ -442,6 +449,7 @@ impl SimpleWalker {
                             dirs_only,
                             batch_size,
                             pipeline_depth,
+                            metrics,
                         );
                     } else {
                         worker_loop(
@@ -465,6 +473,7 @@ impl SimpleWalker {
                             compute_checksum,
                             detect_file_type,
                             max_checksum_size,
+                            metrics,
                         );
                     }
                 })
@@ -690,6 +699,7 @@ fn worker_loop(
     compute_checksum: bool,
     detect_file_type: bool,
     max_checksum_size: u64,
+    metrics: Arc<crate::scanlog::ScanMetrics>,
 ) {
     debug!("Worker {} started", id);
 
@@ -736,6 +746,9 @@ fn worker_loop(
             Some(w) => {
                 idle_spins = 0;
                 active_workers.fetch_add(1, Ordering::Relaxed);
+                // Legacy worker only has one in-flight at a time, so a
+                // fixed tag uniquely identifies its slot.
+                metrics.enter_dir(id, 0, w.path.clone());
                 w
             }
             None => {
@@ -763,6 +776,7 @@ fn worker_loop(
             if work.depth > max as u32 {
                 pending_work.fetch_sub(1, Ordering::SeqCst);
                 active_workers.fetch_sub(1, Ordering::Relaxed);
+                metrics.exit_dir(id, 0);
                 continue;
             }
         }
@@ -795,7 +809,9 @@ fn worker_loop(
 
         // Define the callback that processes directory entries
         // This is used by both readdir_plus_by_fh and readdir_plus_with_fh
+        let metrics_for_chunks = Arc::clone(&metrics);
         let mut process_entries = |chunk: Vec<crate::nfs::types::NfsDirEntry>| -> bool {
+            metrics_for_chunks.record_entries(id, 0, chunk.len() as u64);
             for nfs_entry in chunk {
                 // Skip . and ..
                 if nfs_entry.name == "." || nfs_entry.name == ".." {
@@ -894,12 +910,15 @@ fn worker_loop(
             !channel_broken // Continue reading if channel is OK
         };
 
-        // Use cached file handle if available, otherwise resolve path
+        // Use cached file handle if available, otherwise resolve path.
+        // Time the RPC for the per-scan progress logfile.
+        let rpc_start = Instant::now();
         let result = if let Some(ref fh) = work.file_handle {
             nfs.readdir_plus_by_fh(fh, batch_size, &mut process_entries)
         } else {
             nfs.readdir_plus_with_fh(&work.path, batch_size, &mut process_entries)
         };
+        metrics.record_nfs_latency(id, rpc_start.elapsed());
 
         match result {
             Ok(entry_count) => {
@@ -991,6 +1010,7 @@ fn worker_loop(
         // Mark this work item as done
         pending_work.fetch_sub(1, Ordering::SeqCst);
         active_workers.fetch_sub(1, Ordering::Relaxed);
+        metrics.exit_dir(id, 0);
     }
 
     // Drain residual staging entries (content-analysis path may have
@@ -1032,6 +1052,14 @@ struct DirState {
     file_handle: Vec<u8>,
     cookie: u64,
     cookieverf: [i8; 8],
+    /// Wall-clock at last submit. Reset on every cookie-chain re-submit;
+    /// used to compute per-RPC NFS latency on completion.
+    submitted_at: Instant,
+    /// Tag of the most recent submit. Updated on every cookie-chain
+    /// re-submit. Used to key the per-slot HotDir entry in scanlog so
+    /// concurrent in-flight slots in the same worker don't clobber
+    /// each other's tracking state.
+    tag: u64,
 }
 
 /// Try to grab a work item from local / injector / stealers (mirrors
@@ -1086,6 +1114,7 @@ fn worker_loop_pipelined(
     dirs_only: bool,
     batch_size: usize,
     pipeline_depth: usize,
+    metrics: Arc<crate::scanlog::ScanMetrics>,
 ) {
     debug!("Worker {} (pipelined depth={}) started", id, pipeline_depth);
 
@@ -1152,12 +1181,18 @@ fn worker_loop_pipelined(
                         "Worker {} pipelined submit: tag={:#x} {} (depth={})",
                         id, tag, work.path, work.depth
                     );
+                    // Track this dir under the initial tag for the
+                    // entire dir lifetime (across cookie-chain
+                    // re-submits) so accumulated entries don't reset.
+                    metrics.enter_dir(id, tag, work.path.clone());
                     slots.push(slot);
                     states.push(DirState {
                         work,
                         file_handle: fh,
                         cookie: 0,
                         cookieverf: [0i8; 8],
+                        submitted_at: Instant::now(),
+                        tag,
                     });
                 }
                 Err(e) => {
@@ -1214,6 +1249,9 @@ fn worker_loop_pipelined(
                 let n = slots.len() as u64;
                 errors_count.fetch_add(n, Ordering::Relaxed);
                 pending_work.fetch_sub(n, Ordering::SeqCst);
+                for s in &states {
+                    metrics.exit_dir(id, s.tag);
+                }
                 slots.clear();
                 states.clear();
                 if active_flag {
@@ -1240,12 +1278,16 @@ fn worker_loop_pipelined(
             // is released first.
             drop(slot);
 
+            // Per-RPC NFS latency: time from last submit to this completion.
+            metrics.record_nfs_latency(id, state.submitted_at.elapsed());
+
             // Successful response (matches legacy: status SUCCESS path).
             if result.status == ffi_rpc_status_success() {
                 let mut subdir_count = 0usize;
                 let mut chunk_file_count = 0u64;
                 let mut chunk_byte_count = 0u64;
                 let mut channel_broken = false;
+                metrics.record_entries(id, state.tag, result.entries.len() as u64);
 
                 for nfs_entry in result.entries {
                     if nfs_entry.name == "." || nfs_entry.name == ".." {
@@ -1340,6 +1382,10 @@ fn worker_loop_pipelined(
                     debug!("Worker {} entry channel broken, exiting", id);
                     let n_remaining = slots.len() as u64;
                     pending_work.fetch_sub(n_remaining + 1, Ordering::SeqCst);
+                    metrics.exit_dir(id, state.tag);
+                    for s in &states {
+                        metrics.exit_dir(id, s.tag);
+                    }
                     slots.clear();
                     states.clear();
                     if active_flag {
@@ -1356,22 +1402,27 @@ fn worker_loop_pipelined(
                     );
                     dirs_count.fetch_add(1, Ordering::Relaxed);
                     pending_work.fetch_sub(1, Ordering::SeqCst);
+                    metrics.exit_dir(id, state.tag);
                     // state + slot dropped here.
                 } else {
                     // More pages for the same dir — advance cookie and
-                    // re-submit on the same fh, same tag.
+                    // re-submit. The libnfs `tag` parameter is per-RPC
+                    // so it advances; `state.tag` (the scanlog tracking
+                    // key) stays fixed for the dir's lifetime so
+                    // `entries_seen` accumulates correctly.
                     state.cookie = result.next_cookie;
                     state.cookieverf = result.next_cookieverf;
-                    let tag = next_tag;
+                    let rpc_tag = next_tag;
                     next_tag = next_tag.wrapping_add(1);
                     match nfs.submit_readdirplus_by_fh(
                         &state.file_handle,
                         state.cookie,
                         state.cookieverf,
-                        tag,
+                        rpc_tag,
                     ) {
                         Ok(new_slot) => {
                             slots.push(new_slot);
+                            state.submitted_at = Instant::now();
                             states.push(state);
                         }
                         Err(e) => {
@@ -1381,6 +1432,7 @@ fn worker_loop_pipelined(
                                 id, state.work.path, e
                             );
                             pending_work.fetch_sub(1, Ordering::SeqCst);
+                            metrics.exit_dir(id, state.tag);
                         }
                     }
                 }
@@ -1404,6 +1456,7 @@ fn worker_loop_pipelined(
                     );
                 }
                 pending_work.fetch_sub(1, Ordering::SeqCst);
+                metrics.exit_dir(id, state.tag);
             }
         }
     }

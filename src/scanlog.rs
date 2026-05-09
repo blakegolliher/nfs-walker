@@ -20,6 +20,7 @@
 use crate::config::LogFormat;
 use crate::nfs::types::DbEntry;
 use crossbeam_channel::Sender;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -88,8 +89,12 @@ pub struct ScanMetrics {
     nfs_latency_us: Vec<Mutex<Vec<u64>>>,
     /// One reservoir per writer shard.
     write_latency_us: Vec<Mutex<Vec<u64>>>,
-    /// One slot per worker for the directory it's currently processing.
-    worker_slots: Vec<Mutex<Option<HotDir>>>,
+    /// Per-worker map of `tag -> HotDir`. Workers hold up to
+    /// `--pipeline-depth` in-flight slots concurrently; tracking per-tag
+    /// (not per-worker) so the most-loaded slot surfaces in the snapshot
+    /// even when a worker is juggling 16 directories at once. Mutex is
+    /// per-worker so the hot path stays uncontested.
+    worker_slots: Vec<Mutex<HashMap<u64, HotDir>>>,
     /// Cloned senders used by writers — the snapshot thread reads `.len()`
     /// to estimate write-channel pressure.
     pub write_senders: Mutex<Vec<Sender<Vec<DbEntry>>>>,
@@ -113,7 +118,9 @@ impl ScanMetrics {
         let write_latency_us = (0..shard_count.max(1))
             .map(|_| Mutex::new(Vec::with_capacity(64)))
             .collect();
-        let worker_slots = (0..worker_count).map(|_| Mutex::new(None)).collect();
+        let worker_slots = (0..worker_count)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
         Arc::new(Self {
             counters,
             nfs_latency_us,
@@ -130,6 +137,12 @@ impl ScanMetrics {
         if let Ok(mut guard) = self.output_path.lock() {
             *guard = Some(path);
         }
+    }
+
+    /// Borrow the active-worker atomic so the walker can share it with
+    /// every worker thread (the snapshot thread reads the same atomic).
+    pub fn active_workers(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.counters.active_workers)
     }
 
     pub fn register_write_sender(&self, sender: Sender<Vec<DbEntry>>) {
@@ -172,32 +185,40 @@ impl ScanMetrics {
         }
     }
 
-    pub fn enter_dir(&self, worker_id: usize, path: String) {
+    /// Begin tracking a directory submission. `tag` is the per-worker
+    /// slot identifier (the same `tag` value passed to
+    /// `submit_readdirplus_by_fh`). The legacy worker, which only ever
+    /// holds one in-flight directory, can pass `0` since it never has
+    /// concurrent slots to disambiguate.
+    pub fn enter_dir(&self, worker_id: usize, tag: u64, path: String) {
         if let Some(slot) = self.worker_slots.get(worker_id) {
             if let Ok(mut g) = slot.lock() {
-                *g = Some(HotDir {
-                    path,
-                    started_at: Instant::now(),
-                    entries_seen: 0,
-                });
+                g.insert(
+                    tag,
+                    HotDir {
+                        path,
+                        started_at: Instant::now(),
+                        entries_seen: 0,
+                    },
+                );
             }
         }
     }
 
-    pub fn record_entries(&self, worker_id: usize, n: u64) {
+    pub fn record_entries(&self, worker_id: usize, tag: u64, n: u64) {
         if let Some(slot) = self.worker_slots.get(worker_id) {
             if let Ok(mut g) = slot.lock() {
-                if let Some(hd) = g.as_mut() {
+                if let Some(hd) = g.get_mut(&tag) {
                     hd.entries_seen += n;
                 }
             }
         }
     }
 
-    pub fn exit_dir(&self, worker_id: usize) {
+    pub fn exit_dir(&self, worker_id: usize, tag: u64) {
         if let Some(slot) = self.worker_slots.get(worker_id) {
             if let Ok(mut g) = slot.lock() {
-                *g = None;
+                g.remove(&tag);
             }
         }
     }
@@ -226,7 +247,7 @@ impl ScanMetrics {
         let mut hot_dirs: Vec<(usize, HotDir)> = Vec::new();
         for (i, slot) in self.worker_slots.iter().enumerate() {
             if let Ok(g) = slot.lock() {
-                if let Some(hd) = g.as_ref() {
+                for hd in g.values() {
                     hot_dirs.push((i, hd.clone()));
                 }
             }
@@ -582,17 +603,42 @@ mod tests {
     #[test]
     fn hot_dir_top_n_orders_by_entries_seen() {
         let m = ScanMetrics::new(3, 1, CounterRefs::default());
-        m.enter_dir(0, "/small".into());
-        m.record_entries(0, 100);
-        m.enter_dir(1, "/big".into());
-        m.record_entries(1, 1_000_000);
-        m.enter_dir(2, "/medium".into());
-        m.record_entries(2, 5_000);
+        m.enter_dir(0, 0, "/small".into());
+        m.record_entries(0, 0, 100);
+        m.enter_dir(1, 0, "/big".into());
+        m.record_entries(1, 0, 1_000_000);
+        m.enter_dir(2, 0, "/medium".into());
+        m.record_entries(2, 0, 5_000);
 
         let snap = m.collect_snapshot(2);
         assert_eq!(snap.hot_dirs.len(), 2);
         assert_eq!(snap.hot_dirs[0].1.path, "/big");
         assert_eq!(snap.hot_dirs[1].1.path, "/medium");
+    }
+
+    #[test]
+    fn pipelined_worker_with_concurrent_slots_tracked_per_tag() {
+        // One worker holding 3 in-flight slots concurrently. Each
+        // slot should be tracked independently; clearing one must not
+        // wipe out the others (this was the regression fixed by going
+        // from Vec<Mutex<Option<HotDir>>> to per-tag HashMap).
+        let m = ScanMetrics::new(1, 1, CounterRefs::default());
+        m.enter_dir(0, 100, "/dir-a".into());
+        m.enter_dir(0, 101, "/dir-b".into());
+        m.enter_dir(0, 102, "/dir-c".into());
+        m.record_entries(0, 100, 50_000);
+        m.record_entries(0, 101, 1_000);
+        m.record_entries(0, 102, 200);
+
+        // Clear the smallest -- the other two must still be visible.
+        m.exit_dir(0, 102);
+
+        let snap = m.collect_snapshot(5);
+        assert_eq!(snap.hot_dirs.len(), 2);
+        assert_eq!(snap.hot_dirs[0].1.path, "/dir-a");
+        assert_eq!(snap.hot_dirs[0].1.entries_seen, 50_000);
+        assert_eq!(snap.hot_dirs[1].1.path, "/dir-b");
+        assert_eq!(snap.hot_dirs[1].1.entries_seen, 1_000);
     }
 
     #[test]
@@ -604,8 +650,8 @@ mod tests {
         let m = ScanMetrics::new(2, 1, counters);
         m.record_nfs_latency(0, Duration::from_micros(1500));
         m.record_write_latency(0, Duration::from_micros(800));
-        m.enter_dir(0, "/data/large".into());
-        m.record_entries(0, 12345);
+        m.enter_dir(0, 0, "/data/large".into());
+        m.record_entries(0, 0, 12345);
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("scan.log");
