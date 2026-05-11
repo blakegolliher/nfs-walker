@@ -1,0 +1,66 @@
+{
+  "strictness": 1,
+  "commentTypes": ["logic", "syntax"],
+  "triggerOnUpdates": true,
+  "ignorePatterns": "target/**\nbuild/**\nCargo.lock\nvendor/**\nweb/node_modules/**\nweb/dist/**\n*.parquet\n*.rocks/**\n*.sst\n*.log\n*.docx\nbenchmark-*.log\nscratch.parquet\nnfs-walker-implementation-plan.docx\npatches/**\ntests/fixtures/**\n",
+  "instructions": "nfs-walker is a Rust libnfs-based filesystem scanner targeting ~180K files/sec sustained throughput. Reviews should prioritize: (1) libnfs FFI correctness — handle lifecycles, thread-safety of nfs_context, CString marshaling for non-UTF-8 paths, negative-errno semantics; (2) preserving hot-path throughput — LRU handle caching, READDIRPLUS batching, minimal per-entry allocation, batched SQLite transactions; (3) SQLite schema discipline — additive migrations only, WAL mode intentional, no per-row commits; (4) walk-loop error classification (terminal vs retriable vs per-entry) rather than catch-all early returns. Do NOT flag: `unsafe` blocks with clear SAFETY comments, `.unwrap()` inside `#[cfg(test)]`, or clippy lints that contradict intentional performance choices (e.g., `needless_collect` where the Vec is kept for cache locality). See docs/greptile-rules.md for longer-form guidance.",
+  "customContext": {
+    "rules": [
+      {
+        "scope": ["src/nfs/**/*.rs"],
+        "rule": "Every `*mut nfs_context` from `nfs_init_context()` must have a matching `nfs_destroy_context()`. Every `*mut nfsfh` from `nfs_open*` must have a matching `nfs_close()`. Prefer Drop impls or scope guards over manual cleanup in long functions. Flag handle acquisitions whose release path can be missed on early return or panic."
+      },
+      {
+        "scope": ["src/nfs/**/*.rs", "src/walker/**/*.rs"],
+        "rule": "libnfs contexts are not thread-safe. The intended pattern is one `nfs_context` per worker thread. Flag any PR that introduces sharing of an `nfs_context` across threads, including via `Arc<Mutex<...>>` or similar — that pattern is wrong here, not a fix."
+      },
+      {
+        "scope": ["src/nfs/**/*.rs", "src/walker/**/*.rs"],
+        "rule": "Paths passed to libnfs must be valid CStrings. Real NFS exports contain non-UTF-8 bytes and interior NUL bytes. Flag any `.unwrap()` or `.expect()` on `CString::new()` for path data — these must return an error rather than panic."
+      },
+      {
+        "scope": ["src/nfs/**/*.rs"],
+        "rule": "libnfs returns negative errno on failure; positive returns on read-style calls are byte counts. Error checks must use `< 0`, not `!= 0`. Flag any `!= 0` comparison on a libnfs return that can be a byte count."
+      },
+      {
+        "scope": ["src/walker/**/*.rs", "src/nfs/**/*.rs", "src/parquet/**/*.rs", "src/rocksdb/**/*.rs", "src/db/**/*.rs"],
+        "rule": "The 180K files/sec hot path depends on: LRU file-handle caching, READDIRPLUS instead of READDIR+LOOKUP loops, batched SQLite inserts under one transaction, and minimal allocation per entry. Non-trivial changes to walker/nfs/db code must justify how throughput is preserved. Ask for `criterion` numbers if the change touches the per-entry path."
+      },
+      {
+        "scope": ["src/db/**/*.rs", "src/walker/**/*.rs"],
+        "rule": "SQLite bulk inserts must batch under a single `BEGIN`/`COMMIT`. Flag per-row commits in the walker write path — they tank throughput. Prefer `INSERT OR REPLACE` or `INSERT ... ON CONFLICT` over SELECT-then-INSERT round trips."
+      },
+      {
+        "scope": ["src/db/**/*.rs"],
+        "rule": "WAL mode is intentional to allow concurrent readers during long scans. Flag any PR that changes the SQLite journal mode away from WAL."
+      },
+      {
+        "scope": ["src/db/**/*.rs", "src/walker/**/*.rs"],
+        "rule": "Schema migrations must be additive. Never drop columns — in-flight or resumed scans must survive an upgrade. Flag `DROP COLUMN`, destructive `ALTER TABLE`, or any migration that removes existing fields."
+      },
+      {
+        "scope": ["src/**/*.rs"],
+        "rule": "Errors crossing the libnfs FFI boundary must be wrapped with `.context()` (or equivalent) describing what was attempted and against which path/handle. Bare `?` on FFI returns loses the operation context and makes failures unactionable in scan logs."
+      },
+      {
+        "scope": ["src/walker/**/*.rs"],
+        "rule": "Walk-loop errors must be classified into terminal (abort scan), retriable (back off and continue), or per-entry (log and skip). Flag any catch-all `Err(_) => return` or early-exit `?` in the walk loop that conflates these — losing a single bad inode should not kill a multi-million-file scan."
+      },
+      {
+        "scope": ["src/walker/**/*.rs", "src/nfs/**/*.rs", "src/parquet/**/*.rs", "src/rocksdb/**/*.rs"],
+        "rule": "New hot-path features should include a `criterion` benchmark in `benches/`. Flag PRs that add per-entry work to walker/nfs/parquet/rocksdb without an accompanying bench, or that regress throughput against the existing `walker_bench.rs` baseline."
+      },
+      {
+        "scope": ["tests/**/*.rs"],
+        "rule": "Integration tests that require a real libnfs server must be gated behind a feature flag — they must not run by default in `cargo test`. Flag new tests in `tests/` that hard-depend on a reachable NFS export without a `#[cfg(feature = \"...\")]` guard."
+      }
+    ],
+    "files": [
+      {
+        "scope": ["src/**/*.rs", "tests/**/*.rs", "benches/**/*.rs"],
+        "path": "docs/greptile-rules.md",
+        "description": "Long-form review heuristics for nfs-walker: libnfs FFI conventions, performance hot-path rationale, SQLite discipline, error-handling taxonomy, and what NOT to flag."
+      }
+    ]
+  }
+}
