@@ -221,7 +221,10 @@ preflight_disk() {
 # want all four numbers in the final summary, even if some are partial.
 run_step() {
     local name="$1"; shift
-    if ! preflight_disk 25; then
+    # Need ~9 GiB for the largest single-run output (rocks) plus a
+    # few GiB of headroom for the OS page cache and prior NFS writes
+    # in flight. 12 GiB is the floor that's worked safely.
+    if ! preflight_disk 12; then
         note "$name: skipped (insufficient local disk)"
         return 0
     fi
