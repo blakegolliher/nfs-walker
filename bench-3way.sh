@@ -110,10 +110,18 @@ run_walker() {
     local t0 t1
     t0=$(date +%s.%N)
     set +e
+    # SERVER_IPS=ip1,ip2,...  forces explicit VIP pool, bypassing DNS.
+    # Required when the auth DNS round-robin only exposes one A record
+    # per query (see commit ed660b1).
+    local ips_arg=()
+    if [ -n "${SERVER_IPS:-}" ]; then
+        ips_arg=(--server-ips "$SERVER_IPS")
+    fi
     "$WALKER" "$NFS_URL" \
         -o "$out_dir" \
         -w "$WORKERS" \
         --log "$BASE_DIR/$name.scanlog" --log-fmt json --log-interval-secs 5 \
+        "${ips_arg[@]}" \
         "$@" \
         >"$stdout" 2>&1
     local rc=$?
