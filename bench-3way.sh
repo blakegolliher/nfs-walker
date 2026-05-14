@@ -29,6 +29,11 @@
 #   PARQUET_SHARDS=32
 #   NO_CACHE_DROP=1                     # skip page-cache flush
 #   SKIP_ROCKS=1                        # skip step 1 (use prior baseline)
+#   ARCHIVE_DIR=/path                   # default: /mnt/vamoose-dest/nfs-walker-bench
+#                                       # set to "" to disable archival entirely
+#   KEEP_LOCAL=1                        # don't delete /tmp output after archival
+#                                       # (useful when the NFS archive is slow
+#                                       # or you want to inspect locally first)
 
 set -euo pipefail
 
@@ -42,6 +47,8 @@ ROCKS_SHARDS="${ROCKS_SHARDS:-8}"
 PARQUET_SHARDS="${PARQUET_SHARDS:-32}"
 NO_CACHE_DROP="${NO_CACHE_DROP:-0}"
 SKIP_ROCKS="${SKIP_ROCKS:-0}"
+ARCHIVE_DIR="${ARCHIVE_DIR-/mnt/vamoose-dest/nfs-walker-bench}"
+KEEP_LOCAL="${KEEP_LOCAL:-0}"
 
 if [ ! -x "$WALKER" ]; then
     echo "error: walker not at $WALKER — build first (cargo build --release)" >&2
@@ -109,12 +116,82 @@ count_parquet_rows() {
     echo "$rows"
 }
 
+# Capture per-run statistics from the output dir before we move/delete
+# it, so the final summary doesn't depend on the data still being local.
+record_stats() {
+    local name="$1"
+    local out_dir="$BASE_DIR/$name"
+    case "$name" in
+        rocks)
+            "$WALKER" stats "$out_dir" 2>/dev/null \
+                | awk -F': +' '/Total entries/ { gsub(",","",$2); print $2 }' \
+                | head -1 > "$BASE_DIR/$name.entries"
+            ;;
+        *)
+            count_parquet_rows "$out_dir" > "$BASE_DIR/$name.entries"
+            ;;
+    esac
+    # Recursive size pre-move so the summary reflects the real on-disk
+    # footprint even after archival.
+    du -sb "$out_dir" 2>/dev/null | awk '{print $1}' > "$BASE_DIR/$name.bytes"
+}
+
+# Move the run's bulky output directory off /tmp to the NFS archive so
+# the next run starts with a clean local fs. Sidecar files (scanlog,
+# stdout, wall, rc, entries, bytes) stay local for the summary; they're
+# tiny.
+#
+# Falls back to leaving the data in place when ARCHIVE_DIR is empty or
+# unreachable — the bench still completes, we just don't free disk.
+archive_output_dir() {
+    local name="$1"
+    local out_dir="$BASE_DIR/$name"
+    if [ ! -d "$out_dir" ]; then
+        return
+    fi
+    if [ -z "$ARCHIVE_DIR" ]; then
+        note "archive: ARCHIVE_DIR unset — $name stays at $out_dir"
+        return
+    fi
+    local dest_root="$ARCHIVE_DIR/$(basename "$BASE_DIR")"
+    if ! mkdir -p "$dest_root" 2>/dev/null; then
+        note "archive: cannot create $dest_root — $name stays at $out_dir"
+        return
+    fi
+    local t0 t1
+    t0=$(date +%s)
+    if [ "$KEEP_LOCAL" = "1" ]; then
+        note "archive: copying $name -> $dest_root/ (KEEP_LOCAL=1)"
+        cp -r "$out_dir" "$dest_root/" || {
+            note "archive: copy failed; leaving $name local"
+            return
+        }
+    else
+        note "archive: moving $name -> $dest_root/ (frees local disk)"
+        # mv across filesystems = cp+unlink; tolerate failure and leave
+        # data in place rather than blow up the bench.
+        if mv "$out_dir" "$dest_root/" 2>/dev/null; then
+            :
+        else
+            cp -r "$out_dir" "$dest_root/" || {
+                note "archive: copy fallback failed; leaving $name local"
+                return
+            }
+            rm -rf "$out_dir"
+        fi
+    fi
+    t1=$(date +%s)
+    note "archive: $name done in $((t1 - t0))s"
+}
+
 # Step 1: rocksdb baseline
 if [ "$SKIP_ROCKS" != "1" ]; then
     run_walker rocks \
         --output-format rocksdb \
         --writer-shards "$ROCKS_SHARDS" \
         --pipeline-depth 8
+    record_stats rocks
+    archive_output_dir rocks
 fi
 
 # Step 2: parquet-base (tail-flush fix only)
@@ -125,6 +202,8 @@ run_walker parquet-base \
     --big-dir-split-after 1000000 \
     --parquet-row-group-size 256000 \
     --parquet-compression zstd3
+record_stats parquet-base
+archive_output_dir parquet-base
 
 # Step 3: parquet-conc (+ concurrency tuning)
 run_walker parquet-conc \
@@ -134,6 +213,8 @@ run_walker parquet-conc \
     --big-dir-split-after 2000 \
     --parquet-row-group-size 256000 \
     --parquet-compression zstd3
+record_stats parquet-conc
+archive_output_dir parquet-conc
 
 # Step 4: parquet-snappy (+ snappy compression — current defaults)
 run_walker parquet-snappy \
@@ -143,25 +224,37 @@ run_walker parquet-snappy \
     --big-dir-split-after 2000 \
     --parquet-row-group-size 256000 \
     --parquet-compression snappy
+record_stats parquet-snappy
+archive_output_dir parquet-snappy
 
-# Summary
+# Summary — reads pre-archive sidecar files, so it works whether the
+# data is still local or already pushed to $ARCHIVE_DIR.
 hdr "Summary"
-printf '%-18s %10s %10s %12s\n' "run" "wall(s)" "rc" "entries"
+printf '%-18s %10s %5s %14s %14s\n' "run" "wall(s)" "rc" "entries" "bytes"
 for r in rocks parquet-base parquet-conc parquet-snappy; do
     [ -f "$BASE_DIR/$r.wall" ] || continue
     wall=$(cat "$BASE_DIR/$r.wall")
     rc=$(cat "$BASE_DIR/$r.rc")
-    case "$r" in
-        rocks)
-            entries=$("$WALKER" stats "$BASE_DIR/rocks" 2>/dev/null \
-                | awk -F': +' '/Total entries/ { gsub(",","",$2); print $2 }' \
-                | head -1)
-            ;;
-        *) entries=$(count_parquet_rows "$BASE_DIR/$r") ;;
-    esac
-    printf '%-18s %10s %10s %12s\n' "$r" "$wall" "$rc" "${entries:-?}"
+    entries=$(cat "$BASE_DIR/$r.entries" 2>/dev/null)
+    bytes=$(cat "$BASE_DIR/$r.bytes" 2>/dev/null)
+    printf '%-18s %10s %5s %14s %14s\n' "$r" "$wall" "$rc" "${entries:-?}" "${bytes:-?}"
 done
 
 echo
-note "outputs:   $BASE_DIR/{rocks,parquet-base,parquet-conc,parquet-snappy}"
+if [ -n "$ARCHIVE_DIR" ]; then
+    note "archive:   $ARCHIVE_DIR/$(basename "$BASE_DIR")/"
+fi
+note "sidecars:  $BASE_DIR/  (scanlogs, stdouts, .wall/.rc/.entries/.bytes)"
 note "log:       $LOG"
+
+# Move the sidecar dir to the archive too so everything from this bench
+# lives in one place. Done LAST so the bench.log captures the summary
+# before being moved.
+if [ -n "$ARCHIVE_DIR" ] && [ "$KEEP_LOCAL" != "1" ]; then
+    dest_root="$ARCHIVE_DIR/$(basename "$BASE_DIR")"
+    if mkdir -p "$dest_root" 2>/dev/null; then
+        note "archive: moving sidecars + bench.log -> $dest_root/"
+        find "$BASE_DIR" -maxdepth 1 -type f -exec mv {} "$dest_root/" \; 2>/dev/null || true
+        rmdir "$BASE_DIR" 2>/dev/null || true
+    fi
+fi
