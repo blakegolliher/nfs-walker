@@ -58,6 +58,28 @@ mkdir -p "$BASE_DIR"
 LOG="$BASE_DIR/bench.log"
 exec > >(tee -a "$LOG") 2>&1
 
+# Sanity-check: the archive dir must NOT be on the same filesystem
+# as the bench output dir, otherwise "archive: done in 0s" is just
+# a same-fs rename and we silently consume local disk instead of
+# evacuating it. Caused a full-disk crash on 2026-05-14 when an NFS
+# mount didn't auto-remount after reboot. Set FORCE_LOCAL_ARCHIVE=1
+# to override (useful for testing where ARCHIVE_DIR is intentionally
+# local).
+if [ -n "$ARCHIVE_DIR" ] && [ "${FORCE_LOCAL_ARCHIVE:-0}" != "1" ]; then
+    mkdir -p "$ARCHIVE_DIR" 2>/dev/null || true
+    base_fs=$(stat -f --format='%T' "$BASE_DIR" 2>/dev/null)
+    arch_fs=$(stat -f --format='%T' "$ARCHIVE_DIR" 2>/dev/null)
+    base_dev=$(stat --format='%d' "$BASE_DIR" 2>/dev/null)
+    arch_dev=$(stat --format='%d' "$ARCHIVE_DIR" 2>/dev/null)
+    if [ -n "$base_dev" ] && [ "$base_dev" = "$arch_dev" ]; then
+        echo "error: ARCHIVE_DIR=$ARCHIVE_DIR is on the SAME filesystem as BASE_DIR=$BASE_DIR" >&2
+        echo "       (both are '$base_fs', device $base_dev). Archives won't free local disk." >&2
+        echo "       Likely cause: an NFS mount didn't come back after reboot." >&2
+        echo "       Fix:  mount the export, then re-run. To override: FORCE_LOCAL_ARCHIVE=1" >&2
+        exit 1
+    fi
+fi
+
 G=$'\033[0;32m'; Y=$'\033[1;33m'; N=$'\033[0m'
 hdr() { printf '\n%s=== %s ===%s\n' "$G" "$1" "$N"; }
 note() { printf '%s%s%s\n' "$Y" "$1" "$N"; }
