@@ -211,32 +211,47 @@ if [ "$SKIP_ROCKS" != "1" ]; then
         --pipeline-depth 8
 fi
 
+# Common parquet flags for this host's memory budget.
+#
+# --parquet-channel-depth 256: 8 GiB worst-case channel buffer (vs 64
+#   which back-pressure-blocked walkers too aggressively and halved
+#   throughput, or 1024 which OOM'd a 23 GiB host).
+# --pipeline-depth 8 everywhere: libnfs holds ~2 MB per in-flight RPC,
+#   and pipeline-depth 16 × 477 active workers × 2 MB = ~15 GB just in
+#   in-flight buffers — too tight on a 23 GiB host. Production
+#   (1.4 TiB host) can safely raise this.
+PARQUET_CHANNEL_DEPTH="${PARQUET_CHANNEL_DEPTH:-256}"
+PARQUET_PIPELINE_DEPTH="${PARQUET_PIPELINE_DEPTH:-8}"
+
 # Step 2: parquet-base (tail-flush fix only)
 run_step parquet-base \
     --output-format parquet \
     --writer-shards "$PARQUET_SHARDS" \
-    --pipeline-depth 8 \
+    --pipeline-depth "$PARQUET_PIPELINE_DEPTH" \
     --big-dir-split-after 1000000 \
     --parquet-row-group-size 256000 \
-    --parquet-compression zstd3
+    --parquet-compression zstd3 \
+    --parquet-channel-depth "$PARQUET_CHANNEL_DEPTH"
 
-# Step 3: parquet-conc (+ concurrency tuning)
+# Step 3: parquet-conc (+ big-dir-split concurrency only)
 run_step parquet-conc \
     --output-format parquet \
     --writer-shards "$PARQUET_SHARDS" \
-    --pipeline-depth 16 \
+    --pipeline-depth "$PARQUET_PIPELINE_DEPTH" \
     --big-dir-split-after 2000 \
     --parquet-row-group-size 256000 \
-    --parquet-compression zstd3
+    --parquet-compression zstd3 \
+    --parquet-channel-depth "$PARQUET_CHANNEL_DEPTH"
 
-# Step 4: parquet-snappy (+ snappy compression — current defaults)
+# Step 4: parquet-snappy (+ snappy compression on top of conc)
 run_step parquet-snappy \
     --output-format parquet \
     --writer-shards "$PARQUET_SHARDS" \
-    --pipeline-depth 16 \
+    --pipeline-depth "$PARQUET_PIPELINE_DEPTH" \
     --big-dir-split-after 2000 \
     --parquet-row-group-size 256000 \
-    --parquet-compression snappy
+    --parquet-compression snappy \
+    --parquet-channel-depth "$PARQUET_CHANNEL_DEPTH"
 
 # Summary — reads pre-archive sidecar files, so it works whether the
 # data is still local or already pushed to $ARCHIVE_DIR.
