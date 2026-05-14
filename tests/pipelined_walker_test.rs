@@ -56,6 +56,7 @@ fn make_config(url: NfsUrl, output_path: PathBuf, pipeline_depth: usize) -> Walk
         parquet_compression: ParquetCompression::Snappy,
         parquet_row_group_size: 256_000,
         parquet_file_size_bytes: 512 * 1024 * 1024,
+        parquet_channel_depth: 64,
         log: None,
     }
 }

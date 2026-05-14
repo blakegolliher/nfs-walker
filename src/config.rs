@@ -242,6 +242,15 @@ pub struct CliArgs {
     #[arg(long, default_value = "512", value_name = "MB")]
     pub parquet_file_size_mb: usize,
 
+    /// Per-shard parquet channel depth, in batches (direct-write only).
+    /// Caps the worst-case in-flight memory at roughly
+    /// `channel_depth × writer_shards × batch_size × ~200B`. Default
+    /// 64 keeps the ceiling near 2 GiB; lower on tight-memory hosts,
+    /// raise on big production hosts (1.4 TiB transfer hosts can use
+    /// 1024 with no risk).
+    #[arg(long, default_value = "64", value_name = "N")]
+    pub parquet_channel_depth: usize,
+
     /// Override the per-scan progress logfile path. Default is `<output>.log`
     /// (sidecar next to the RocksDB directory). Disabled with --no-log.
     #[arg(long, value_name = "PATH")]
@@ -626,6 +635,9 @@ pub struct WalkConfig {
     /// File-rotation threshold (bytes) for direct-write parquet output.
     pub parquet_file_size_bytes: usize,
 
+    /// Per-shard channel depth for direct-write parquet output.
+    pub parquet_channel_depth: usize,
+
     /// Threshold for splitting a giant directory into a continuation
     /// work item (pipelined worker only). 0 disables.
     pub big_dir_split_after: u64,
@@ -804,6 +816,7 @@ impl WalkConfig {
             parquet_compression: args.parquet_compression,
             parquet_row_group_size: args.parquet_row_group_size.max(1),
             parquet_file_size_bytes: args.parquet_file_size_mb.saturating_mul(1024 * 1024),
+            parquet_channel_depth: args.parquet_channel_depth.max(1),
             log,
         })
     }
@@ -891,6 +904,7 @@ mod tests {
             parquet_compression: ParquetCompression::Snappy,
             parquet_row_group_size: 256_000,
             parquet_file_size_bytes: 512 * 1024 * 1024,
+            parquet_channel_depth: 64,
             log: None,
         };
 

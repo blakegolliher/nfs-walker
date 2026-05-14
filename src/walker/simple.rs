@@ -252,6 +252,7 @@ impl SimpleWalker {
             row_group_size: self.config.parquet_row_group_size,
             target_file_size: self.config.parquet_file_size_bytes,
             compression: self.config.parquet_compression.to_direct_writer(),
+            channel_depth: self.config.parquet_channel_depth,
         };
 
         let pool =

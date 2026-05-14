@@ -83,6 +83,21 @@ pub struct ShardSummary {
     pub part_files: Vec<String>,
 }
 
+/// Bounded depth for each per-shard `Vec<DbEntry>` channel.
+///
+/// Each channel slot holds one batch (`Vec<DbEntry>` of up to
+/// `batch_size`), so total peak buffer memory across all shards is
+/// roughly `channel_depth × shards × batch_size × bytes_per_entry`.
+///
+/// 64 keeps the worst-case at ~2 GiB on the default config (32 shards,
+/// batch_size 5000, ~200 B/entry); large enough to absorb short
+/// writer hiccups, small enough that a 23 GiB host doesn't OOM when
+/// the writer drains slower than walkers produce.
+///
+/// Larger hosts (production transfer hosts at 1.4 TiB+) can override
+/// via `--parquet-channel-depth`.
+pub const DEFAULT_CHANNEL_DEPTH: usize = 64;
+
 /// Configuration shared across the per-shard writer threads.
 #[derive(Clone)]
 pub struct DirectWriteConfig {
@@ -110,6 +125,9 @@ pub struct DirectWriteConfig {
     pub target_file_size: usize,
     /// Compression algorithm + level.
     pub compression: ParquetCompression,
+    /// Per-shard channel depth (in batches, not entries). See
+    /// [`DEFAULT_CHANNEL_DEPTH`] for the memory math.
+    pub channel_depth: usize,
 }
 
 impl Default for DirectWriteConfig {
@@ -128,6 +146,7 @@ impl Default for DirectWriteConfig {
             // walker and can afford the slower encoder for smaller
             // archived output.
             compression: ParquetCompression::Snappy,
+            channel_depth: DEFAULT_CHANNEL_DEPTH,
         }
     }
 }
@@ -191,10 +210,15 @@ pub fn spawn_direct_parquet_writers(
     let mut joins: Vec<JoinHandle<Result<ShardSummary, WalkerError>>> =
         Vec::with_capacity(config.shards);
 
+    let channel_depth = config.channel_depth.max(1);
     for shard_idx in 0..config.shards {
-        // Matches the RocksDB writer's channel sizing exactly so we
-        // measure backend-only differences when comparing throughput.
-        let (tx, rx) = crossbeam_channel::bounded::<Vec<DbEntry>>(1024);
+        // Channel depth caps the per-shard buffer; see
+        // `DEFAULT_CHANNEL_DEPTH` for the memory budget rationale.
+        // Walkers backpressure-block on `sender.push(entry)` when the
+        // channel is full, so we trade a little walker throughput
+        // (rarely; only when the writer is briefly stalled) for a
+        // bounded memory ceiling and no OOM kills.
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<DbEntry>>(channel_depth);
         senders.push(tx);
 
         let scan_dir = scan_dir.clone();
@@ -461,6 +485,7 @@ pub(crate) fn test_config(output_dir: PathBuf, shards: usize) -> DirectWriteConf
         row_group_size: 1_000_000,
         target_file_size: 256 * 1024 * 1024,
         compression: ParquetCompression::Zstd(3),
+        channel_depth: DEFAULT_CHANNEL_DEPTH,
     }
 }
 
@@ -597,6 +622,7 @@ mod tests {
             // tracks the row count more linearly. The point of the
             // test is rotation correctness, not compression ratio.
             compression: ParquetCompression::Zstd(1),
+            channel_depth: DEFAULT_CHANNEL_DEPTH,
         };
         let metrics = build_metrics(1);
         let pool = spawn_direct_parquet_writers(cfg.clone(), metrics).unwrap();
