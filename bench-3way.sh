@@ -152,6 +152,13 @@ record_stats() {
 #
 # Falls back to leaving the data in place when ARCHIVE_DIR is empty or
 # unreachable — the bench still completes, we just don't free disk.
+#
+# CRITICAL: ends with `sync` on the destination. Without sync, cross-fs
+# `mv` to NFS returns when data is in the OS page cache, not when it's
+# actually flushed to the NFS server. The subsequent run was writing
+# its own output to /tmp while dirty NFS pages from the prior run were
+# still pending — combined with the next run's bytes, this filled the
+# 77 GiB local disk mid-run and segfaulted the walker.
 archive_output_dir() {
     local name="$1"
     local out_dir="$BASE_DIR/$name"
@@ -177,8 +184,6 @@ archive_output_dir() {
         }
     else
         note "archive: moving $name -> $dest_root/ (frees local disk)"
-        # mv across filesystems = cp+unlink; tolerate failure and leave
-        # data in place rather than blow up the bench.
         if mv "$out_dir" "$dest_root/" 2>/dev/null; then
             :
         else
@@ -189,8 +194,26 @@ archive_output_dir() {
             rm -rf "$out_dir"
         fi
     fi
+    # Force NFS write-behind to actually flush before we report done
+    # and let the next run start eating /tmp + local page cache.
+    sync
     t1=$(date +%s)
-    note "archive: $name done in $((t1 - t0))s"
+    note "archive: $name done in $((t1 - t0))s (cp+sync)"
+}
+
+# Pre-flight: bail before starting a run if local disk is too tight to
+# hold its expected output. Each run can produce 10+ GiB on the 320 M
+# tree; we want at least 25 GiB free to keep buffer.
+preflight_disk() {
+    local need_gib="${1:-25}"
+    local avail_gib
+    avail_gib=$(df -BG --output=avail "$BASE_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')
+    if [ -n "$avail_gib" ] && [ "$avail_gib" -lt "$need_gib" ]; then
+        note "preflight: only ${avail_gib} GiB free on $(df --output=target "$BASE_DIR" | tail -1), need ${need_gib}; bailing"
+        return 1
+    fi
+    note "preflight: ${avail_gib:-?} GiB free, ok"
+    return 0
 }
 
 # Each run's stats/archive helpers are best-effort: an individual run
@@ -198,6 +221,10 @@ archive_output_dir() {
 # want all four numbers in the final summary, even if some are partial.
 run_step() {
     local name="$1"; shift
+    if ! preflight_disk 25; then
+        note "$name: skipped (insufficient local disk)"
+        return 0
+    fi
     run_walker "$name" "$@" || true
     record_stats "$name" || true
     archive_output_dir "$name" || true
