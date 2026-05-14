@@ -578,17 +578,64 @@ impl SimpleWalker {
                   self.config.nfs_url.server, server_ips.len(), server_ips);
         }
 
+        // IPs that have already failed at least one mount attempt — later
+        // workers skip these instead of paying the same timeout again.
+        // Per-run only (no global state); a freshly-launched scan retries
+        // every IP from scratch.
+        let mut dead_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         // Spawn workers
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
         for (id, local) in workers_local.into_iter().enumerate() {
-            // Round-robin across server IPs
-            let ip = if !server_ips.is_empty() {
-                Some(server_ips[id % server_ips.len()].clone())
+            // Pick an IP with failover. The round-robin position is the
+            // first choice; on failure, walk the rest of the pool in order.
+            // A single dead VIP is logged and skipped; only fatal if EVERY
+            // IP refuses to mount.
+            let nfs = if server_ips.is_empty() {
+                self.create_connection_with_ip(None)?
             } else {
-                None
+                let n = server_ips.len();
+                let primary_idx = id % n;
+                let mut connected: Option<NfsConnection> = None;
+                let mut tried: Vec<String> = Vec::new();
+                let mut last_err: Option<WalkerError> = None;
+                for offset in 0..n {
+                    let ip = &server_ips[(primary_idx + offset) % n];
+                    if dead_ips.contains(ip) {
+                        continue;
+                    }
+                    match self.create_connection_with_ip(Some(ip)) {
+                        Ok(c) => {
+                            if !tried.is_empty() {
+                                info!("Worker {} mounted via {} after failover from {:?}",
+                                      id, ip, tried);
+                            }
+                            connected = Some(c);
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Worker {} mount on VIP {} failed: {} (marking dead, falling back)",
+                                  id, ip, e);
+                            tried.push(ip.clone());
+                            dead_ips.insert(ip.clone());
+                            last_err = Some(e);
+                        }
+                    }
+                }
+                match connected {
+                    Some(c) => c,
+                    None => {
+                        error!(
+                            "Worker {} could not mount on any of {} VIPs ({} are dead). Aborting.",
+                            id, n, dead_ips.len()
+                        );
+                        return Err(last_err.expect(
+                            "must have at least one error if every VIP was tried and none worked",
+                        ));
+                    }
+                }
             };
-            let nfs = self.create_connection_with_ip(ip.as_deref())?;
             info!("Worker {} connected to {}", id, nfs.server());
 
             let injector = Arc::clone(&injector);
