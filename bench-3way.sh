@@ -211,43 +211,48 @@ if [ "$SKIP_ROCKS" != "1" ]; then
         --pipeline-depth 8
 fi
 
-# Common parquet flags for this host's memory budget.
-#
-# --parquet-channel-depth 256: 8 GiB worst-case channel buffer (vs 64
-#   which back-pressure-blocked walkers too aggressively and halved
-#   throughput, or 1024 which OOM'd a 23 GiB host).
-# --pipeline-depth 8 everywhere: libnfs holds ~2 MB per in-flight RPC,
-#   and pipeline-depth 16 × 477 active workers × 2 MB = ~15 GB just in
-#   in-flight buffers — too tight on a 23 GiB host. Production
-#   (1.4 TiB host) can safely raise this.
-PARQUET_CHANNEL_DEPTH="${PARQUET_CHANNEL_DEPTH:-256}"
-PARQUET_PIPELINE_DEPTH="${PARQUET_PIPELINE_DEPTH:-8}"
+# Channel buffer per shard. Default 1024 batches matches yesterday's
+# 580 K/s validated config; total worst-case buffer ~ 32 GiB on the
+# default 32-shard config which is fine on production transfer hosts
+# (1.4 TiB+) and on this dev host once it's bumped to 256 GiB. On a
+# tight-memory host (<=32 GiB total) export
+# PARQUET_CHANNEL_DEPTH=256 to cap at ~8 GiB.
+PARQUET_CHANNEL_DEPTH="${PARQUET_CHANNEL_DEPTH:-1024}"
 
-# Step 2: parquet-base (tail-flush fix only)
+# Step 2: parquet-base — direct-write Parquet, tail-flush fix only.
+# Pipeline-depth 8 matches the rocks baseline; no big-dir-split.
 run_step parquet-base \
     --output-format parquet \
     --writer-shards "$PARQUET_SHARDS" \
-    --pipeline-depth "$PARQUET_PIPELINE_DEPTH" \
+    --pipeline-depth 8 \
     --big-dir-split-after 1000000 \
     --parquet-row-group-size 256000 \
     --parquet-compression zstd3 \
     --parquet-channel-depth "$PARQUET_CHANNEL_DEPTH"
 
-# Step 3: parquet-conc (+ big-dir-split concurrency only)
+# Step 3: parquet-conc — adds the two concurrency levers we want to
+# A/B against parquet-base:
+#   - pipeline-depth 16: more in-flight RPCs per worker
+#   - big-dir-split-after 2000: split giant flat dirs across workers
+# These cost ~15 GiB libnfs response buffer + DirWork queue growth, so
+# this step needs a roomy host (~64 GiB+).
 run_step parquet-conc \
     --output-format parquet \
     --writer-shards "$PARQUET_SHARDS" \
-    --pipeline-depth "$PARQUET_PIPELINE_DEPTH" \
+    --pipeline-depth 16 \
     --big-dir-split-after 2000 \
     --parquet-row-group-size 256000 \
     --parquet-compression zstd3 \
     --parquet-channel-depth "$PARQUET_CHANNEL_DEPTH"
 
-# Step 4: parquet-snappy (+ snappy compression on top of conc)
+# Step 4: parquet-snappy — same as conc but with Snappy compression
+# (= the shipped default). On the dev-host bench Snappy completed
+# without OOM where ZSTD-3 (parquet-conc) OOM'd, so this is also a
+# memory-pressure escape hatch.
 run_step parquet-snappy \
     --output-format parquet \
     --writer-shards "$PARQUET_SHARDS" \
-    --pipeline-depth "$PARQUET_PIPELINE_DEPTH" \
+    --pipeline-depth 16 \
     --big-dir-split-after 2000 \
     --parquet-row-group-size 256000 \
     --parquet-compression snappy \
