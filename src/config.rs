@@ -162,6 +162,13 @@ pub struct CliArgs {
     #[arg(long, default_value = "3", value_name = "NUM")]
     pub retries: u32,
 
+    /// Explicit server VIPs (comma-separated), bypasses DNS round-robin
+    /// discovery. Use when the auth DNS returns a single A record per
+    /// query and the local resolver caches it, hiding the rest of the
+    /// pool. Example: --server-ips 172.200.202.1,172.200.202.2,172.200.202.4
+    #[arg(long, value_delimiter = ',', value_name = "IPS")]
+    pub server_ips: Vec<String>,
+
     /// Explicit NFS export path (overrides auto-detection from URL)
     /// Use when the export has multiple path components, e.g., /volumes/uuid
     #[arg(long, value_name = "PATH")]
@@ -638,6 +645,10 @@ pub struct WalkConfig {
     /// Per-shard channel depth for direct-write parquet output.
     pub parquet_channel_depth: usize,
 
+    /// Explicit server VIPs to use, bypassing DNS resolution. Empty
+    /// means use DNS as normal.
+    pub server_ips: Vec<String>,
+
     /// Threshold for splitting a giant directory into a continuation
     /// work item (pipelined worker only). 0 disables.
     pub big_dir_split_after: u64,
@@ -817,6 +828,7 @@ impl WalkConfig {
             parquet_row_group_size: args.parquet_row_group_size.max(1),
             parquet_file_size_bytes: args.parquet_file_size_mb.saturating_mul(1024 * 1024),
             parquet_channel_depth: args.parquet_channel_depth.max(1),
+            server_ips: args.server_ips,
             log,
         })
     }
@@ -905,6 +917,7 @@ mod tests {
             parquet_row_group_size: 256_000,
             parquet_file_size_bytes: 512 * 1024 * 1024,
             parquet_channel_depth: 64,
+            server_ips: vec![],
             log: None,
         };
 

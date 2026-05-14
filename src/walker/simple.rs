@@ -571,12 +571,28 @@ impl SimpleWalker {
 
         let stealers = Arc::new(stealers);
 
-        // Resolve DNS to get all server IPs for round-robin load balancing
-        let server_ips = resolve_dns(&self.config.nfs_url.server);
-        if server_ips.len() > 1 {
-            info!("DNS resolved {} to {} IPs: {:?}",
-                  self.config.nfs_url.server, server_ips.len(), server_ips);
-        }
+        // Get server IPs. If --server-ips was passed, use that list verbatim
+        // (bypasses DNS — required when the auth server returns a single A
+        // record per query and the local resolver caches it). Otherwise
+        // resolve DNS for round-robin load balancing.
+        let server_ips = if !self.config.server_ips.is_empty() {
+            info!("Using {} explicit server VIPs (--server-ips), skipping DNS: {:?}",
+                  self.config.server_ips.len(), self.config.server_ips);
+            self.config.server_ips.clone()
+        } else {
+            let ips = resolve_dns(&self.config.nfs_url.server);
+            if ips.len() > 1 {
+                info!("DNS resolved {} to {} IPs: {:?}",
+                      self.config.nfs_url.server, ips.len(), ips);
+            } else if ips.len() == 1 {
+                info!(
+                    "DNS resolved {} to a single IP ({}). If the server actually has more VIPs, \
+                     pass --server-ips IP1,IP2,... to use them all.",
+                    self.config.nfs_url.server, ips[0]
+                );
+            }
+            ips
+        };
 
         // IPs that have already failed at least one mount attempt — later
         // workers skip these instead of paying the same timeout again.
