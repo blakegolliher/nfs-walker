@@ -106,19 +106,28 @@ run_walker() {
 }
 
 count_parquet_rows() {
+    # Run unguarded — partial scan dirs (failed walker) can return
+    # non-zero from find/duckdb and `set -e + pipefail` would otherwise
+    # propagate the failure all the way up and abort the bench.
+    set +e
     local out_dir="$1"
     local scan_dir
     scan_dir=$(find "$out_dir/scans" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n1)
-    [ -z "$scan_dir" ] && return
-    local rows
-    rows=$(duckdb -c "SELECT count(*) FROM '${scan_dir}/part-*.parquet'" 2>/dev/null \
-        | awk '/^[0-9]/ { print $1 }' | head -n1)
-    echo "$rows"
+    if [ -n "$scan_dir" ]; then
+        local rows
+        rows=$(duckdb -c "SELECT count(*) FROM '${scan_dir}/part-*.parquet'" 2>/dev/null \
+            | awk '/^[0-9]/ { print $1 }' | head -n1)
+        echo "$rows"
+    fi
+    set -e
 }
 
 # Capture per-run statistics from the output dir before we move/delete
 # it, so the final summary doesn't depend on the data still being local.
+# Best-effort: a partial output (failed walker) shouldn't abort the
+# bench, so this runs with set +e.
 record_stats() {
+    set +e
     local name="$1"
     local out_dir="$BASE_DIR/$name"
     case "$name" in
@@ -131,9 +140,9 @@ record_stats() {
             count_parquet_rows "$out_dir" > "$BASE_DIR/$name.entries"
             ;;
     esac
-    # Recursive size pre-move so the summary reflects the real on-disk
-    # footprint even after archival.
     du -sb "$out_dir" 2>/dev/null | awk '{print $1}' > "$BASE_DIR/$name.bytes"
+    set -e
+    return 0
 }
 
 # Move the run's bulky output directory off /tmp to the NFS archive so
@@ -184,48 +193,50 @@ archive_output_dir() {
     note "archive: $name done in $((t1 - t0))s"
 }
 
+# Each run's stats/archive helpers are best-effort: an individual run
+# failing (or partially scanning) shouldn't abort the whole bench. We
+# want all four numbers in the final summary, even if some are partial.
+run_step() {
+    local name="$1"; shift
+    run_walker "$name" "$@" || true
+    record_stats "$name" || true
+    archive_output_dir "$name" || true
+}
+
 # Step 1: rocksdb baseline
 if [ "$SKIP_ROCKS" != "1" ]; then
-    run_walker rocks \
+    run_step rocks \
         --output-format rocksdb \
         --writer-shards "$ROCKS_SHARDS" \
         --pipeline-depth 8
-    record_stats rocks
-    archive_output_dir rocks
 fi
 
 # Step 2: parquet-base (tail-flush fix only)
-run_walker parquet-base \
+run_step parquet-base \
     --output-format parquet \
     --writer-shards "$PARQUET_SHARDS" \
     --pipeline-depth 8 \
     --big-dir-split-after 1000000 \
     --parquet-row-group-size 256000 \
     --parquet-compression zstd3
-record_stats parquet-base
-archive_output_dir parquet-base
 
 # Step 3: parquet-conc (+ concurrency tuning)
-run_walker parquet-conc \
+run_step parquet-conc \
     --output-format parquet \
     --writer-shards "$PARQUET_SHARDS" \
     --pipeline-depth 16 \
     --big-dir-split-after 2000 \
     --parquet-row-group-size 256000 \
     --parquet-compression zstd3
-record_stats parquet-conc
-archive_output_dir parquet-conc
 
 # Step 4: parquet-snappy (+ snappy compression — current defaults)
-run_walker parquet-snappy \
+run_step parquet-snappy \
     --output-format parquet \
     --writer-shards "$PARQUET_SHARDS" \
     --pipeline-depth 16 \
     --big-dir-split-after 2000 \
     --parquet-row-group-size 256000 \
     --parquet-compression snappy
-record_stats parquet-snappy
-archive_output_dir parquet-snappy
 
 # Summary — reads pre-archive sidecar files, so it works whether the
 # data is still local or already pushed to $ARCHIVE_DIR.
