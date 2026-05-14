@@ -37,6 +37,39 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use tracing::{debug, info};
 
+/// Compression algorithm choice for the direct-write Parquet pipeline.
+///
+/// Mid-scan write latency was effectively zero at ZSTD-3 on our 580K/s
+/// bench, but end-of-scan tail-flush wall-clock was 50s+ as 32 shards
+/// simultaneously encoded their final row groups. The tunable matters
+/// less for steady-state throughput than for the tail.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ParquetCompression {
+    Zstd(i32),
+    Snappy,
+    Lz4Raw,
+    None,
+}
+
+impl ParquetCompression {
+    fn to_parquet(self) -> Result<Compression, WalkerError> {
+        Ok(match self {
+            ParquetCompression::Zstd(level) => {
+                let zstd_level = ZstdLevel::try_new(level).map_err(|e| {
+                    WalkerError::Parquet(ParquetError::Other(format!(
+                        "Invalid ZSTD level {}: {}",
+                        level, e
+                    )))
+                })?;
+                Compression::ZSTD(zstd_level)
+            }
+            ParquetCompression::Snappy => Compression::SNAPPY,
+            ParquetCompression::Lz4Raw => Compression::LZ4_RAW,
+            ParquetCompression::None => Compression::UNCOMPRESSED,
+        })
+    }
+}
+
 /// Per-shard summary returned to the spawning thread after the channel
 /// closes. Aggregated into the run-wide `metadata.json` so the layout
 /// matches the post-hoc converter (parallel_convert.rs).
@@ -64,16 +97,19 @@ pub struct DirectWriteConfig {
     pub scan_timestamp_us: i64,
     /// Number of writer shards (== channel count).
     pub shards: usize,
-    /// Rows per row-group flush. `1_000_000` matches the post-hoc
-    /// converter default.
+    /// Rows per row-group flush. Default is 256K — small enough that
+    /// each end-of-scan tail flush is fast (~25-50 MB per shard
+    /// post-compression vs 200 MB+ at 1M), large enough that downstream
+    /// analytical queries still benefit from row-group statistics for
+    /// predicate pushdown. The post-hoc converters use 1M because
+    /// they're not concurrent with a hot walker and can afford to
+    /// accumulate.
     pub row_group_size: usize,
     /// File rotation threshold in bytes. The writer closes the current
     /// part once `bytes_written` crosses this value.
     pub target_file_size: usize,
-    /// ZSTD level. `3` matches the post-hoc converter default; cheaper
-    /// levels are an option if profiling shows compression CPU pinning
-    /// the host.
-    pub compression_level: i32,
+    /// Compression algorithm + level.
+    pub compression: ParquetCompression,
 }
 
 impl Default for DirectWriteConfig {
@@ -83,9 +119,15 @@ impl Default for DirectWriteConfig {
             scan_id: String::new(),
             scan_timestamp_us: 0,
             shards: 1,
-            row_group_size: 1_000_000,
-            target_file_size: 256 * 1024 * 1024,
-            compression_level: 3,
+            row_group_size: 256_000,
+            target_file_size: 512 * 1024 * 1024,
+            // Snappy matches the streaming-Parquet default in DuckDB,
+            // PyArrow, and Polars. Faster encoder than ZSTD with the
+            // trade-off of ~30% larger files. The post-hoc converters
+            // keep ZSTD-3 because they're not concurrent with a hot
+            // walker and can afford the slower encoder for smaller
+            // archived output.
+            compression: ParquetCompression::Snappy,
         }
     }
 }
@@ -140,7 +182,7 @@ pub fn spawn_direct_parquet_writers(
     );
 
     let schema = parquet_schema_ref();
-    let props = writer_properties(config.compression_level, config.row_group_size)?;
+    let props = writer_properties(config.compression, config.row_group_size)?;
     // Wrapping properties in `Arc` so each writer thread can clone the
     // handle cheaply when rotating part files.
     let props = Arc::new(props);
@@ -362,17 +404,11 @@ fn close_writer_take_name(
 /// breaks our `bytes_written`-driven file rotation when the caller
 /// uses a smaller row group.
 fn writer_properties(
-    compression_level: i32,
+    compression: ParquetCompression,
     row_group_size: usize,
 ) -> Result<WriterProperties, WalkerError> {
-    let zstd_level = ZstdLevel::try_new(compression_level).map_err(|e| {
-        WalkerError::Parquet(ParquetError::Other(format!(
-            "Invalid ZSTD level {}: {}",
-            compression_level, e
-        )))
-    })?;
     Ok(WriterProperties::builder()
-        .set_compression(Compression::ZSTD(zstd_level))
+        .set_compression(compression.to_parquet()?)
         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Chunk)
         .set_max_row_group_size(row_group_size.max(1))
         .build())
@@ -424,7 +460,7 @@ pub(crate) fn test_config(output_dir: PathBuf, shards: usize) -> DirectWriteConf
         shards,
         row_group_size: 1_000_000,
         target_file_size: 256 * 1024 * 1024,
-        compression_level: 3,
+        compression: ParquetCompression::Zstd(3),
     }
 }
 
@@ -560,7 +596,7 @@ mod tests {
             // ZSTD level 1 — cheaper compression so the on-disk size
             // tracks the row count more linearly. The point of the
             // test is rotation correctness, not compression ratio.
-            compression_level: 1,
+            compression: ParquetCompression::Zstd(1),
         };
         let metrics = build_metrics(1);
         let pool = spawn_direct_parquet_writers(cfg.clone(), metrics).unwrap();

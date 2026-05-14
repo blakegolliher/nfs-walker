@@ -219,6 +219,29 @@ pub struct CliArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Rocksdb, value_name = "FMT")]
     pub output_format: OutputFormat,
 
+    /// Parquet compression algorithm (direct-write only). `snappy` is
+    /// the default — fastest encoder with ~30% file-size penalty vs
+    /// ZSTD-3; the standard choice for streaming Parquet workloads
+    /// where write throughput matters more than max compression.
+    /// Override to `zstd3` for compatibility with the post-hoc
+    /// converter's defaults, or `none` to diagnose whether the encoder
+    /// is the bottleneck.
+    #[arg(long, value_enum, default_value_t = ParquetCompression::Snappy, value_name = "ALG")]
+    pub parquet_compression: ParquetCompression,
+
+    /// Parquet row-group size in rows (direct-write only). Default
+    /// 256_000 spreads the encoding/IO work across the scan instead of
+    /// dumping it at end. Smaller groups reduce tail-flush time;
+    /// larger groups improve downstream query predicate pushdown.
+    #[arg(long, default_value = "256000", value_name = "N")]
+    pub parquet_row_group_size: usize,
+
+    /// Parquet part-file rotation threshold in MiB (direct-write only).
+    /// Once a shard's current file exceeds this, the writer closes it
+    /// and starts a fresh `part-rNN-SSSSS+1.parquet`.
+    #[arg(long, default_value = "512", value_name = "MB")]
+    pub parquet_file_size_mb: usize,
+
     /// Override the per-scan progress logfile path. Default is `<output>.log`
     /// (sidecar next to the RocksDB directory). Disabled with --no-log.
     #[arg(long, value_name = "PATH")]
@@ -257,6 +280,44 @@ pub enum OutputFormat {
     /// Stream entries directly to sharded Parquet files. Faster but
     /// drops the incremental-rescan capability.
     Parquet,
+}
+
+/// Compression algorithm for direct-write Parquet output.
+///
+/// Maps to `parquet::basic::Compression` in `direct_writer.rs`. CLI
+/// values include the explicit ZSTD levels we care about so users
+/// don't have to remember the integer mapping.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ParquetCompression {
+    /// ZSTD level 1 (fastest, still reasonable ratio).
+    Zstd1,
+    /// ZSTD level 3 (default; matches post-hoc converter).
+    Zstd3,
+    /// ZSTD level 6 (best ratio, slow).
+    Zstd6,
+    /// Snappy (faster than ZSTD, ~30% larger files).
+    Snappy,
+    /// LZ4 (raw frame; faster than Snappy, ~10% larger again).
+    Lz4Raw,
+    /// No compression. Useful for diagnosing whether the encoder is
+    /// the tail-flush bottleneck.
+    None,
+}
+
+impl ParquetCompression {
+    /// Translate to the direct-writer's internal enum (also exposed
+    /// for downstream code that needs a deeper representation).
+    pub fn to_direct_writer(self) -> crate::parquet::direct_writer::ParquetCompression {
+        use crate::parquet::direct_writer::ParquetCompression as PC;
+        match self {
+            Self::Zstd1 => PC::Zstd(1),
+            Self::Zstd3 => PC::Zstd(3),
+            Self::Zstd6 => PC::Zstd(6),
+            Self::Snappy => PC::Snappy,
+            Self::Lz4Raw => PC::Lz4Raw,
+            Self::None => PC::None,
+        }
+    }
 }
 
 /// Subcommands
@@ -556,6 +617,15 @@ pub struct WalkConfig {
     /// Output backend (RocksDB or direct-write Parquet).
     pub output_format: OutputFormat,
 
+    /// Compression for direct-write parquet output.
+    pub parquet_compression: ParquetCompression,
+
+    /// Row-group size for direct-write parquet output.
+    pub parquet_row_group_size: usize,
+
+    /// File-rotation threshold (bytes) for direct-write parquet output.
+    pub parquet_file_size_bytes: usize,
+
     /// Threshold for splitting a giant directory into a continuation
     /// work item (pipelined worker only). 0 disables.
     pub big_dir_split_after: u64,
@@ -731,6 +801,9 @@ impl WalkConfig {
             writer_shards,
             big_dir_split_after: args.big_dir_split_after,
             output_format: args.output_format,
+            parquet_compression: args.parquet_compression,
+            parquet_row_group_size: args.parquet_row_group_size.max(1),
+            parquet_file_size_bytes: args.parquet_file_size_mb.saturating_mul(1024 * 1024),
             log,
         })
     }
@@ -815,6 +888,9 @@ mod tests {
             writer_shards: 1,
             big_dir_split_after: 0,
             output_format: OutputFormat::Rocksdb,
+            parquet_compression: ParquetCompression::Snappy,
+            parquet_row_group_size: 256_000,
+            parquet_file_size_bytes: 512 * 1024 * 1024,
             log: None,
         };
 

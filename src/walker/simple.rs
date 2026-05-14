@@ -249,13 +249,9 @@ impl SimpleWalker {
             scan_id: scan_id.clone(),
             scan_timestamp_us,
             shards,
-            // The post-hoc converters use 1 M; matching them keeps row
-            // groups large enough to compress efficiently while still
-            // giving the rotation logic plenty of opportunities to
-            // check `bytes_written` on a billion-entry scan.
-            row_group_size: 1_000_000,
-            target_file_size: 512 * 1024 * 1024,
-            compression_level: 3,
+            row_group_size: self.config.parquet_row_group_size,
+            target_file_size: self.config.parquet_file_size_bytes,
+            compression: self.config.parquet_compression.to_direct_writer(),
         };
 
         let pool =
