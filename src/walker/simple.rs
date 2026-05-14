@@ -16,12 +16,16 @@
 //! └── Writer Thread: recv entries → batch insert to RocksDB
 //! ```
 
-use crate::config::WalkConfig;
+use crate::config::{OutputFormat, WalkConfig};
 use crate::rocksdb::schema::path_to_shard;
 use crate::content::{checksum::compute_gxhash, filetype::detect_file_type as detect_mime_type};
 use crate::error::{Result, WalkerError};
 use crate::nfs::{resolve_dns, NfsConnection, NfsConnectionBuilder};
 use crate::nfs::types::{DbEntry, EntryType};
+use crate::parquet::direct_writer::{
+    spawn_direct_parquet_writers, write_metadata_json as write_direct_metadata_json,
+    DirectWriteConfig,
+};
 use crate::rocksdb::{
     finalize_rocks_db, meta_keys, RocksHandle, RocksWriter, RocksWriterConfig, WalkStatsSnapshot,
 };
@@ -210,7 +214,156 @@ impl SimpleWalker {
     }
 
     pub fn run(&self) -> Result<WalkStats> {
-        self.run_rocksdb()
+        match self.config.output_format {
+            OutputFormat::Rocksdb => self.run_rocksdb(),
+            OutputFormat::Parquet => self.run_parquet(),
+        }
+    }
+
+    /// Run walker with direct-write Parquet output. Fans out to
+    /// `writer_shards` independent streaming Parquet writers. No
+    /// RocksDB is involved; incremental rescan is not supported in
+    /// this mode (see `tasks/todo.md`).
+    fn run_parquet(&self) -> Result<WalkStats> {
+        let start = Instant::now();
+        let shards = self.config.writer_shards.max(1);
+
+        let scan_id = uuid::Uuid::new_v4().to_string();
+        let scan_timestamp_us =
+            chrono::Utc::now().timestamp_micros();
+
+        info!(
+            "Opening direct-write Parquet output: {} (scan_id={}, shards={})",
+            self.config.output_path.display(),
+            scan_id,
+            shards
+        );
+
+        let metrics = self.build_metrics(shards);
+        metrics.set_output_path(self.config.output_path.clone());
+
+        let logger_handle = self.maybe_start_logger(metrics.clone(), start);
+
+        let direct_cfg = DirectWriteConfig {
+            output_dir: self.config.output_path.clone(),
+            scan_id: scan_id.clone(),
+            scan_timestamp_us,
+            shards,
+            // The post-hoc converters use 1 M; matching them keeps row
+            // groups large enough to compress efficiently while still
+            // giving the rotation logic plenty of opportunities to
+            // check `bytes_written` on a billion-entry scan.
+            row_group_size: 1_000_000,
+            target_file_size: 512 * 1024 * 1024,
+            compression_level: 3,
+        };
+
+        let pool =
+            spawn_direct_parquet_writers(direct_cfg, metrics.clone()).map_err(|e| match e {
+                WalkerError::Parquet(p) => WalkerError::Parquet(p),
+                other => other,
+            })?;
+
+        // Register clones for queue-depth observation. MUST be paired
+        // with `release_write_senders()` before joining, same trap as
+        // the RocksDB shard path.
+        for tx in &pool.senders {
+            metrics.register_write_sender(tx.clone());
+        }
+
+        self.run_workers(pool.senders, metrics.clone())?;
+
+        // Drop the observability clones so each writer's recv() returns
+        // Err and the thread can flush its tail and close the part file.
+        metrics.release_write_senders();
+
+        let mut summaries = Vec::with_capacity(pool.joins.len());
+        let mut first_err: Option<WalkerError> = None;
+        for (idx, h) in pool.joins.into_iter().enumerate() {
+            match h.join() {
+                Ok(Ok(s)) => summaries.push(s),
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                    warn!("parquet writer shard {} failed", idx);
+                }
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(WalkerError::Parquet(
+                            crate::error::ParquetError::Other(format!(
+                                "parquet writer shard {} panicked",
+                                idx
+                            )),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+
+        let source_url = self.config.nfs_url.to_display_string();
+        let (total_entries, _total_bytes, _files) = write_direct_metadata_json(
+            &pool.scan_dir,
+            &scan_id,
+            scan_timestamp_us,
+            &source_url,
+            &summaries,
+        )?;
+
+        let dirs = self.dirs_count.load(Ordering::Relaxed);
+        let files = self.files_count.load(Ordering::Relaxed);
+        let bytes = self.bytes_count.load(Ordering::Relaxed);
+        let errors = self.errors_count.load(Ordering::Relaxed);
+
+        // Walker counters and parquet row count measure different
+        // things and can't be compared directly:
+        //   - `dirs_count` counts directories we READ (called
+        //     readdirplus on), not directories we EMITTED.
+        //   - `files_count` counts files we saw inside those reads.
+        //   - parquet rows = every non-dot entry returned by any
+        //     readdir that we completed (subdirs are emitted by their
+        //     parent's readdir even when we don't recurse into them).
+        //
+        // The relation with no depth limit (and no exclude patterns)
+        // is `parquet_rows == files + dirs - 1` (minus one because the
+        // root directory is never emitted as a child of its parent).
+        // With a depth limit, there's an additional "seen but skipped"
+        // term we don't track separately, so any mismatch is expected.
+        if self.config.max_depth.is_none() && self.config.exclude_patterns.is_empty() {
+            let expected = files.saturating_add(dirs.saturating_sub(1));
+            if total_entries != expected {
+                warn!(
+                    "parquet row count {} != expected {} (files {} + dirs {} - 1) — \
+                     entries may have been dropped",
+                    total_entries, expected, files, dirs
+                );
+            }
+        }
+
+        let stats = WalkStats {
+            dirs,
+            files,
+            bytes,
+            errors,
+            duration: start.elapsed(),
+            completed: !self.shutdown.load(Ordering::Relaxed),
+        };
+
+        metrics.signal_shutdown();
+        if let Some(h) = logger_handle {
+            let _ = h.join();
+        }
+
+        info!(
+            "Direct-write Parquet scan complete: {} rows in {} part files",
+            total_entries,
+            summaries.iter().map(|s| s.part_files.len()).sum::<usize>()
+        );
+
+        Ok(stats)
     }
 
     /// Run walker with RocksDB output. Fans out to `writer_shards`

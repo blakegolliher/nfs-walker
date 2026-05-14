@@ -17,7 +17,7 @@
 //!
 //! See `docs/PIPELINED_READDIRPLUS_DESIGN.md` §8 for the full test plan.
 
-use nfs_walker::config::{NfsUrl, WalkConfig};
+use nfs_walker::config::{NfsUrl, OutputFormat, WalkConfig};
 use nfs_walker::rocksdb::RocksHandle;
 use nfs_walker::walker::SimpleWalker;
 use std::collections::BTreeSet;
@@ -52,6 +52,7 @@ fn make_config(url: NfsUrl, output_path: PathBuf, pipeline_depth: usize) -> Walk
         pipeline_depth,
         writer_shards: 1,
         big_dir_split_after: 0,
+        output_format: OutputFormat::Rocksdb,
         log: None,
     }
 }

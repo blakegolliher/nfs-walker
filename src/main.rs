@@ -94,7 +94,11 @@ fn run() -> Result<()> {
             config.worker_count,
             &config.output_path.display().to_string(),
         );
-        eprintln!("Mode: READDIRPLUS (RocksDB)");
+        let backend = match config.output_format {
+            nfs_walker::config::OutputFormat::Rocksdb => "RocksDB",
+            nfs_walker::config::OutputFormat::Parquet => "Parquet direct-write",
+        };
+        eprintln!("Mode: READDIRPLUS ({})", backend);
     }
 
     // Save output path before moving config
@@ -368,16 +372,25 @@ fn run_server(
 }
 
 /// Get total size of a RocksDB directory
+/// Recursive size of the scan output directory. Walks subdirectories so
+/// the parquet layout (`scans/<id>/part-*.parquet`) reports honestly;
+/// the single-flat-directory case (RocksDB) still works since the walk
+/// just bottoms out one level down.
 fn get_rocks_db_size(path: &std::path::Path) -> Option<u64> {
     if !path.is_dir() {
         return None;
     }
-
     let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                total += meta.len();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    total += meta.len();
+                }
             }
         }
     }

@@ -33,8 +33,16 @@ const MAX_PIPELINE_DEPTH: usize = 64;
 /// Maximum writer-shard count. RocksDB's compaction thread pool is
 /// shared across CFs; with shards beyond ~32 the pool starts to thrash
 /// and per-shard memtable memory grows superlinearly with no further
-/// throughput gain.
+/// throughput gain. The Parquet direct-write path has no shared
+/// compaction pool, so this cap is artificially generous for it; the
+/// limit there is per-shard memory for in-flight Arrow builders.
 const MAX_WRITER_SHARDS: usize = 32;
+
+/// Default writer-shard count when `--output-format parquet` is selected
+/// and the user did not pass `--writer-shards`. 32 matches the customer
+/// tuning that motivated this code path (libnfs+DuckDB → 3M files/sec on
+/// a comparable target).
+const DEFAULT_PARQUET_SHARDS: usize = 32;
 
 /// Regex for parsing NFS URLs
 static NFS_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -189,16 +197,27 @@ pub struct CliArgs {
     #[arg(long, default_value = "1000000", value_name = "N")]
     pub big_dir_split_after: u64,
 
-    /// Number of RocksDB writer shards. 1 = legacy single-writer path
-    /// (current behavior). Higher values split the entries-by-path CF
-    /// into N independent CFs each owned by its own writer thread, so a
-    /// scan that's writer-bound can scale past one core's
-    /// `put_cf` rate. Recommended range on a many-core box pointed at a
-    /// large NFS export is 8 (strong baseline) — 16 (lift further only
-    /// if profiling still shows writer saturation). Above 32 the
-    /// background compaction pool starts to thrash.
-    #[arg(long, default_value = "1", value_name = "N")]
-    pub writer_shards: usize,
+    /// Number of writer shards. 1 = legacy single-writer path (RocksDB
+    /// only). Higher values split the entries-by-path keyspace into N
+    /// independent shards each owned by its own writer thread. For
+    /// `--output-format rocksdb` (default) the recommended range is 8-16
+    /// and the hard cap is 32 (compaction-pool thrash above that). For
+    /// `--output-format parquet` the per-shard cost is just an Arrow
+    /// builder + ZSTD encoder so 32 is the typical sweet spot (matches
+    /// the customer baseline this path was designed to chase).
+    ///
+    /// When unset, the default is 1 in rocksdb mode and 32 in parquet
+    /// mode.
+    #[arg(long, value_name = "N")]
+    pub writer_shards: Option<usize>,
+
+    /// Output backend. `rocksdb` (default) writes a RocksDB directory
+    /// suitable for incremental rescans and post-hoc export. `parquet`
+    /// streams entries directly to sharded Parquet files (one set per
+    /// `--writer-shards`) — much faster on writer-bound scans, but loses
+    /// the incremental-rescan capability (no baseline state store).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Rocksdb, value_name = "FMT")]
+    pub output_format: OutputFormat,
 
     /// Override the per-scan progress logfile path. Default is `<output>.log`
     /// (sidecar next to the RocksDB directory). Disabled with --no-log.
@@ -226,6 +245,18 @@ pub enum LogFormat {
     Text,
     /// JSON-Lines: one JSON object per snapshot.
     Json,
+}
+
+/// Walker output backend. Selected at scan time; cannot be mixed in one
+/// scan.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Write to a RocksDB directory (default; supports incremental
+    /// rescans, post-hoc export to Parquet/SQLite, and resume).
+    Rocksdb,
+    /// Stream entries directly to sharded Parquet files. Faster but
+    /// drops the incremental-rescan capability.
+    Parquet,
 }
 
 /// Subcommands
@@ -518,9 +549,12 @@ pub struct WalkConfig {
     /// 0 = legacy serial worker loop. >0 selects the pipelined worker.
     pub pipeline_depth: usize,
 
-    /// Number of RocksDB writer shards (1 = legacy single-writer path).
+    /// Number of writer shards (1 = legacy single-writer path).
     /// Validated to 1..=32 in `from_args`.
     pub writer_shards: usize,
+
+    /// Output backend (RocksDB or direct-write Parquet).
+    pub output_format: OutputFormat,
 
     /// Threshold for splitting a giant directory into a continuation
     /// work item (pipelined worker only). 0 disables.
@@ -612,10 +646,17 @@ impl WalkConfig {
             });
         }
 
-        // Validate writer-shard count.
-        if args.writer_shards == 0 || args.writer_shards > MAX_WRITER_SHARDS {
+        // Resolve writer-shard count. Default depends on backend:
+        // rocksdb → 1 (legacy behavior), parquet → DEFAULT_PARQUET_SHARDS.
+        // An explicit `--writer-shards N` always wins; we validate after
+        // applying the default so the cap applies uniformly.
+        let writer_shards = args.writer_shards.unwrap_or(match args.output_format {
+            OutputFormat::Rocksdb => 1,
+            OutputFormat::Parquet => DEFAULT_PARQUET_SHARDS,
+        });
+        if writer_shards == 0 || writer_shards > MAX_WRITER_SHARDS {
             return Err(ConfigError::InvalidWriterShards {
-                shards: args.writer_shards,
+                shards: writer_shards,
                 max: MAX_WRITER_SHARDS,
             });
         }
@@ -687,8 +728,9 @@ impl WalkConfig {
             detect_file_type: args.file_type,
             max_checksum_size: args.max_checksum_size,
             pipeline_depth: args.pipeline_depth,
-            writer_shards: args.writer_shards,
+            writer_shards,
             big_dir_split_after: args.big_dir_split_after,
+            output_format: args.output_format,
             log,
         })
     }
@@ -772,6 +814,7 @@ mod tests {
             pipeline_depth: 0,
             writer_shards: 1,
             big_dir_split_after: 0,
+            output_format: OutputFormat::Rocksdb,
             log: None,
         };
 
