@@ -33,7 +33,16 @@ pub fn parquet_schema() -> Schema {
         Field::new("ctime_nsec", DataType::Int32, true),
         Field::new("depth", DataType::UInt16, false),
         Field::new("parent_path", DataType::Utf8, false),
-        Field::new("scan_id", DataType::Utf8, false),
+        // scan_id is dictionary-encoded so the per-shard writer doesn't
+        // buffer ~9 MB of repeated UUID bytes per row group. DuckDB,
+        // Spark, and pandas see this as a regular VARCHAR/string
+        // column; Arrow-native readers get a DictionaryArray they can
+        // operate on directly. See P1-4 in tasks/code-review-audit.md.
+        Field::new(
+            "scan_id",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            false,
+        ),
         Field::new("scan_timestamp_us", DataType::Int64, false),
     ])
 }

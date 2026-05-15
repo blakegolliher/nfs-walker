@@ -11,9 +11,10 @@ use crate::nfs::types::DbEntry;
 use crate::parquet::schema::{compute_parent_path, file_type_string, parquet_schema_ref};
 use crate::rocksdb::schema::RocksEntry;
 use arrow::array::{
-    ArrayRef, Int32Builder, Int64Builder, StringBuilder, UInt16Builder, UInt32Builder, UInt64Builder,
+    ArrayRef, Int32Builder, Int64Builder, StringBuilder, StringDictionaryBuilder, UInt16Builder,
+    UInt32Builder, UInt64Builder,
 };
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Schema, UInt32Type};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
@@ -73,7 +74,11 @@ pub struct RowBuilder {
     b_ctime_nsec: Int32Builder,
     b_depth: UInt16Builder,
     b_parent_path: StringBuilder,
-    b_scan_id: StringBuilder,
+    /// scan_id is dictionary-encoded — every row in a given batch
+    /// shares the same UUID, so the builder produces a 1-entry
+    /// dictionary plus a tiny index array instead of materializing
+    /// ~9 MB of repeated bytes per row group.
+    b_scan_id: StringDictionaryBuilder<UInt32Type>,
     b_scan_ts: Int64Builder,
 }
 
@@ -105,7 +110,7 @@ impl RowBuilder {
             b_ctime_nsec: Int32Builder::new(),
             b_depth: UInt16Builder::new(),
             b_parent_path: StringBuilder::new(),
-            b_scan_id: StringBuilder::new(),
+            b_scan_id: StringDictionaryBuilder::<UInt32Type>::new(),
             b_scan_ts: Int64Builder::new(),
         }
     }
