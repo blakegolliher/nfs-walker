@@ -334,13 +334,16 @@ impl SimpleWalker {
             //     readdir that we completed (subdirs are emitted by their
             //     parent's readdir even when we don't recurse into them).
             //
-            // The relation with no depth limit (and no exclude patterns)
-            // is `parquet_rows == files + dirs - 1` (minus one because
-            // the root directory is never emitted as a child of its
-            // parent). With a depth limit, there's an additional "seen
-            // but skipped" term we don't track separately, so any
-            // mismatch is expected.
-            if self.config.max_depth.is_none() && self.config.exclude_patterns.is_empty() {
+            // The relation with no depth limit and no dirs-only mode is
+            // `parquet_rows == files + dirs - 1` (minus one because the
+            // root directory is never emitted as a child of its parent).
+            // `dirs_only` makes the worker drop file entries before they
+            // reach the writer, which breaks the relation. `max_depth`
+            // adds a "seen but skipped" term we don't track separately,
+            // also breaking it. `exclude_patterns` is gathered into the
+            // config but never consulted by the worker today, so it
+            // doesn't perturb the count — no carve-out needed.
+            if self.config.max_depth.is_none() && !self.config.dirs_only {
                 let expected = files.saturating_add(dirs.saturating_sub(1));
                 if total_entries != expected {
                     warn!(
