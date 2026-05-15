@@ -753,6 +753,39 @@ impl WalkConfig {
                 max: MAX_WRITER_SHARDS,
             });
         }
+
+        // Validate --server-ips: trim each entry, drop empties, parse as
+        // IpAddr, dedupe while preserving first-seen order. If the flag
+        // was passed but every entry was whitespace/empty, reject rather
+        // than silently fall back to DNS.
+        let server_ips = {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut out: Vec<String> = Vec::new();
+            for raw in &args.server_ips {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                trimmed.parse::<std::net::IpAddr>().map_err(|e| {
+                    ConfigError::InvalidServerIps {
+                        entry: raw.clone(),
+                        reason: format!("not a valid IP address: {}", e),
+                    }
+                })?;
+                if seen.insert(trimmed.to_string()) {
+                    out.push(trimmed.to_string());
+                }
+            }
+            if !args.server_ips.is_empty() && out.is_empty() {
+                return Err(ConfigError::InvalidServerIps {
+                    entry: args.server_ips.join(","),
+                    reason: "flag was passed but no usable IP entries remained after trimming"
+                        .to_string(),
+                });
+            }
+            out
+        };
+
         // Compile exclude patterns
         let exclude_patterns = args
             .exclude_patterns
@@ -828,7 +861,7 @@ impl WalkConfig {
             parquet_row_group_size: args.parquet_row_group_size.max(1),
             parquet_file_size_bytes: args.parquet_file_size_mb.saturating_mul(1024 * 1024),
             parquet_channel_depth: args.parquet_channel_depth.max(1),
-            server_ips: args.server_ips,
+            server_ips,
             log,
         })
     }
@@ -923,5 +956,61 @@ mod tests {
 
         assert!(config.is_excluded("/data/.snapshot/hourly.0"));
         assert!(!config.is_excluded("/data/myfile.txt"));
+    }
+
+    fn parse_with_server_ips(value: &str) -> Result<WalkConfig, ConfigError> {
+        let args = CliArgs::parse_from([
+            "nfs-walker",
+            "nfs://server/export",
+            "--server-ips",
+            value,
+        ]);
+        WalkConfig::from_args(args)
+    }
+
+    #[test]
+    fn server_ips_empty_string_rejected() {
+        let err = parse_with_server_ips("").expect_err("empty string must reject");
+        assert!(matches!(err, ConfigError::InvalidServerIps { .. }), "got {:?}", err);
+    }
+
+    #[test]
+    fn server_ips_only_commas_rejected() {
+        let err = parse_with_server_ips(",,").expect_err("commas-only must reject");
+        assert!(matches!(err, ConfigError::InvalidServerIps { .. }), "got {:?}", err);
+    }
+
+    #[test]
+    fn server_ips_drops_empties_between_commas() {
+        let cfg = parse_with_server_ips("10.0.0.1,,10.0.0.2").unwrap();
+        assert_eq!(cfg.server_ips, vec!["10.0.0.1", "10.0.0.2"]);
+    }
+
+    #[test]
+    fn server_ips_trims_whitespace() {
+        let cfg = parse_with_server_ips("10.0.0.1, 10.0.0.2").unwrap();
+        assert_eq!(cfg.server_ips, vec!["10.0.0.1", "10.0.0.2"]);
+    }
+
+    #[test]
+    fn server_ips_rejects_malformed() {
+        let err = parse_with_server_ips("10.0.0.1,not-an-ip")
+            .expect_err("malformed entry must reject");
+        match err {
+            ConfigError::InvalidServerIps { entry, .. } => assert_eq!(entry, "not-an-ip"),
+            other => panic!("expected InvalidServerIps, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn server_ips_dedupes_preserving_order() {
+        let cfg = parse_with_server_ips("10.0.0.1,10.0.0.1,10.0.0.2").unwrap();
+        assert_eq!(cfg.server_ips, vec!["10.0.0.1", "10.0.0.2"]);
+    }
+
+    #[test]
+    fn server_ips_accepts_ipv6() {
+        let cfg = parse_with_server_ips("::1,10.0.0.1").unwrap();
+        assert_eq!(cfg.server_ips, vec!["::1", "10.0.0.1"]);
     }
 }

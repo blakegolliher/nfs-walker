@@ -646,9 +646,15 @@ impl SimpleWalker {
                             "Worker {} could not mount on any of {} VIPs ({} are dead). Aborting.",
                             id, n, dead_ips.len()
                         );
-                        return Err(last_err.expect(
-                            "must have at least one error if every VIP was tried and none worked",
-                        ));
+                        return Err(last_err.unwrap_or_else(|| {
+                            WalkerError::Nfs(crate::error::NfsError::ConnectionFailed {
+                                server: self.config.nfs_url.server.clone(),
+                                reason: format!(
+                                    "worker {} could not mount on any of {} VIPs (all marked dead by earlier workers)",
+                                    id, n
+                                ),
+                            })
+                        }));
                     }
                 }
             };

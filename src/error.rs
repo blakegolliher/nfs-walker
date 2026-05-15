@@ -199,6 +199,10 @@ pub enum ConfigError {
     /// Writer-shard count out of range
     #[error("Invalid writer-shards {shards}: must be between 1 and {max}")]
     InvalidWriterShards { shards: usize, max: usize },
+
+    /// `--server-ips` entry could not be parsed
+    #[error("Invalid --server-ips entry '{entry}': {reason}")]
+    InvalidServerIps { entry: String, reason: String },
 }
 
 /// Worker thread errors
