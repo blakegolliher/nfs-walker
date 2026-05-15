@@ -402,10 +402,19 @@ fn writer_loop(
                 // opening the next; if close() errors, `?` propagates
                 // out and `inprogress`'s Drop removes the partial.
                 if writer.bytes_written() as usize >= target_file_size {
-                    let closed_bytes = writer.bytes_written() as u64;
+                    // bytes_written() is captured before close() because
+                    // close() consumes the writer. The footer adds a few
+                    // KB that bytes_written doesn't see, so we prefer
+                    // stat() of the closed file when available and fall
+                    // back to the pre-close count if stat fails.
+                    let pre_close_bytes = writer.bytes_written() as u64;
                     writer.close().map_err(ParquetError::Parquet)?;
+                    let filename = inprogress.commit();
+                    let closed_bytes = std::fs::metadata(scan_dir.join(&filename))
+                        .map(|m| m.len())
+                        .unwrap_or(pre_close_bytes);
                     summary.bytes_written += closed_bytes;
-                    summary.part_files.push(inprogress.commit());
+                    summary.part_files.push(filename);
 
                     inprogress = InProgressPart::new(&scan_dir, shard_idx, part_seq);
                     writer = open_part_writer(inprogress.path(), &schema, &props)?;
@@ -426,10 +435,16 @@ fn writer_loop(
         )?;
     }
 
-    let closed_bytes = writer.bytes_written() as u64;
+    // Same pattern as the rotation path: prefer post-close stat so the
+    // footer bytes get counted; fall back to pre-close bytes_written().
+    let pre_close_bytes = writer.bytes_written() as u64;
     writer.close().map_err(ParquetError::Parquet)?;
+    let filename = inprogress.commit();
+    let closed_bytes = std::fs::metadata(scan_dir.join(&filename))
+        .map(|m| m.len())
+        .unwrap_or(pre_close_bytes);
     summary.bytes_written += closed_bytes;
-    summary.part_files.push(inprogress.commit());
+    summary.part_files.push(filename);
 
     debug!(
         "parquet writer {} finished: {} entries, {} bytes, {} part files",
