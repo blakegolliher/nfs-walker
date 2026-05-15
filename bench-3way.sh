@@ -339,13 +339,25 @@ note "sidecars:  $BASE_DIR/  (scanlogs, stdouts, .wall/.rc/.entries/.bytes)"
 note "log:       $LOG"
 
 # Move the sidecar dir to the archive too so everything from this bench
-# lives in one place. Done LAST so the bench.log captures the summary
-# before being moved.
+# lives in one place. Done LAST so bench.log captures the summary
+# before we start moving things.
 if [ -n "$ARCHIVE_DIR" ] && [ "$KEEP_LOCAL" != "1" ]; then
     dest_root="$ARCHIVE_DIR/$(basename "$BASE_DIR")"
     if mkdir -p "$dest_root" 2>/dev/null; then
-        note "archive: moving sidecars + bench.log -> $dest_root/"
-        find "$BASE_DIR" -maxdepth 1 -type f -exec mv {} "$dest_root/" \; 2>/dev/null || true
-        rmdir "$BASE_DIR" 2>/dev/null || true
+        note "archive: moving sidecars -> $dest_root/  (bench.log copied separately)"
+        # Move every sidecar EXCEPT bench.log — the `tee` subprocess
+        # that owns our stdout/stderr fd is still holding bench.log
+        # open. A cross-fs mv unlinks the source inode while tee keeps
+        # writing to it, silently dropping any post-archive output.
+        find "$BASE_DIR" -maxdepth 1 -type f ! -name bench.log \
+            -exec mv {} "$dest_root/" \; 2>/dev/null || true
+        # Give tee a moment to flush its line buffer + sync to push
+        # block-cached writes to disk, then copy. Anything emitted
+        # after this block (just rmdir's silent failure) won't reach
+        # the archived copy, which is fine.
+        sleep 1
+        sync
+        cp "$LOG" "$dest_root/" 2>/dev/null || true
+        # Don't rmdir BASE_DIR — bench.log stays for local debugging.
     fi
 fi
