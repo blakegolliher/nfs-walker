@@ -7,6 +7,19 @@
 //! Only requires the first few bytes of a file (typically 8KB or less),
 //! making it efficient for scanning large filesystems over NFS.
 
+const PDF_MAGIC: &[u8] = b"%PDF-";
+const ELF_MAGIC: &[u8] = b"\x7FELF";
+
+fn builtin_kind(header: &[u8]) -> Option<(&'static str, &'static str)> {
+    if header.starts_with(PDF_MAGIC) {
+        return Some(("application/pdf", "PDF"));
+    }
+    if header.starts_with(ELF_MAGIC) {
+        return Some(("application/x-executable", "ELF"));
+    }
+    None
+}
+
 /// Detect the MIME type of a file from its header bytes
 ///
 /// Returns the detected MIME type as a string, or None if the type is unknown.
@@ -25,18 +38,24 @@
 /// assert_eq!(detect_file_type(unknown), None);
 /// ```
 pub fn detect_file_type(header: &[u8]) -> Option<String> {
-    infer::get(header).map(|kind| kind.mime_type().to_string())
+    builtin_kind(header)
+        .map(|(mime, _)| mime.to_string())
+        .or_else(|| infer::get(header).map(|kind| kind.mime_type().to_string()))
 }
 
 /// Detect the file type and return a human-readable description
 ///
 /// Returns a tuple of (MIME type, description) or None if unknown.
 pub fn detect_file_type_with_description(header: &[u8]) -> Option<(String, String)> {
-    infer::get(header).map(|kind| {
-        let mime = kind.mime_type().to_string();
-        let desc = kind.extension().to_uppercase();
-        (mime, desc)
-    })
+    builtin_kind(header)
+        .map(|(mime, desc)| (mime.to_string(), desc.to_string()))
+        .or_else(|| {
+            infer::get(header).map(|kind| {
+                let mime = kind.mime_type().to_string();
+                let desc = kind.extension().to_uppercase();
+                (mime, desc)
+            })
+        })
 }
 
 /// Check if the content is an image file
@@ -61,12 +80,12 @@ pub fn is_archive(header: &[u8]) -> bool {
 
 /// Check if the content is a document file
 pub fn is_document(header: &[u8]) -> bool {
-    infer::is_document(header)
+    header.starts_with(PDF_MAGIC) || infer::is_document(header)
 }
 
 /// Check if the content is an application/executable
 pub fn is_app(header: &[u8]) -> bool {
-    infer::is_app(header)
+    header.starts_with(ELF_MAGIC) || infer::is_app(header)
 }
 
 #[cfg(test)]

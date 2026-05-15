@@ -717,13 +717,13 @@ fn validate_param(param: &ParamDef, value: &str) -> Result<String, ServerError> 
                 reason: format!("expected integer, got '{}'", value),
             })?;
             // Clamp limit-like params to reasonable bounds
-            if param.name == "limit" && (n < 1 || n > 10000) {
+            if param.name == "limit" && !(1..=10000).contains(&n) {
                 return Err(ServerError::InvalidParameter {
                     name: param.name.to_string(),
                     reason: "limit must be between 1 and 10000".to_string(),
                 });
             }
-            if param.name == "days" && (n < 1 || n > 36500) {
+            if param.name == "days" && !(1..=36500).contains(&n) {
                 return Err(ServerError::InvalidParameter {
                     name: param.name.to_string(),
                     reason: "days must be between 1 and 36500".to_string(),

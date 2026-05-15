@@ -111,7 +111,7 @@ fn batches_to_json(batches: &[RecordBatch]) -> Result<Vec<serde_json::Value>, Se
     let rows: Vec<serde_json::Value> = output
         .lines()
         .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str(line))
+        .map(serde_json::from_str)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(rows)

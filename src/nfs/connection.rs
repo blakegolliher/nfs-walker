@@ -630,17 +630,15 @@ impl NfsConnection {
             let mut chunk = Vec::with_capacity(chunk_size);
             for entry in cb_data.entries {
                 chunk.push(entry);
-                if chunk.len() >= chunk_size {
-                    if !callback(std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size))) {
-                        return Ok(total_entries);
-                    }
+                if chunk.len() >= chunk_size
+                    && !callback(std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size)))
+                {
+                    return Ok(total_entries);
                 }
             }
             // Send remaining entries
-            if !chunk.is_empty() {
-                if !callback(chunk) {
-                    return Ok(total_entries);
-                }
+            if !chunk.is_empty() && !callback(chunk) {
+                return Ok(total_entries);
             }
 
             // Check if we're done
@@ -1025,14 +1023,14 @@ impl NfsConnection {
             uid: d.uid,
             gid: d.gid,
             mode: d.mode,
-            atime: Some(timeval_to_micros(d.atime.tv_sec as i64, d.atime_nsec)),
-            mtime: Some(timeval_to_micros(d.mtime.tv_sec as i64, d.mtime_nsec)),
-            ctime: Some(timeval_to_micros(d.ctime.tv_sec as i64, d.ctime_nsec)),
-            mtime_sec: Some(d.mtime.tv_sec as i64),
+            atime: Some(timeval_to_micros(d.atime.tv_sec, d.atime_nsec)),
+            mtime: Some(timeval_to_micros(d.mtime.tv_sec, d.mtime_nsec)),
+            ctime: Some(timeval_to_micros(d.ctime.tv_sec, d.ctime_nsec)),
+            mtime_sec: Some(d.mtime.tv_sec),
             mtime_nsec: Some(d.mtime_nsec as i32),
-            atime_sec: Some(d.atime.tv_sec as i64),
+            atime_sec: Some(d.atime.tv_sec),
             atime_nsec: Some(d.atime_nsec as i32),
-            ctime_sec: Some(d.ctime.tv_sec as i64),
+            ctime_sec: Some(d.ctime.tv_sec),
             ctime_nsec: Some(d.ctime_nsec as i32),
             blksize: d.blksize,
             blocks: d.blocks,
@@ -1362,14 +1360,14 @@ impl NfsDirHandle {
             uid: d.uid,
             gid: d.gid,
             mode: d.mode,
-            atime: Some(timeval_to_micros(d.atime.tv_sec as i64, d.atime_nsec)),
-            mtime: Some(timeval_to_micros(d.mtime.tv_sec as i64, d.mtime_nsec)),
-            ctime: Some(timeval_to_micros(d.ctime.tv_sec as i64, d.ctime_nsec)),
-            mtime_sec: Some(d.mtime.tv_sec as i64),
+            atime: Some(timeval_to_micros(d.atime.tv_sec, d.atime_nsec)),
+            mtime: Some(timeval_to_micros(d.mtime.tv_sec, d.mtime_nsec)),
+            ctime: Some(timeval_to_micros(d.ctime.tv_sec, d.ctime_nsec)),
+            mtime_sec: Some(d.mtime.tv_sec),
             mtime_nsec: Some(d.mtime_nsec as i32),
-            atime_sec: Some(d.atime.tv_sec as i64),
+            atime_sec: Some(d.atime.tv_sec),
             atime_nsec: Some(d.atime_nsec as i32),
-            ctime_sec: Some(d.ctime.tv_sec as i64),
+            ctime_sec: Some(d.ctime.tv_sec),
             ctime_nsec: Some(d.ctime_nsec as i32),
             blksize: d.blksize,
             blocks: d.blocks,
@@ -1601,7 +1599,7 @@ unsafe extern "C" fn readdirplus_full_callback(
                             ctime_sec: Some(attrs.ctime.seconds as i64),
                             ctime_nsec: Some(attrs.ctime.nseconds as i32),
                             blksize: 4096, // NFS3 doesn't provide blksize
-                            blocks: (attrs.used + 511) / 512, // Convert used bytes to 512-byte blocks
+                            blocks: attrs.used.div_ceil(512), // Convert used bytes to 512-byte blocks
                         };
                         (et, Some(s))
                     } else {
@@ -1667,6 +1665,9 @@ fn wait_for_rpc_completion(
     let timeout = std::time::Duration::from_millis(timeout_ms as u64);
     let mut iteration = 0u32;
 
+    // The libnfs C callback mutates `*completed`; clippy cannot see through
+    // the FFI boundary, but polling this flag is the wrapped API contract.
+    #[allow(clippy::while_immutable_condition)]
     while !unsafe { *completed } {
         if start.elapsed() > timeout {
             tracing::debug!(
@@ -2096,7 +2097,7 @@ mod tests {
 
         let r1 = slot.take_result();
         assert_eq!(r1.entries.len(), 7);
-        assert_eq!(r1.eof, false);
+        assert!(!r1.eof);
         assert_eq!(r1.next_cookie, 12345);
         assert_eq!(r1.status, 0);
 
@@ -2105,7 +2106,7 @@ mod tests {
         // and the same cookie/status.
         let r2 = slot.take_result();
         assert_eq!(r2.entries.len(), 0);
-        assert_eq!(r2.eof, false);
+        assert!(!r2.eof);
         assert_eq!(r2.next_cookie, 12345);
         assert_eq!(r2.status, 0);
     }

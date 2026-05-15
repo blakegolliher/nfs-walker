@@ -158,7 +158,7 @@ mod tests {
     fn test_seconds_to_microseconds() {
         assert_eq!(seconds_to_microseconds(0), 0);
         assert_eq!(seconds_to_microseconds(1), 1_000_000);
-        assert_eq!(seconds_to_microseconds(1234567890), 1234567890_000_000);
+        assert_eq!(seconds_to_microseconds(1_234_567_890), 1_234_567_890_000_000);
         // Saturating: no overflow
         assert_eq!(
             seconds_to_microseconds(i64::MAX),

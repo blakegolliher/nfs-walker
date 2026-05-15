@@ -247,7 +247,7 @@ pub async fn serve(
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .map_err(|e| ServerError::Io(e))?;
+        .map_err(ServerError::Io)?;
 
     eprintln!("\nServer shut down.");
     Ok(())

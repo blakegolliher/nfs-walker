@@ -86,7 +86,6 @@ impl DirWork {
 /// path-shard channel by `path_to_shard(entry.path, shards)`. Workers
 /// hold N partial batches in parallel; shards == 1 collapses to a
 /// single channel and matches the legacy behavior bit-for-bit.
-
 struct ShardedSender {
     senders: Vec<Sender<Vec<DbEntry>>>,
     batches: Vec<Vec<DbEntry>>,
@@ -734,7 +733,7 @@ impl SimpleWalker {
             builder = builder.with_ip(ip.to_string());
         }
 
-        builder.connect().map_err(|e| WalkerError::Nfs(e))
+        builder.connect().map_err(WalkerError::Nfs)
     }
 
 }
@@ -1663,10 +1662,12 @@ mod tests {
 
     #[test]
     fn test_walk_progress_rate() {
-        let mut progress = WalkProgress::default();
-        progress.files = 1000;
-        progress.dirs = 100;
-        progress.elapsed = Duration::from_secs(10);
+        let progress = WalkProgress {
+            files: 1000,
+            dirs: 100,
+            elapsed: Duration::from_secs(10),
+            ..WalkProgress::default()
+        };
         assert!((progress.files_per_second() - 110.0).abs() < 0.1);
     }
 

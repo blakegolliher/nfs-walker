@@ -26,21 +26,12 @@ const UNHEALTHY_COOLDOWN_SECS: u64 = 30;
 pub const DEFAULT_DNS_REFRESH_SECS: u64 = 60;
 
 /// Health status of an IP address
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct IpHealth {
     /// Consecutive failure count
     failures: u32,
     /// Time when the IP became unhealthy (for cooldown)
     unhealthy_since: Option<Instant>,
-}
-
-impl Default for IpHealth {
-    fn default() -> Self {
-        Self {
-            failures: 0,
-            unhealthy_since: None,
-        }
-    }
 }
 
 impl IpHealth {
