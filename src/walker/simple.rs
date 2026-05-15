@@ -3,33 +3,30 @@
 //! A high-performance implementation that:
 //! 1. Uses READDIRPLUS to get names AND attributes in one RPC call
 //! 2. All workers read directories in parallel (no single coordinator)
-//! 3. Dedicated writer thread handles all DB writes (no mutex contention)
+//! 3. Sharded Parquet writers handle output (no single-writer contention)
 //!
 //! Architecture:
 //! ```text
 //! Directory Queue (crossbeam deque - work stealing)
 //! │
-//! ├── Worker 0: pop dir → READDIRPLUS → send entries → push subdirs
-//! ├── Worker 1: pop dir → READDIRPLUS → send entries → push subdirs
-//! └── Worker N: pop dir → READDIRPLUS → send entries → push subdirs
+//! ├── Worker 0: pop dir → READDIRPLUS → ShardedSender(entry) → push subdirs
+//! ├── Worker 1: pop dir → READDIRPLUS → ShardedSender(entry) → push subdirs
+//! └── Worker N: pop dir → READDIRPLUS → ShardedSender(entry) → push subdirs
 //! │
-//! └── Writer Thread: recv entries → batch insert to RocksDB
+//! └── N Parquet Writer Threads: recv batch → row group → part file
 //! ```
 
-use crate::config::{OutputFormat, WalkConfig};
-use crate::rocksdb::schema::path_to_shard;
+use crate::config::WalkConfig;
 use crate::content::{checksum::compute_gxhash, filetype::detect_file_type as detect_mime_type};
 use crate::error::{Result, WalkerError};
-use crate::nfs::{resolve_dns, NfsConnection, NfsConnectionBuilder};
 use crate::nfs::types::{DbEntry, EntryType};
+use crate::nfs::{resolve_dns, NfsConnection, NfsConnectionBuilder};
 use crate::parquet::direct_writer::{
     spawn_direct_parquet_writers, write_metadata_json as write_direct_metadata_json,
     DirectWriteConfig,
 };
-use crate::rocksdb::{
-    finalize_rocks_db, meta_keys, RocksHandle, RocksWriter, RocksWriterConfig, WalkStatsSnapshot,
-};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crate::walker::sharding::path_to_shard;
+use crossbeam_channel::Sender;
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -213,18 +210,13 @@ impl SimpleWalker {
         }
     }
 
+    /// Drive the scan to completion.
+    ///
+    /// Fans out to `writer_shards` independent streaming Parquet writers
+    /// (see `parquet::direct_writer`). Returns when every worker and
+    /// every writer thread has joined, or with the first error
+    /// encountered.
     pub fn run(&self) -> Result<WalkStats> {
-        match self.config.output_format {
-            OutputFormat::Rocksdb => self.run_rocksdb(),
-            OutputFormat::Parquet => self.run_parquet(),
-        }
-    }
-
-    /// Run walker with direct-write Parquet output. Fans out to
-    /// `writer_shards` independent streaming Parquet writers. No
-    /// RocksDB is involved; incremental rescan is not supported in
-    /// this mode (see `tasks/todo.md`).
-    fn run_parquet(&self) -> Result<WalkStats> {
         let start = Instant::now();
         let shards = self.config.writer_shards.max(1);
 
@@ -380,169 +372,6 @@ impl SimpleWalker {
         result
     }
 
-    /// Run walker with RocksDB output. Fans out to `writer_shards`
-    /// independent writer threads when `--writer-shards N > 1`; legacy
-    /// single-writer behavior for shards == 1.
-    fn run_rocksdb(&self) -> Result<WalkStats> {
-        let start = Instant::now();
-
-        info!("Opening RocksDB: {}", self.config.output_path.display());
-        let rocks_path = self.config.output_path.clone();
-        let shards = self.config.writer_shards.max(1);
-
-        // Build the per-scan metrics handle. The walker's existing atomic
-        // counters are passed by reference so the snapshot thread reads
-        // what the walker writes (no double-bookkeeping).
-        let metrics = self.build_metrics(shards);
-        metrics.set_output_path(rocks_path.clone());
-
-        // Spawn the progress-logfile snapshot thread. Joined in the
-        // unconditional cleanup block at the bottom of this function.
-        let logger_handle = self.maybe_start_logger(metrics.clone(), start);
-
-        // Body wrapped in an IIFE so any `?` lands in `result` without
-        // skipping the logger cleanup below.
-        let result = (|| -> Result<WalkStats> {
-            let rocks_handle: Arc<RocksHandle> = if shards <= 1 {
-                // Single-shard path: legacy single rocks-writer thread.
-                let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(1024);
-                metrics.register_write_sender(entry_tx.clone());
-
-                let writer_handle = self.spawn_rocksdb_writer(
-                    rocks_path.clone(),
-                    entry_rx,
-                    metrics.clone(),
-                )?;
-
-                let workers_result = self.run_workers(vec![entry_tx], metrics.clone());
-
-                // ALWAYS release the observability clone and join the
-                // writer thread, regardless of workers_result. Skipping
-                // either step (e.g. via `?`-propagating workers_result)
-                // would block the writer in recv() forever (channel kept
-                // alive by the metrics-registered clone) or detach the
-                // writer thread (handle dropped without join) — either
-                // way the writer never gets to commit its tail batch.
-                metrics.release_write_senders();
-                let writer_result: Result<Arc<RocksHandle>> = match writer_handle.join() {
-                    Ok(Ok(h)) => Ok(Arc::new(h)),
-                    Ok(Err(e)) => Err(WalkerError::Rocks(e)),
-                    Err(_) => Err(WalkerError::Worker(crate::error::WorkerError::Panicked {
-                        id: 0,
-                        message: "RocksDB writer thread panicked".to_string(),
-                    })),
-                };
-
-                // Workers' error takes precedence (upstream cause); only
-                // surface the writer error if workers succeeded.
-                workers_result?;
-                writer_result?
-            } else {
-                // Multi-shard path: spawn N writers, each owning one
-                // path shard CF. Final summary is the merge of each
-                // shard's accumulator.
-                let (rocks_handle, writer_handles, txs) = self.spawn_sharded_rocksdb_writers(
-                    rocks_path.clone(),
-                    shards,
-                    metrics.clone(),
-                )?;
-                for tx in &txs {
-                    metrics.register_write_sender(tx.clone());
-                }
-
-                let workers_result = self.run_workers(txs, metrics.clone());
-
-                // ALWAYS release observability senders + join writers.
-                // Same reasoning as the single-shard arm above.
-                metrics.release_write_senders();
-                use crate::rocksdb::summary::SummaryAccumulator;
-                let mut merged = SummaryAccumulator::new();
-                let mut writer_err: Option<WalkerError> = None;
-                for (shard_idx, h) in writer_handles.into_iter().enumerate() {
-                    match h.join() {
-                        Ok(Ok(shard_summary)) => {
-                            debug!(
-                                "shard {} contributed: files={} dirs={}",
-                                shard_idx,
-                                shard_summary.total.total_files,
-                                shard_summary.total.total_dirs
-                            );
-                            merged.merge_from(&shard_summary);
-                        }
-                        Ok(Err(e)) => {
-                            if writer_err.is_none() {
-                                writer_err = Some(WalkerError::Rocks(e));
-                            }
-                            warn!("rocks shard writer {} returned error", shard_idx);
-                        }
-                        Err(_) => {
-                            if writer_err.is_none() {
-                                writer_err = Some(WalkerError::Worker(
-                                    crate::error::WorkerError::Panicked {
-                                        id: shard_idx,
-                                        message: format!(
-                                            "RocksDB shard writer {} panicked",
-                                            shard_idx
-                                        ),
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                }
-
-                workers_result?;
-                if let Some(e) = writer_err {
-                    return Err(e);
-                }
-
-                merged.touch_now();
-                let mut wopts = rocksdb::WriteOptions::default();
-                wopts.disable_wal(true);
-                flush_summary_to_cf(&rocks_handle, &merged, &wopts)
-                    .map_err(WalkerError::Rocks)?;
-                rocks_handle.db.flush().map_err(|e| {
-                    WalkerError::Rocks(crate::error::RocksError::Rocks(e))
-                })?;
-
-                rocks_handle
-            };
-
-            // Finalize database
-            info!("Finalizing RocksDB...");
-            let stats_snapshot = WalkStatsSnapshot {
-                dirs: self.dirs_count.load(Ordering::Relaxed),
-                files: self.files_count.load(Ordering::Relaxed),
-                bytes: self.bytes_count.load(Ordering::Relaxed),
-                errors: self.errors_count.load(Ordering::Relaxed),
-            };
-            finalize_rocks_db(
-                &rocks_handle,
-                start.elapsed(),
-                !self.shutdown.load(Ordering::Relaxed),
-                &stats_snapshot,
-            )
-            .map_err(WalkerError::Rocks)?;
-
-            Ok(WalkStats {
-                dirs: stats_snapshot.dirs,
-                files: stats_snapshot.files,
-                bytes: stats_snapshot.bytes,
-                errors: stats_snapshot.errors,
-                duration: start.elapsed(),
-                completed: !self.shutdown.load(Ordering::Relaxed),
-            })
-        })();
-
-        // ALWAYS stop the logger and join its thread.
-        metrics.signal_shutdown();
-        if let Some(h) = logger_handle {
-            let _ = h.join();
-        }
-
-        result
-    }
-
     /// Build a fresh `ScanMetrics` populated with references to the walker's
     /// existing scan counters.
     fn build_metrics(&self, shards: usize) -> Arc<crate::scanlog::ScanMetrics> {
@@ -583,10 +412,9 @@ impl SimpleWalker {
 
     /// Run worker threads.
     ///
-    /// `entry_txs` carries one sender per writer shard. Length 1 selects
-    /// the legacy single-writer fan-in; length N (with the RocksDB
-    /// multi-shard writer) makes each worker route per-entry via
-    /// `gxhash(path) % N` into the matching writer's channel.
+    /// `entry_txs` carries one sender per parquet writer shard. Each
+    /// worker routes per-entry via `gxhash(path) % N` into the matching
+    /// writer's channel.
     fn run_workers(
         &self,
         entry_txs: Vec<Sender<Vec<DbEntry>>>,
@@ -669,10 +497,10 @@ impl SimpleWalker {
         // Spawn workers. A connection failure must NOT short-circuit out
         // of this function via `?` — already-spawned workers below would
         // be detached, their senders would stay alive (cloned into each
-        // thread), and `run_parquet`/`run_rocksdb` would never get to
-        // join the writer threads. Instead, capture the error, signal
-        // shutdown so any already-spawned worker exits its loop, then
-        // fall through to the drop+join cleanup at the end.
+        // thread), and the caller would never get to join the writer
+        // threads. Instead, capture the error, signal shutdown so any
+        // already-spawned worker exits its loop, then fall through to
+        // the drop+join cleanup at the end.
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
         let mut spawn_err: Option<WalkerError> = None;
 
@@ -909,133 +737,7 @@ impl SimpleWalker {
         builder.connect().map_err(|e| WalkerError::Nfs(e))
     }
 
-    /// Spawn N RocksDB writer threads, one per path-CF shard. Returns:
-    ///   - the shared `Arc<RocksHandle>` (kept alive by every writer
-    ///     thread for the duration of the scan; the caller also keeps a
-    ///     copy to write final metadata + finalize),
-    ///   - the join handles, in shard order — each yields the shard's
-    ///     `SummaryAccumulator` on success,
-    ///   - the per-shard `Sender<Vec<DbEntry>>` to thread into workers.
-    #[allow(clippy::type_complexity)]
-    fn spawn_sharded_rocksdb_writers(
-        &self,
-        path: std::path::PathBuf,
-        shards: usize,
-        metrics: Arc<crate::scanlog::ScanMetrics>,
-    ) -> Result<(
-        Arc<RocksHandle>,
-        Vec<JoinHandle<std::result::Result<crate::rocksdb::summary::SummaryAccumulator, crate::error::RocksError>>>,
-        Vec<Sender<Vec<DbEntry>>>,
-    )> {
-        debug_assert!(shards >= 2);
-
-        if path.exists() {
-            std::fs::remove_dir_all(&path).map_err(WalkerError::Io)?;
-        }
-
-        // Open with N path-shard CFs and write initial metadata.
-        let writer = RocksWriter::open_with_shards(
-            &path,
-            shards,
-            RocksWriterConfig::default(),
-        )
-        .map_err(WalkerError::Rocks)?;
-
-        writer
-            .set_metadata(meta_keys::SOURCE_URL, &self.config.nfs_url.to_display_string())
-            .map_err(WalkerError::Rocks)?;
-        writer
-            .set_metadata(meta_keys::START_TIME, &chrono::Utc::now().to_rfc3339())
-            .map_err(WalkerError::Rocks)?;
-        writer
-            .set_metadata(meta_keys::STATUS, "running")
-            .map_err(WalkerError::Rocks)?;
-        writer
-            .set_metadata(meta_keys::WORKER_COUNT, &self.config.worker_count.to_string())
-            .map_err(WalkerError::Rocks)?;
-
-        let handle = Arc::new(writer.into_handle());
-        let batch_size = self.config.batch_size;
-
-        let flush_lock = Arc::new(std::sync::Mutex::new(()));
-        let flush_counter = Arc::new(AtomicU64::new(0));
-
-        let mut txs: Vec<Sender<Vec<DbEntry>>> = Vec::with_capacity(shards);
-        let mut joins: Vec<
-            JoinHandle<
-                std::result::Result<
-                    crate::rocksdb::summary::SummaryAccumulator,
-                    crate::error::RocksError,
-                >,
-            >,
-        > = Vec::with_capacity(shards);
-
-        for shard_idx in 0..shards {
-            let (tx, rx) = bounded::<Vec<DbEntry>>(1024);
-            txs.push(tx);
-            let h = Arc::clone(&handle);
-            let fl = Arc::clone(&flush_lock);
-            let fc = Arc::clone(&flush_counter);
-            let m = Arc::clone(&metrics);
-            let join = thread::Builder::new()
-                .name(format!("rocks-writer-{}", shard_idx))
-                .spawn(move || {
-                    rocksdb_writer_loop_shard(h, shard_idx, rx, batch_size, fl, fc, m)
-                })
-                .expect("Failed to spawn RocksDB shard writer thread");
-            joins.push(join);
-        }
-
-        Ok((handle, joins, txs))
-    }
-
-    
-    fn spawn_rocksdb_writer(
-        &self,
-        path: std::path::PathBuf,
-        entry_rx: Receiver<Vec<DbEntry>>,
-        metrics: Arc<crate::scanlog::ScanMetrics>,
-    ) -> Result<RocksWriterSpawn> {
-        // Create RocksDB with metadata
-        let config = RocksWriterConfig::default();
-
-        // Remove existing directory if present
-        if path.exists() {
-            std::fs::remove_dir_all(&path).map_err(WalkerError::Io)?;
-        }
-
-        // Create writer to initialize database
-        let writer = RocksWriter::open(&path, config)
-            .map_err(WalkerError::Rocks)?;
-
-        // Set initial metadata
-        writer.set_metadata(meta_keys::SOURCE_URL, &self.config.nfs_url.to_display_string())
-            .map_err(WalkerError::Rocks)?;
-        writer.set_metadata(meta_keys::START_TIME, &chrono::Utc::now().to_rfc3339())
-            .map_err(WalkerError::Rocks)?;
-        writer.set_metadata(meta_keys::STATUS, "running")
-            .map_err(WalkerError::Rocks)?;
-        writer.set_metadata(meta_keys::WORKER_COUNT, &self.config.worker_count.to_string())
-            .map_err(WalkerError::Rocks)?;
-
-        let handle = writer.into_handle();
-        let batch_size = self.config.batch_size;
-
-        // Spawn writer thread
-        let join = thread::Builder::new()
-            .name("rocks-writer".to_string())
-            .spawn(move || {
-                rocksdb_writer_loop(handle, entry_rx, batch_size, metrics)
-            })
-            .expect("Failed to spawn RocksDB writer thread");
-
-        Ok(join)
-    }
 }
-
-/// Type alias for the rocksdb writer thread join handle.
-
-type RocksWriterSpawn = JoinHandle<std::result::Result<RocksHandle, crate::error::RocksError>>;
 
 /// Worker thread - processes directories using READDIRPLUS.
 ///
@@ -1946,242 +1648,6 @@ fn worker_loop_pipelined(
 fn ffi_rpc_status_success() -> i32 {
     crate::nfs::connection::ffi::RPC_STATUS_SUCCESS as i32
 }
-
-/// RocksDB writer thread - handles all database writes (single-shard).
-fn rocksdb_writer_loop(
-    handle: RocksHandle,
-    entry_rx: Receiver<Vec<DbEntry>>,
-    batch_size: usize,
-    metrics: Arc<crate::scanlog::ScanMetrics>,
-) -> std::result::Result<RocksHandle, crate::error::RocksError> {
-    use crate::error::RocksError;
-    use crate::rocksdb::summary::SummaryAccumulator;
-
-    use rocksdb::WriteOptions;
-
-    debug!("RocksDB writer thread started with batch_size={}", batch_size);
-
-    let mut total_written = 0u64;
-    let mut pending: Vec<DbEntry> = Vec::with_capacity(batch_size * 2);
-    let mut entries_since_flush = 0u64;
-    let mut writes_since_summary_flush = 0u32;
-    let mut summary = SummaryAccumulator::new();
-
-    const FLUSH_INTERVAL: u64 = 1_000_000;
-    const SUMMARY_FLUSH_EVERY_N_WRITES: u32 = 100;
-
-    let mut write_opts = WriteOptions::default();
-    write_opts.disable_wal(true);
-
-    while let Ok(entries) = entry_rx.recv() {
-        pending.extend(entries);
-
-        if pending.len() >= batch_size {
-            let t = Instant::now();
-            write_rocks_batch_shard(&handle, 0, &pending, &write_opts)?;
-            metrics.record_write_latency(0, t.elapsed());
-            summary.update(&pending);
-            total_written += pending.len() as u64;
-            entries_since_flush += pending.len() as u64;
-            writes_since_summary_flush += 1;
-            pending.clear();
-
-            if writes_since_summary_flush >= SUMMARY_FLUSH_EVERY_N_WRITES {
-                summary.touch_now();
-                flush_summary_to_cf(&handle, &summary, &write_opts)?;
-                writes_since_summary_flush = 0;
-            }
-
-            if entries_since_flush >= FLUSH_INTERVAL {
-                debug!("RocksDB periodic flush at {} entries", total_written);
-                handle.db.flush().map_err(RocksError::Rocks)?;
-                entries_since_flush = 0;
-            }
-        }
-    }
-
-    if !pending.is_empty() {
-        let t = Instant::now();
-        write_rocks_batch_shard(&handle, 0, &pending, &write_opts)?;
-        metrics.record_write_latency(0, t.elapsed());
-        summary.update(&pending);
-        total_written += pending.len() as u64;
-        pending.clear();
-    }
-
-    summary.touch_now();
-    flush_summary_to_cf(&handle, &summary, &write_opts)?;
-    handle.db.flush().map_err(RocksError::Rocks)?;
-
-    debug!(
-        "RocksDB writer thread finished, wrote {} entries (summary: {} files, {} dirs)",
-        total_written, summary.total.total_files, summary.total.total_dirs
-    );
-    Ok(handle)
-}
-
-/// Per-shard writer thread loop for the multi-shard ingest path.
-///
-/// Each shard owns one path-CF and shares the inode CF with its peers
-/// (per-CF memtables + `allow_concurrent_memtable_write` make this
-/// safe). Periodic `db.flush()` is serialized via `flush_lock` so two
-/// shards don't issue overlapping flushes; the accumulator is updated
-/// per-shard and merged once at end-of-scan in the spawning thread.
-
-#[allow(clippy::too_many_arguments)]
-fn rocksdb_writer_loop_shard(
-    handle: Arc<RocksHandle>,
-    shard_idx: usize,
-    entry_rx: Receiver<Vec<DbEntry>>,
-    batch_size: usize,
-    flush_lock: Arc<std::sync::Mutex<()>>,
-    flush_counter: Arc<AtomicU64>,
-    metrics: Arc<crate::scanlog::ScanMetrics>,
-) -> std::result::Result<crate::rocksdb::summary::SummaryAccumulator, crate::error::RocksError> {
-    use crate::error::RocksError;
-    use crate::rocksdb::summary::SummaryAccumulator;
-    use rocksdb::WriteOptions;
-
-    debug!(
-        "RocksDB writer thread (shard {}) started with batch_size={}",
-        shard_idx, batch_size
-    );
-
-    let mut total_written = 0u64;
-    let mut pending: Vec<DbEntry> = Vec::with_capacity(batch_size * 2);
-    let mut summary = SummaryAccumulator::new();
-
-    // Across-shard flush threshold. Any single shard crossing this since
-    // its last contribution triggers one global db.flush(); sharing the
-    // counter (rather than per-shard) avoids amplifying flush count
-    // proportional to N when the ingest rate is fixed.
-    const GLOBAL_FLUSH_INTERVAL: u64 = 1_000_000;
-
-    let mut write_opts = WriteOptions::default();
-    write_opts.disable_wal(true);
-
-    while let Ok(entries) = entry_rx.recv() {
-        pending.extend(entries);
-
-        if pending.len() >= batch_size {
-            let batch_len = pending.len() as u64;
-            let t = Instant::now();
-            write_rocks_batch_shard(&handle, shard_idx, &pending, &write_opts)?;
-            metrics.record_write_latency(shard_idx, t.elapsed());
-            summary.update(&pending);
-            total_written += batch_len;
-            pending.clear();
-
-            // Bump the shared cross-shard counter; check the threshold
-            // outside the mutex so the lock is held only when an actual
-            // flush is needed.
-            flush_counter.fetch_add(batch_len, Ordering::Relaxed);
-        }
-
-        if flush_counter.load(Ordering::Relaxed) >= GLOBAL_FLUSH_INTERVAL {
-            if let Ok(guard) = flush_lock.try_lock() {
-                // Recheck under the lock to avoid duplicate flushes.
-                if flush_counter.load(Ordering::Relaxed) >= GLOBAL_FLUSH_INTERVAL {
-                    debug!(
-                        "RocksDB global flush triggered by shard {}",
-                        shard_idx
-                    );
-                    handle.db.flush().map_err(RocksError::Rocks)?;
-                    flush_counter.store(0, Ordering::Relaxed);
-                }
-                drop(guard);
-            }
-        }
-    }
-
-    if !pending.is_empty() {
-        let t = Instant::now();
-        write_rocks_batch_shard(&handle, shard_idx, &pending, &write_opts)?;
-        metrics.record_write_latency(shard_idx, t.elapsed());
-        summary.update(&pending);
-        total_written += pending.len() as u64;
-        pending.clear();
-    }
-
-    debug!(
-        "RocksDB writer thread (shard {}) finished, wrote {} entries (shard summary: {} files, {} dirs)",
-        shard_idx, total_written, summary.total.total_files, summary.total.total_dirs
-    );
-    Ok(summary)
-}
-
-
-/// Serialize the in-memory accumulator into the five summary keys and
-/// flush them via a single WAL-disabled WriteBatch.
-
-fn flush_summary_to_cf(
-    handle: &RocksHandle,
-    summary: &crate::rocksdb::summary::SummaryAccumulator,
-    write_opts: &rocksdb::WriteOptions,
-) -> std::result::Result<(), crate::error::RocksError> {
-    use crate::error::RocksError;
-    use rocksdb::WriteBatch;
-
-    let cf = match handle.cf_summary() {
-        Some(cf) => cf,
-        // Should not happen for DBs created by this binary. If a primary
-        // somehow opens a legacy DB without the CF, just skip flushing.
-        None => return Ok(()),
-    };
-
-    let kv = summary
-        .serialize_kv()
-        .map_err(|e| RocksError::Bincode(e.to_string()))?;
-
-    let mut batch = WriteBatch::default();
-    for (k, v) in kv {
-        batch.put_cf(cf, k, &v);
-    }
-    handle
-        .db
-        .write_opt(batch, write_opts)
-        .map_err(RocksError::Rocks)
-}
-
-/// Write a batch of entries owned by `shard_idx` to RocksDB.
-///
-/// All entries in the batch must hash to `shard_idx` under
-/// `path_to_shard(...)` — the caller (worker `ShardedSender`) guarantees
-/// this by routing per-entry. The path entry goes to that shard's CF
-/// and the inode entry goes to the (shared) inode CF. Inode-CF
-/// concurrent writes from N shards are safe because RocksDB has
-/// `allow_concurrent_memtable_write = true` set globally.
-
-fn write_rocks_batch_shard(
-    handle: &RocksHandle,
-    shard_idx: usize,
-    entries: &[DbEntry],
-    write_opts: &rocksdb::WriteOptions,
-) -> std::result::Result<(), crate::error::RocksError> {
-    use crate::error::RocksError;
-    use crate::rocksdb::schema::{encode_inode_key, encode_path_key, RocksEntry};
-    use rocksdb::WriteBatch;
-
-    let mut batch = WriteBatch::default();
-    let cf_path = handle.cf_entries_by_path_shard(shard_idx);
-    let cf_inode = handle.cf_entries_by_inode();
-
-    for entry in entries {
-        let rocks_entry = RocksEntry::from_db_entry(entry);
-        let value = rocks_entry
-            .to_bytes()
-            .map_err(|e| RocksError::Bincode(e.to_string()))?;
-
-        let path_key = encode_path_key(&entry.path);
-        let inode_key = encode_inode_key(entry.inode);
-
-        batch.put_cf(&cf_path, &path_key, &value);
-        batch.put_cf(&cf_inode, &inode_key, &value);
-    }
-
-    handle.db.write_opt(batch, write_opts).map_err(RocksError::Rocks)
-}
-
 
 #[cfg(test)]
 mod tests {

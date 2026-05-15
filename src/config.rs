@@ -30,23 +30,16 @@ const MAX_BATCH_SIZE: usize = 100_000;
 /// per context and we'd risk hitting per-context server-side caps.
 const MAX_PIPELINE_DEPTH: usize = 64;
 
-/// Maximum writer-shard count. The cap is set by the RocksDB backend:
-/// its compaction thread pool is shared across CFs and starts to thrash
-/// beyond ~32 shards (per-shard memtable memory grows superlinearly with
-/// no further throughput gain). The Parquet direct-write path has no
-/// shared compaction pool, so this cap is artificially low for it —
-/// the real limit there is per-shard memory for in-flight Arrow
-/// builders. We keep the cap uniform across both backends for simplicity
-/// and because 32 shards has been more than enough on every prod scan
-/// to date. Lifting the cap for parquet alone is a follow-up if a fat
-/// host genuinely wants 64+ parquet shards.
+/// Maximum writer-shard count. The real per-shard cost is one Arrow
+/// builder + ZSTD encoder; 32 has been more than enough on every prod
+/// scan we've run. Raising this is plausible on fat hosts but unproven.
 const MAX_WRITER_SHARDS: usize = 32;
 
-/// Default writer-shard count when `--output-format parquet` is selected
-/// and the user did not pass `--writer-shards`. 32 matches the customer
-/// tuning that motivated this code path (libnfs+DuckDB → 3M files/sec on
-/// a comparable target).
-const DEFAULT_PARQUET_SHARDS: usize = 32;
+/// Default writer-shard count when `--writer-shards` is not passed. 32
+/// matches the customer tuning that motivated this code path
+/// (libnfs+DuckDB → 3 M files/sec) and is the production recommendation
+/// after the 810 M-file bench (see tasks/parquet-experiment-review.md).
+const DEFAULT_WRITER_SHARDS: usize = 32;
 
 /// Regex for parsing NFS URLs
 static NFS_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -54,41 +47,35 @@ static NFS_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:nfs://)?([^:/]+)(:\d+)?(/[^\s]*)$").expect("Invalid NFS URL regex")
 });
 
-/// High-performance NFS filesystem walker. Scans to RocksDB; export to Parquet or SQLite afterwards.
+/// High-performance NFS filesystem walker. Streams directly to sharded Parquet.
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "nfs-walker",
     version,
-    about = "High-performance NFS filesystem scanner (RocksDB output, Parquet/SQLite export)",
+    about = "High-performance NFS filesystem scanner (sharded Parquet output)",
     long_about = "Walks an NFS filesystem using direct libnfs READDIRPLUS calls with parallel workers.\n\n\
-                  Output is always RocksDB (.rocks). Export to Parquet for analytics, or SQLite for ad-hoc SQL, after the scan.\n\n\
+                  Output is sharded Parquet: scans/<scan_id>/part-rNN-SSSSS.parquet + metadata.json.\n\
+                  Read directly with DuckDB / DataFusion / Polars; no post-hoc conversion step.\n\n\
                   Typical workflow:\n\
-                  1. Scan:    nfs-walker nfs://server/export -o scan.rocks -w 32\n\
-                  2. Export:  nfs-walker export-parquet scan.rocks ./parquet-out -p --parallelism 64\n\
-                              (or: nfs-walker export-sql scan.rocks scan.db -p)\n\
-                  3. Stats:   nfs-walker stats scan.rocks",
+                  1. Scan:   nfs-walker nfs://server/export -o scan.parquet -w 32\n\
+                  2. Stats:  nfs-walker stats scan.parquet\n\
+                  3. Query:  duckdb -c \"SELECT count(*) FROM 'scan.parquet/scans/*/part-*.parquet'\"",
     after_help = "\
 EXAMPLES:
-  Scan an NFS export to RocksDB:
-    nfs-walker nfs://server/export -o scan.rocks -w 32
+  Scan an NFS export:
+    nfs-walker nfs://server/export -o scan.parquet -w 32
 
   Scan with exclusions and depth limit:
-    nfs-walker nfs://server/data --exclude '.snapshot' --exclude '\\.Trash' -d 10 -o scan.rocks
-
-  Export RocksDB to Parquet for analytics (DuckDB / DataFusion):
-    nfs-walker export-parquet scan.rocks ./parquet-out -p --parallelism 64
-
-  Export RocksDB to SQLite for ad-hoc SQL queries:
-    nfs-walker export-sql scan.rocks scan.db -p
+    nfs-walker nfs://server/data --exclude '.snapshot' --exclude '\\.Trash' -d 10 -o scan.parquet
 
   Show scan overview (counts, total size, max depth):
-    nfs-walker stats scan.rocks
+    nfs-walker stats scan.parquet
 
   Disable the per-scan progress logfile (default writes <output>.log):
-    nfs-walker nfs://server/export -o scan.rocks --no-log
+    nfs-walker nfs://server/export -o scan.parquet --no-log
 
   Emit JSON-lines progress log every 10s instead of text every 5s:
-    nfs-walker nfs://server/export -o scan.rocks --log-fmt json --log-interval-secs 10
+    nfs-walker nfs://server/export -o scan.parquet --log-fmt json --log-interval-secs 10
 
 NOTE: For large scans (>100M files), write output to a filesystem with enough space.
       Use 'ulimit -n 65536' if you hit 'too many open files' errors.",
@@ -104,13 +91,9 @@ pub struct CliArgs {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Output RocksDB directory (default: walk.rocks)
-    #[arg(short, long, default_value = "walk.rocks", value_name = "PATH")]
+    /// Output directory for the Parquet scan (default: walk.parquet)
+    #[arg(short, long, default_value = "walk.parquet", value_name = "PATH")]
     pub output: PathBuf,
-
-    /// RocksDB baseline for incremental scans
-    #[arg(long, value_name = "PATH", help = "RocksDB baseline for incremental scan comparison")]
-    pub baseline: Option<PathBuf>,
 
     /// Number of worker threads for parallel GETATTR
     #[arg(
@@ -125,12 +108,11 @@ pub struct CliArgs {
     #[arg(long, default_value = "10000", value_name = "NUM")]
     pub queue_size: usize,
 
-    /// Batch size sent from each worker to the writer thread. Larger
-    /// batches mean fewer cross-thread sends and bigger RocksDB
-    /// WriteBatch transactions, which reduces contention from
-    /// ≥hundreds of producers. 5000 is a good default for billion-entry
-    /// scans on multi-core hosts; drop to 1000 for tiny exports or
-    /// low-memory environments.
+    /// Batch size sent from each worker to the writer threads. Larger
+    /// batches mean fewer cross-thread sends and larger Arrow row groups,
+    /// which reduces contention from ≥hundreds of producers. 5000 is a
+    /// good default for billion-entry scans on multi-core hosts; drop to
+    /// 1000 for tiny exports or low-memory environments.
     #[arg(short = 'b', long, default_value = "5000", value_name = "NUM")]
     pub batch_size: usize,
 
@@ -208,62 +190,49 @@ pub struct CliArgs {
     #[arg(long, default_value = "1000000", value_name = "N")]
     pub big_dir_split_after: u64,
 
-    /// Number of writer shards. 1 = legacy single-writer path (RocksDB
-    /// only). Higher values split the entries-by-path keyspace into N
-    /// independent shards each owned by its own writer thread. For
-    /// `--output-format rocksdb` (default) the recommended range is 8-16
-    /// and the hard cap is 32 (compaction-pool thrash above that). For
-    /// `--output-format parquet` the per-shard cost is just an Arrow
-    /// builder + ZSTD encoder so 32 is the typical sweet spot (matches
-    /// the customer baseline this path was designed to chase).
-    ///
-    /// When unset, the default is 1 in rocksdb mode and 32 in parquet
-    /// mode.
+    /// Number of writer shards. Splits the entries-by-path keyspace into
+    /// N independent shards each owned by its own writer thread. The
+    /// per-shard cost is one Arrow builder + ZSTD encoder, so 32 (the
+    /// default) is the typical sweet spot and matches the customer
+    /// baseline this code path was designed to chase. The hard cap is
+    /// 32; raising it on a fat host is plausible but unproven.
     #[arg(long, value_name = "N")]
     pub writer_shards: Option<usize>,
 
-    /// Output backend. `rocksdb` (default) writes a RocksDB directory
-    /// suitable for incremental rescans and post-hoc export. `parquet`
-    /// streams entries directly to sharded Parquet files (one set per
-    /// `--writer-shards`) — much faster on writer-bound scans, but loses
-    /// the incremental-rescan capability (no baseline state store).
-    #[arg(long, value_enum, default_value_t = OutputFormat::Rocksdb, value_name = "FMT")]
-    pub output_format: OutputFormat,
-
-    /// Parquet compression algorithm (direct-write only). `snappy` is
-    /// the default — fastest encoder with ~30% file-size penalty vs
-    /// ZSTD-3; the standard choice for streaming Parquet workloads
-    /// where write throughput matters more than max compression.
-    /// Override to `zstd3` for compatibility with the post-hoc
-    /// converter's defaults, or `none` to diagnose whether the encoder
-    /// is the bottleneck.
-    #[arg(long, value_enum, default_value_t = ParquetCompression::Snappy, value_name = "ALG")]
+    /// Parquet compression algorithm. `zstd3` (the default) is the
+    /// production recommendation after the 810 M-file bench: 49 GiB
+    /// output vs 59 GiB for Snappy, only 2.3% slower wall on 128 cores.
+    /// On small (≤16-core) hosts Snappy may win because ZSTD goes
+    /// CPU-bound; use `none` to diagnose whether the encoder is the
+    /// bottleneck on a given host.
+    #[arg(long, value_enum, default_value_t = ParquetCompression::Zstd3, value_name = "ALG")]
     pub parquet_compression: ParquetCompression,
 
-    /// Parquet row-group size in rows (direct-write only). Default
-    /// 256_000 spreads the encoding/IO work across the scan instead of
-    /// dumping it at end. Smaller groups reduce tail-flush time;
-    /// larger groups improve downstream query predicate pushdown.
+    /// Parquet row-group size in rows. Default 256_000 spreads the
+    /// encoding/IO work across the scan instead of dumping it at end.
+    /// Smaller groups reduce tail-flush time; larger groups improve
+    /// downstream query predicate pushdown.
     #[arg(long, default_value = "256000", value_name = "N")]
     pub parquet_row_group_size: usize,
 
-    /// Parquet part-file rotation threshold in MiB (direct-write only).
-    /// Once a shard's current file exceeds this, the writer closes it
-    /// and starts a fresh `part-rNN-SSSSS+1.parquet`.
+    /// Parquet part-file rotation threshold in MiB. Once a shard's
+    /// current file exceeds this, the writer closes it and starts a
+    /// fresh `part-rNN-SSSSS+1.parquet`.
     #[arg(long, default_value = "512", value_name = "MB")]
     pub parquet_file_size_mb: usize,
 
-    /// Per-shard parquet channel depth, in batches (direct-write only).
-    /// Caps the worst-case in-flight memory at roughly
-    /// `channel_depth × writer_shards × batch_size × ~200B`. Default
-    /// 64 keeps the ceiling near 2 GiB; lower on tight-memory hosts,
-    /// raise on big production hosts (1.4 TiB transfer hosts can use
-    /// 1024 with no risk).
+    /// Per-shard parquet channel depth, in batches. Caps the worst-case
+    /// in-flight memory at roughly
+    /// `channel_depth × writer_shards × batch_size × ~200B`. Default 64
+    /// keeps the ceiling near 2 GiB; lower on tight-memory hosts, raise
+    /// on big production hosts (1.4 TiB transfer hosts can use 1024
+    /// with no risk).
     #[arg(long, default_value = "64", value_name = "N")]
     pub parquet_channel_depth: usize,
 
-    /// Override the per-scan progress logfile path. Default is `<output>.log`
-    /// (sidecar next to the RocksDB directory). Disabled with --no-log.
+    /// Override the per-scan progress logfile path. Default is
+    /// `<output>.log` (sidecar next to the scan output directory).
+    /// Disabled with --no-log.
     #[arg(long, value_name = "PATH")]
     pub log: Option<PathBuf>,
 
@@ -290,19 +259,7 @@ pub enum LogFormat {
     Json,
 }
 
-/// Walker output backend. Selected at scan time; cannot be mixed in one
-/// scan.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum OutputFormat {
-    /// Write to a RocksDB directory (default; supports incremental
-    /// rescans, post-hoc export to Parquet/SQLite, and resume).
-    Rocksdb,
-    /// Stream entries directly to sharded Parquet files. Faster but
-    /// drops the incremental-rescan capability.
-    Parquet,
-}
-
-/// Compression algorithm for direct-write Parquet output.
+/// Compression algorithm for the streaming Parquet writer.
 ///
 /// Maps to `parquet::basic::Compression` in `direct_writer.rs`. CLI
 /// values include the explicit ZSTD levels we care about so users
@@ -311,7 +268,7 @@ pub enum OutputFormat {
 pub enum ParquetCompression {
     /// ZSTD level 1 (fastest, still reasonable ratio).
     Zstd1,
-    /// ZSTD level 3 (default; matches post-hoc converter).
+    /// ZSTD level 3 (production default; best balance on 128c).
     Zstd3,
     /// ZSTD level 6 (best ratio, slow).
     Zstd6,
@@ -343,63 +300,10 @@ impl ParquetCompression {
 /// Subcommands
 #[derive(clap::Subcommand, Debug, Clone)]
 pub enum Command {
-    /// Export RocksDB scan to a SQLite database (for ad-hoc SQL queries).
-    ExportSql {
-        /// Input RocksDB directory from a previous scan
-        #[arg(value_name = "INPUT")]
-        input: PathBuf,
-
-        /// Output SQLite file (.db)
-        #[arg(value_name = "OUTPUT")]
-        output: PathBuf,
-
-        /// Show conversion progress
-        #[arg(short = 'p', long)]
-        progress: bool,
-    },
-
-    /// Export RocksDB scan to Parquet files (for analytics/DataFusion)
-    #[cfg(feature = "parquet")]
-    ExportParquet {
-        /// Input RocksDB directory
-        #[arg(value_name = "INPUT")]
-        input: PathBuf,
-
-        /// Output directory for Parquet files
-        #[arg(value_name = "OUTPUT_DIR")]
-        output_dir: PathBuf,
-
-        /// Show export progress
-        #[arg(short = 'p', long)]
-        progress: bool,
-
-        /// Target file size in MB before splitting
-        #[arg(long, default_value = "256")]
-        file_size_mb: usize,
-
-        /// Rows per row group
-        #[arg(long, default_value = "1000000")]
-        row_group_size: usize,
-
-        /// ZSTD compression level (1-22)
-        #[arg(long, default_value = "3")]
-        compression_level: i32,
-
-        /// Number of parallel shards. 1 selects the legacy single-threaded
-        /// path; values above 1 enable the SST-balanced parallel exporter.
-        /// Set to roughly num_cpus on many-core boxes; on a 160-core /
-        /// NVMe-backed RocksDB the useful range is 64-128 (NVMe saturates
-        /// past that). Bump `ulimit -n` first — RocksDB read-only mode
-        /// keeps every SST file open, and large databases may exceed the
-        /// default file-descriptor limit.
-        #[arg(long, default_value = "1", value_name = "N")]
-        parallelism: usize,
-    },
-
     /// Start analytics server for querying scan data
     #[cfg(feature = "server")]
     Serve {
-        /// Directory containing exported Parquet scans
+        /// Directory containing Parquet scan output
         #[arg(long, value_name = "DIR")]
         data_dir: std::path::PathBuf,
 
@@ -412,17 +316,11 @@ pub enum Command {
         bind: String,
     },
 
-    /// Show overview statistics for a RocksDB scan (counts, total size, max depth).
+    /// Show overview statistics for a Parquet scan (counts, total size, max depth).
     Stats {
-        /// RocksDB database path from a previous scan
-        #[arg(value_name = "DB")]
-        db: PathBuf,
-
-        /// Open the database in RocksDB secondary mode for live querying
-        /// while a scan is still writing to it. Slightly slower than the
-        /// default read-only mode but tolerates concurrent compactions.
-        #[arg(long)]
-        live: bool,
+        /// Parquet scan directory from a previous scan
+        #[arg(value_name = "SCAN_DIR")]
+        scan_dir: PathBuf,
     },
 }
 
@@ -578,11 +476,8 @@ pub struct WalkConfig {
     /// Parsed NFS URL
     pub nfs_url: NfsUrl,
 
-    /// Output RocksDB directory path
+    /// Output Parquet scan directory path
     pub output_path: PathBuf,
-
-    /// RocksDB baseline path for incremental scans
-    pub baseline_path: Option<PathBuf>,
 
     /// Number of worker threads
     pub worker_count: usize,
@@ -630,23 +525,20 @@ pub struct WalkConfig {
     /// 0 = legacy serial worker loop. >0 selects the pipelined worker.
     pub pipeline_depth: usize,
 
-    /// Number of writer shards (1 = legacy single-writer path).
-    /// Validated to 1..=32 in `from_args`.
+    /// Number of writer shards. Validated to 1..=MAX_WRITER_SHARDS in
+    /// `from_args`.
     pub writer_shards: usize,
 
-    /// Output backend (RocksDB or direct-write Parquet).
-    pub output_format: OutputFormat,
-
-    /// Compression for direct-write parquet output.
+    /// Compression algorithm for parquet output.
     pub parquet_compression: ParquetCompression,
 
-    /// Row-group size for direct-write parquet output.
+    /// Row-group size for parquet output.
     pub parquet_row_group_size: usize,
 
-    /// File-rotation threshold (bytes) for direct-write parquet output.
+    /// File-rotation threshold (bytes) for parquet output.
     pub parquet_file_size_bytes: usize,
 
-    /// Per-shard channel depth for direct-write parquet output.
+    /// Per-shard channel depth for parquet output.
     pub parquet_channel_depth: usize,
 
     /// Explicit server VIPs to use, bypassing DNS resolution. Empty
@@ -743,14 +635,11 @@ impl WalkConfig {
             });
         }
 
-        // Resolve writer-shard count. Default depends on backend:
-        // rocksdb → 1 (legacy behavior), parquet → DEFAULT_PARQUET_SHARDS.
-        // An explicit `--writer-shards N` always wins; we validate after
-        // applying the default so the cap applies uniformly.
-        let writer_shards = args.writer_shards.unwrap_or(match args.output_format {
-            OutputFormat::Rocksdb => 1,
-            OutputFormat::Parquet => DEFAULT_PARQUET_SHARDS,
-        });
+        // Resolve writer-shard count. The default (32) matches the
+        // production recommendation from the 810 M-file bench; explicit
+        // `--writer-shards N` always wins. Validate after applying the
+        // default so the cap applies uniformly.
+        let writer_shards = args.writer_shards.unwrap_or(DEFAULT_WRITER_SHARDS);
         if writer_shards == 0 || writer_shards > MAX_WRITER_SHARDS {
             return Err(ConfigError::InvalidWriterShards {
                 shards: writer_shards,
@@ -812,18 +701,8 @@ impl WalkConfig {
             }
         }
 
-        // Validate baseline path if provided
-        if let Some(ref baseline) = args.baseline {
-            if !baseline.exists() {
-                return Err(ConfigError::InvalidResumeDb {
-                    path: baseline.clone(),
-                    reason: "Baseline database does not exist".to_string(),
-                });
-            }
-        }
-
         // Resolve the progress-logfile destination.
-        // Default sidecar path is `<output>.log` (e.g. scan.rocks.log).
+        // Default sidecar path is `<output>.log` (e.g. scan.parquet.log).
         let log = if args.no_log {
             None
         } else {
@@ -842,7 +721,6 @@ impl WalkConfig {
         Ok(Self {
             nfs_url,
             output_path: args.output,
-            baseline_path: args.baseline,
             worker_count: args.workers,
             queue_size: args.queue_size,
             batch_size: args.batch_size,
@@ -860,7 +738,6 @@ impl WalkConfig {
             pipeline_depth: args.pipeline_depth,
             writer_shards,
             big_dir_split_after: args.big_dir_split_after,
-            output_format: args.output_format,
             parquet_compression: args.parquet_compression,
             parquet_row_group_size: args.parquet_row_group_size.max(1),
             parquet_file_size_bytes: args.parquet_file_size_mb.max(1).saturating_mul(1024 * 1024),
@@ -930,8 +807,7 @@ mod tests {
     fn test_exclude_pattern() {
         let config = WalkConfig {
             nfs_url: NfsUrl::parse("nfs://s/e").unwrap(),
-            output_path: PathBuf::from("test.rocks"),
-            baseline_path: None,
+            output_path: PathBuf::from("test.parquet"),
             worker_count: 4,
             queue_size: 1000,
             batch_size: 1000,
@@ -949,8 +825,7 @@ mod tests {
             pipeline_depth: 0,
             writer_shards: 1,
             big_dir_split_after: 0,
-            output_format: OutputFormat::Rocksdb,
-            parquet_compression: ParquetCompression::Snappy,
+            parquet_compression: ParquetCompression::Zstd3,
             parquet_row_group_size: 256_000,
             parquet_file_size_bytes: 512 * 1024 * 1024,
             parquet_channel_depth: 64,

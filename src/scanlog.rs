@@ -2,7 +2,7 @@
 //!
 //! When a scan starts, the walker creates an `Arc<ScanMetrics>` and a
 //! background snapshot thread (via [`start_logger`]). Workers and the
-//! RocksDB writer report:
+//! parquet writers report:
 //!
 //! - per-worker NFS RPC durations (`record_nfs_latency`),
 //! - per-shard write-batch durations (`record_write_latency`),
@@ -98,7 +98,7 @@ pub struct ScanMetrics {
     /// Cloned senders used by writers — the snapshot thread reads `.len()`
     /// to estimate write-channel pressure.
     pub write_senders: Mutex<Vec<Sender<Vec<DbEntry>>>>,
-    /// Path to the RocksDB output dir (so the snapshot thread can sample
+    /// Path to the scan output dir (so the snapshot thread can sample
     /// on-disk size).
     output_path: Mutex<Option<PathBuf>>,
 
@@ -479,7 +479,7 @@ fn emit_text(
         "    write_batch      avg={:>5}us  p99={:>5}us  n={}  queue={}",
         writes.avg_us, writes.p99_us, writes.count, queue_str,
     )?;
-    writeln!(writer, "    rocksdb          size={size_h}  errors={}", snap.errors)?;
+    writeln!(writer, "    output           size={size_h}  errors={}", snap.errors)?;
     if !snap.hot_dirs.is_empty() {
         writeln!(writer, "    hot dirs:")?;
         for (worker_id, hd) in &snap.hot_dirs {

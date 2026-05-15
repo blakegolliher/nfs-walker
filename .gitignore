@@ -2,6 +2,12 @@
 /target/
 /build/
 
+# Loose nfs-walker binaries dropped at the repo root (debug copies,
+# downloaded release artifacts, etc.). The static-musl build can be
+# 350 MiB unstripped — don't commit one by accident.
+/nfs-walker
+/nfs-walker-*
+
 # Cargo lock (optional - include for binaries, exclude for libraries)
 # Cargo.lock
 

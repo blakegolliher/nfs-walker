@@ -1,7 +1,8 @@
-# Build nfs-walker with RocksDB as a fully static musl binary
+# Build nfs-walker as a fully static musl binary.
 #
-# Uses Alpine Linux (musl-based) with static C++ linking.
-# The resulting binary works on ANY Linux system.
+# Uses Alpine Linux (musl-based) with static C linking. The resulting
+# binary works on ANY Linux system without needing a matching glibc.
+# Output is sharded Parquet — there is no RocksDB dependency.
 #
 # Usage:
 #   podman build -f Dockerfile.musl -t nfs-walker-musl .
@@ -10,29 +11,17 @@
 
 FROM docker.io/library/rust:1.92.0-alpine as builder
 
-# Install build dependencies for musl + C++ + RocksDB
+# Install build dependencies for musl + libnfs + parquet codecs.
 RUN apk add --no-cache \
     build-base \
     musl-dev \
-    g++ \
-    clang \
-    clang-dev \
-    clang-static \
-    llvm-dev \
-    linux-headers \
     git \
     autoconf \
     automake \
     libtool \
     pkgconf \
-    lz4-dev \
-    lz4-static \
     zstd-dev \
     zstd-static \
-    snappy-dev \
-    snappy-static \
-    bzip2-dev \
-    bzip2-static \
     zlib-dev \
     zlib-static
 

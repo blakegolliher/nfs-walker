@@ -2,7 +2,7 @@
 //!
 //! These tests walk a real NFS export with both `--pipeline-depth 0`
 //! (legacy serial worker) and `--pipeline-depth 8` (pipelined worker),
-//! then compare the resulting databases entry-for-entry.
+//! then compare the resulting Parquet scans entry-for-entry.
 //!
 //! They are `#[ignore]`'d by default because they require a real (or
 //! loopback) NFS server. To run:
@@ -17,11 +17,13 @@
 //!
 //! See `docs/PIPELINED_READDIRPLUS_DESIGN.md` §8 for the full test plan.
 
-use nfs_walker::config::{NfsUrl, OutputFormat, ParquetCompression, WalkConfig};
-use nfs_walker::rocksdb::RocksHandle;
+use arrow::array::StringArray;
+use nfs_walker::config::{NfsUrl, ParquetCompression, WalkConfig};
 use nfs_walker::walker::SimpleWalker;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -34,7 +36,6 @@ fn make_config(url: NfsUrl, output_path: PathBuf, pipeline_depth: usize) -> Walk
     WalkConfig {
         nfs_url: url,
         output_path,
-        baseline_path: None,
         worker_count: 4,
         queue_size: 1000,
         batch_size: 1000,
@@ -52,27 +53,52 @@ fn make_config(url: NfsUrl, output_path: PathBuf, pipeline_depth: usize) -> Walk
         pipeline_depth,
         writer_shards: 1,
         big_dir_split_after: 0,
-        output_format: OutputFormat::Rocksdb,
-        parquet_compression: ParquetCompression::Snappy,
+        parquet_compression: ParquetCompression::Zstd3,
         parquet_row_group_size: 256_000,
         parquet_file_size_bytes: 512 * 1024 * 1024,
         parquet_channel_depth: 64,
+        server_ips: vec![],
         log: None,
     }
 }
 
-/// Pull every (path, entry_type) from the RocksDB and return a stable,
-/// comparable representation. We use BTreeSet so order differences
-/// between the two walkers don't fail equality.
-fn paths_in_db(db: &PathBuf) -> BTreeSet<(String, i64)> {
-    let handle = RocksHandle::open_readonly(db).expect("open rocksdb readonly");
-    handle
-        .iter_by_path()
-        .map(|res| {
-            let entry = res.expect("iterate entry");
-            (entry.path, entry.entry_type as i64)
-        })
-        .collect()
+/// Pull every (path, file_type) from the Parquet scan and return a
+/// stable, comparable representation. BTreeSet so writer-shard order
+/// doesn't matter.
+fn paths_in_scan(scan_root: &Path) -> BTreeSet<(String, String)> {
+    let mut out = BTreeSet::new();
+    let scans = scan_root.join("scans");
+    let scan_dir = std::fs::read_dir(&scans)
+        .expect("scans/ dir")
+        .next()
+        .expect("at least one scan-id dir")
+        .expect("scan-id readdir")
+        .path();
+    for entry in std::fs::read_dir(&scan_dir).expect("read scan dir") {
+        let p = entry.expect("read entry").path();
+        if p.extension().is_some_and(|e| e == "parquet") {
+            let file = File::open(&p).expect("open parquet");
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                .expect("parquet builder")
+                .build()
+                .expect("parquet reader");
+            for batch in reader {
+                let batch = batch.expect("read batch");
+                let path_col = batch
+                    .column_by_name("path")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .expect("path column");
+                let ft_col = batch
+                    .column_by_name("file_type")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .expect("file_type column");
+                for i in 0..batch.num_rows() {
+                    out.insert((path_col.value(i).to_string(), ft_col.value(i).to_string()));
+                }
+            }
+        }
+    }
+    out
 }
 
 #[test]
@@ -87,11 +113,11 @@ fn pipelined_and_legacy_produce_equal_path_sets() {
     };
 
     let workdir = tempdir().expect("tempdir");
-    let baseline_db = workdir.path().join("baseline.rocks");
-    let pipelined_db = workdir.path().join("pipelined.rocks");
+    let baseline_root = workdir.path().join("baseline.parquet");
+    let pipelined_root = workdir.path().join("pipelined.parquet");
 
     // Run baseline (legacy serial worker).
-    let baseline_cfg = make_config(url.clone(), baseline_db.clone(), 0);
+    let baseline_cfg = make_config(url.clone(), baseline_root.clone(), 0);
     let baseline_stats = SimpleWalker::new(baseline_cfg)
         .run()
         .expect("baseline run");
@@ -104,7 +130,7 @@ fn pipelined_and_legacy_produce_equal_path_sets() {
     );
 
     // Run pipelined.
-    let pipelined_cfg = make_config(url, pipelined_db.clone(), 8);
+    let pipelined_cfg = make_config(url, pipelined_root.clone(), 8);
     let pipelined_stats = SimpleWalker::new(pipelined_cfg)
         .run()
         .expect("pipelined run");
@@ -125,8 +151,8 @@ fn pipelined_and_legacy_produce_equal_path_sets() {
         "file count mismatch"
     );
 
-    let baseline_paths = paths_in_db(&baseline_db);
-    let pipelined_paths = paths_in_db(&pipelined_db);
+    let baseline_paths = paths_in_scan(&baseline_root);
+    let pipelined_paths = paths_in_scan(&pipelined_root);
 
     let only_baseline: Vec<_> = baseline_paths
         .difference(&pipelined_paths)

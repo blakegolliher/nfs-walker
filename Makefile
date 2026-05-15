@@ -1,19 +1,21 @@
 # nfs-walker Makefile
 #
 # Targets:
-#   make / make build  - Build release binary with glibc
-#   make release       - Build static musl binary for distribution
-#   make debug         - Build debug binary
+#   make / make build  - Native release build (glibc-linked)
+#   make release       - Static musl binary for distribution
+#   make debug         - Debug build
+#   make docker-rocky  - Rocky-9 build via Docker (analytics server + dashboard)
+#   make docker-musl   - Static musl build via Docker
 #   make test          - Run all tests
-#   make bench         - Run benchmarks
+#   make check         - Run clippy + format check
+#   make fmt           - Format code
 #   make clean         - Remove all build artifacts
 #   make install-deps  - Install system dependencies
-#   make check         - Run clippy and format check
-#   make fmt           - Format code
+#   make install-musl  - Install musl toolchain
 #   make help          - Show this help
 
 SHELL := /bin/bash
-.PHONY: all build release release-rocks debug static test bench clean install-deps install-musl check fmt help docker-rocky docker-musl docker-release
+.PHONY: all build release debug test clean clean-cache install-deps install-musl check fmt help docker-rocky docker-musl info list
 
 # Project info
 PROJECT_NAME := nfs-walker
@@ -33,12 +35,12 @@ MUSL_BIN := $(TARGET_DIR)/$(MUSL_TARGET)/release/$(PROJECT_NAME)
 RELEASE_BINARY := $(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)
 LATEST_LINK := $(BUILD_DIR)/$(PROJECT_NAME)
 
-# Colors for output
+# Colors
 RED := \033[0;31m
 GREEN := \033[0;32m
 YELLOW := \033[0;33m
 BLUE := \033[0;34m
-NC := \033[0m # No Color
+NC := \033[0m
 
 #------------------------------------------------------------------------------
 # Default target
@@ -46,77 +48,7 @@ NC := \033[0m # No Color
 all: build
 
 #------------------------------------------------------------------------------
-# Release target - produces static musl binary for distribution
-#------------------------------------------------------------------------------
-release:
-	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) release (static musl, no RocksDB)...$(NC)"
-	@if ! rustup target list --installed | grep -q $(MUSL_TARGET); then \
-		echo -e "$(YELLOW)Installing musl target...$(NC)"; \
-		rustup target add $(MUSL_TARGET); \
-	fi
-	@if ! command -v musl-gcc &> /dev/null; then \
-		echo -e "$(RED)✗ musl-gcc not found. Run: make install-musl$(NC)"; \
-		exit 1; \
-	fi
-	@mkdir -p $(BUILD_DIR)
-	@RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target $(MUSL_TARGET) --no-default-features 2>&1 | tee $(BUILD_DIR)/build-release.log; \
-	BUILD_STATUS=$${PIPESTATUS[0]}; \
-	if [ $$BUILD_STATUS -eq 0 ]; then \
-		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)"; \
-		cp $(MUSL_BIN) $(BUILD_DIR)/$$RELEASE_NAME; \
-		chmod +x $(BUILD_DIR)/$$RELEASE_NAME; \
-		rm -f $(LATEST_LINK); \
-		ln -s $$RELEASE_NAME $(LATEST_LINK); \
-		echo -e "$(GREEN)✓ Release build successful$(NC)"; \
-		echo -e "  Binary: $(BUILD_DIR)/$$RELEASE_NAME"; \
-		echo -e "  Symlink: $(LATEST_LINK) -> $$RELEASE_NAME"; \
-		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size: " $$5}'; \
-		echo -e "  Type: Static (musl) - no dependencies"; \
-		file $(BUILD_DIR)/$$RELEASE_NAME | sed 's/^/  /'; \
-	else \
-		echo -e "$(RED)✗ Release build failed$(NC)"; \
-		echo -e "  See $(BUILD_DIR)/build-release.log for details"; \
-		echo -e "  You may need to run: make install-musl"; \
-		exit 1; \
-	fi
-
-#------------------------------------------------------------------------------
-# Release target with RocksDB support - static musl binary
-#------------------------------------------------------------------------------
-release-rocks:
-	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) release with RocksDB (static musl)...$(NC)"
-	@if ! rustup target list --installed | grep -q $(MUSL_TARGET); then \
-		echo -e "$(YELLOW)Installing musl target...$(NC)"; \
-		rustup target add $(MUSL_TARGET); \
-	fi
-	@if ! command -v musl-gcc &> /dev/null; then \
-		echo -e "$(RED)✗ musl-gcc not found. Run: make install-musl$(NC)"; \
-		exit 1; \
-	fi
-	@mkdir -p $(BUILD_DIR)
-	@RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target $(MUSL_TARGET) 2>&1 | tee $(BUILD_DIR)/build-release-rocks.log; \
-	BUILD_STATUS=$${PIPESTATUS[0]}; \
-	if [ $$BUILD_STATUS -eq 0 ]; then \
-		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-rocks"; \
-		cp $(MUSL_BIN) $(BUILD_DIR)/$$RELEASE_NAME; \
-		chmod +x $(BUILD_DIR)/$$RELEASE_NAME; \
-		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-rocks; \
-		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-rocks; \
-		echo -e "$(GREEN)✓ Release build with RocksDB successful$(NC)"; \
-		echo -e "  Binary: $(BUILD_DIR)/$$RELEASE_NAME"; \
-		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-rocks -> $$RELEASE_NAME"; \
-		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size: " $$5}'; \
-		echo -e "  Type: Static (musl) with RocksDB - no dependencies"; \
-		file $(BUILD_DIR)/$$RELEASE_NAME | sed 's/^/  /'; \
-	else \
-		echo -e "$(RED)✗ Release build with RocksDB failed$(NC)"; \
-		echo -e "  See $(BUILD_DIR)/build-release-rocks.log for details"; \
-		echo -e "  You may need to run: make install-musl"; \
-		exit 1; \
-	fi
-
-#------------------------------------------------------------------------------
-# Build release binary with date stamp
+# Native release build (links against system glibc + libnfs)
 #------------------------------------------------------------------------------
 build:
 	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION)...$(NC)"
@@ -129,9 +61,9 @@ build:
 		rm -f $(LATEST_LINK); \
 		ln -s $(RELEASE_BINARY) $(LATEST_LINK); \
 		echo -e "$(GREEN)✓ Build successful$(NC)"; \
-		echo -e "  Binary: $(BUILD_DIR)/$(RELEASE_BINARY)"; \
+		echo -e "  Binary:  $(BUILD_DIR)/$(RELEASE_BINARY)"; \
 		echo -e "  Symlink: $(LATEST_LINK) -> $(RELEASE_BINARY)"; \
-		ls -lh $(BUILD_DIR)/$(RELEASE_BINARY) | awk '{print "  Size: " $$5}'; \
+		ls -lh $(BUILD_DIR)/$(RELEASE_BINARY) | awk '{print "  Size:    " $$5}'; \
 	else \
 		echo -e "$(RED)✗ Build failed$(NC)"; \
 		echo -e "  See $(BUILD_DIR)/build.log for details"; \
@@ -139,7 +71,41 @@ build:
 	fi
 
 #------------------------------------------------------------------------------
-# Build debug binary
+# Static musl binary — works on any Linux
+#------------------------------------------------------------------------------
+release:
+	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) (static musl)...$(NC)"
+	@if ! rustup target list --installed | grep -q $(MUSL_TARGET); then \
+		echo -e "$(YELLOW)Installing musl target...$(NC)"; \
+		rustup target add $(MUSL_TARGET); \
+	fi
+	@if ! command -v musl-gcc &> /dev/null; then \
+		echo -e "$(RED)✗ musl-gcc not found. Run: make install-musl$(NC)"; \
+		exit 1; \
+	fi
+	@mkdir -p $(BUILD_DIR)
+	@RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target $(MUSL_TARGET) 2>&1 | tee $(BUILD_DIR)/build-release.log; \
+	BUILD_STATUS=$${PIPESTATUS[0]}; \
+	if [ $$BUILD_STATUS -eq 0 ]; then \
+		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-static"; \
+		cp $(MUSL_BIN) $(BUILD_DIR)/$$RELEASE_NAME; \
+		chmod +x $(BUILD_DIR)/$$RELEASE_NAME; \
+		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-static; \
+		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-static; \
+		echo -e "$(GREEN)✓ Static release build successful$(NC)"; \
+		echo -e "  Binary:  $(BUILD_DIR)/$$RELEASE_NAME"; \
+		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-static -> $$RELEASE_NAME"; \
+		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size:    " $$5}'; \
+		file $(BUILD_DIR)/$$RELEASE_NAME | sed 's/^/  /'; \
+	else \
+		echo -e "$(RED)✗ Static release build failed$(NC)"; \
+		echo -e "  See $(BUILD_DIR)/build-release.log for details"; \
+		echo -e "  You may need to run: make install-musl"; \
+		exit 1; \
+	fi
+
+#------------------------------------------------------------------------------
+# Debug build
 #------------------------------------------------------------------------------
 debug:
 	@echo -e "$(BLUE)Building $(PROJECT_NAME) (debug)...$(NC)"
@@ -156,41 +122,11 @@ debug:
 	fi
 
 #------------------------------------------------------------------------------
-# Build static musl binary (fully portable, no dependencies)
-#------------------------------------------------------------------------------
-static:
-	@echo -e "$(BLUE)Building $(PROJECT_NAME) (static musl, no RocksDB)...$(NC)"
-	@if ! rustup target list --installed | grep -q $(MUSL_TARGET); then \
-		echo -e "$(YELLOW)Installing musl target...$(NC)"; \
-		rustup target add $(MUSL_TARGET); \
-	fi
-	@mkdir -p $(BUILD_DIR)
-	@RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target $(MUSL_TARGET) --no-default-features 2>&1 | tee $(BUILD_DIR)/build-static.log; \
-	BUILD_STATUS=$${PIPESTATUS[0]}; \
-	if [ $$BUILD_STATUS -eq 0 ]; then \
-		STATIC_BINARY="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-static"; \
-		cp $(MUSL_BIN) $(BUILD_DIR)/$$STATIC_BINARY; \
-		chmod +x $(BUILD_DIR)/$$STATIC_BINARY; \
-		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-static; \
-		ln -s $$STATIC_BINARY $(BUILD_DIR)/$(PROJECT_NAME)-static; \
-		echo -e "$(GREEN)✓ Static build successful$(NC)"; \
-		echo -e "  Binary: $(BUILD_DIR)/$$STATIC_BINARY"; \
-		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-static"; \
-		ls -lh $(BUILD_DIR)/$$STATIC_BINARY | awk '{print "  Size: " $$5}'; \
-		echo -e "  Verify static: ldd $(BUILD_DIR)/$$STATIC_BINARY"; \
-	else \
-		echo -e "$(RED)✗ Static build failed$(NC)"; \
-		echo -e "  See $(BUILD_DIR)/build-static.log for details"; \
-		echo -e "  You may need to run: make install-musl"; \
-		exit 1; \
-	fi
-
-#------------------------------------------------------------------------------
-# Build portable server binary for RHEL/Rocky 9+ using Docker (RECOMMENDED)
-# Includes: RocksDB, Parquet export, analytics server, embedded web dashboard
+# Rocky-9 build via Docker: analytics server + embedded React dashboard.
+# Targets glibc 2.34 so it runs on Rocky/RHEL 9+, Ubuntu 22.04+, Debian 12+.
 #------------------------------------------------------------------------------
 docker-rocky:
-	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) for Rocky/RHEL 9+ with all features (Docker)...$(NC)"
+	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) (Rocky 9, server + dashboard)...$(NC)"
 	@mkdir -p $(BUILD_DIR)
 	@if command -v podman &> /dev/null; then \
 		CONTAINER_CMD=podman; \
@@ -204,31 +140,28 @@ docker-rocky:
 	$$CONTAINER_CMD build -f Dockerfile.rocky -t nfs-walker-rocky . 2>&1 | tee $(BUILD_DIR)/build-rocky.log; \
 	BUILD_STATUS=$${PIPESTATUS[0]}; \
 	if [ $$BUILD_STATUS -eq 0 ]; then \
-		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-el9-server"; \
+		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-el9"; \
 		$$CONTAINER_CMD run --rm nfs-walker-rocky cat /build/nfs-walker > $(BUILD_DIR)/$$RELEASE_NAME; \
 		chmod +x $(BUILD_DIR)/$$RELEASE_NAME; \
-		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-server; \
-		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-server; \
+		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-el9; \
+		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-el9; \
 		echo -e "$(GREEN)✓ Rocky 9 build successful$(NC)"; \
-		echo -e "  Binary: $(BUILD_DIR)/$$RELEASE_NAME"; \
-		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-server -> $$RELEASE_NAME"; \
-		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size: " $$5}'; \
-		echo -e "  Features: RocksDB, Parquet, analytics server, embedded dashboard"; \
+		echo -e "  Binary:  $(BUILD_DIR)/$$RELEASE_NAME"; \
+		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-el9 -> $$RELEASE_NAME"; \
+		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size:    " $$5}'; \
 		echo -e "  Compatible with: Rocky/RHEL/Alma 9+, Ubuntu 22.04+, Debian 12+"; \
 		file $(BUILD_DIR)/$$RELEASE_NAME | sed 's/^/  /'; \
-		echo "  Dependencies:"; \
-		ldd $(BUILD_DIR)/$$RELEASE_NAME 2>&1 | sed 's/^/    /'; \
 	else \
-		echo -e "$(RED)✗ Docker Rocky build failed$(NC)"; \
+		echo -e "$(RED)✗ Rocky 9 build failed$(NC)"; \
 		echo -e "  See $(BUILD_DIR)/build-rocky.log for details"; \
 		exit 1; \
 	fi
 
 #------------------------------------------------------------------------------
-# Build fully static musl binary with RocksDB using Docker (works on ANY Linux)
+# Static musl build via Docker — works on ANY Linux.
 #------------------------------------------------------------------------------
 docker-musl:
-	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) static musl+RocksDB (Docker)...$(NC)"
+	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) (static musl via Docker)...$(NC)"
 	@mkdir -p $(BUILD_DIR)
 	@if command -v podman &> /dev/null; then \
 		CONTAINER_CMD=podman; \
@@ -242,56 +175,20 @@ docker-musl:
 	$$CONTAINER_CMD build -f Dockerfile.musl -t nfs-walker-musl . 2>&1 | tee $(BUILD_DIR)/build-musl.log; \
 	BUILD_STATUS=$${PIPESTATUS[0]}; \
 	if [ $$BUILD_STATUS -eq 0 ]; then \
-		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-musl-rocks"; \
-		$$CONTAINER_CMD run --rm nfs-walker-musl cat /app/target/x86_64-unknown-linux-musl/release/nfs-walker > $(BUILD_DIR)/$$RELEASE_NAME; \
+		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-musl-static"; \
+		$$CONTAINER_CMD run --rm nfs-walker-musl cat /app/target/x86_64-unknown-linux-musl/release-debug/nfs-walker > $(BUILD_DIR)/$$RELEASE_NAME; \
 		chmod +x $(BUILD_DIR)/$$RELEASE_NAME; \
-		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-static-rocks; \
-		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-static-rocks; \
+		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-static; \
+		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-static; \
 		echo -e "$(GREEN)✓ Static musl build successful$(NC)"; \
-		echo -e "  Binary: $(BUILD_DIR)/$$RELEASE_NAME"; \
-		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-static-rocks -> $$RELEASE_NAME"; \
-		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size: " $$5}'; \
-		echo -e "  Type: Fully static (musl) with RocksDB - works on ANY Linux"; \
+		echo -e "  Binary:  $(BUILD_DIR)/$$RELEASE_NAME"; \
+		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-static -> $$RELEASE_NAME"; \
+		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size:    " $$5}'; \
+		echo -e "  Type: Fully static (musl) — works on ANY Linux"; \
 		file $(BUILD_DIR)/$$RELEASE_NAME | sed 's/^/  /'; \
-		ldd $(BUILD_DIR)/$$RELEASE_NAME 2>&1 | sed 's/^/  /'; \
 	else \
-		echo -e "$(RED)✗ Docker musl build failed$(NC)"; \
+		echo -e "$(RED)✗ Static musl build failed$(NC)"; \
 		echo -e "  See $(BUILD_DIR)/build-musl.log for details"; \
-		exit 1; \
-	fi
-
-#------------------------------------------------------------------------------
-# Build static binary with RocksDB using Docker (most reliable)
-#------------------------------------------------------------------------------
-docker-release:
-	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) release with RocksDB (Docker)...$(NC)"
-	@mkdir -p $(BUILD_DIR)
-	@if command -v podman &> /dev/null; then \
-		CONTAINER_CMD=podman; \
-	elif command -v docker &> /dev/null; then \
-		CONTAINER_CMD=docker; \
-	else \
-		echo -e "$(RED)✗ Neither podman nor docker found$(NC)"; \
-		exit 1; \
-	fi; \
-	echo "Using $$CONTAINER_CMD..."; \
-	$$CONTAINER_CMD build -f Dockerfile.static-builder -t nfs-walker-builder . 2>&1 | tee $(BUILD_DIR)/build-docker.log; \
-	BUILD_STATUS=$${PIPESTATUS[0]}; \
-	if [ $$BUILD_STATUS -eq 0 ]; then \
-		RELEASE_NAME="$(PROJECT_NAME)-$(VERSION)-$(DATE_STAMP)-rocks"; \
-		$$CONTAINER_CMD run --rm nfs-walker-builder cat /app/target/release/nfs-walker > $(BUILD_DIR)/$$RELEASE_NAME; \
-		chmod +x $(BUILD_DIR)/$$RELEASE_NAME; \
-		rm -f $(BUILD_DIR)/$(PROJECT_NAME)-rocks; \
-		ln -s $$RELEASE_NAME $(BUILD_DIR)/$(PROJECT_NAME)-rocks; \
-		echo -e "$(GREEN)✓ Docker build successful$(NC)"; \
-		echo -e "  Binary: $(BUILD_DIR)/$$RELEASE_NAME"; \
-		echo -e "  Symlink: $(BUILD_DIR)/$(PROJECT_NAME)-rocks -> $$RELEASE_NAME"; \
-		ls -lh $(BUILD_DIR)/$$RELEASE_NAME | awk '{print "  Size: " $$5}'; \
-		echo -e "  Type: Portable Linux with RocksDB (glibc 2.31+)"; \
-		file $(BUILD_DIR)/$$RELEASE_NAME | sed 's/^/  /'; \
-	else \
-		echo -e "$(RED)✗ Docker build failed$(NC)"; \
-		echo -e "  See $(BUILD_DIR)/build-docker.log for details"; \
 		exit 1; \
 	fi
 
@@ -345,21 +242,6 @@ test:
 	fi
 
 #------------------------------------------------------------------------------
-# Run benchmarks
-#------------------------------------------------------------------------------
-bench:
-	@echo -e "$(BLUE)Running benchmarks...$(NC)"
-	@mkdir -p $(BUILD_DIR)
-	@cargo bench 2>&1 | tee $(BUILD_DIR)/bench.log; \
-	if [ $${PIPESTATUS[0]} -eq 0 ]; then \
-		echo -e "$(GREEN)✓ Benchmarks complete$(NC)"; \
-		echo -e "  Results: $(BUILD_DIR)/bench.log"; \
-	else \
-		echo -e "$(RED)✗ Benchmarks failed$(NC)"; \
-		exit 1; \
-	fi
-
-#------------------------------------------------------------------------------
 # Clean all build artifacts
 #------------------------------------------------------------------------------
 clean:
@@ -382,7 +264,7 @@ clean-cache:
 	@echo -e "$(GREEN)✓ Cache cleaned$(NC)"
 
 #------------------------------------------------------------------------------
-# Install system dependencies
+# Install system dependencies (build-time)
 #------------------------------------------------------------------------------
 install-deps:
 	@echo -e "$(BLUE)Installing system dependencies...$(NC)"
@@ -391,29 +273,24 @@ install-deps:
 		sudo apt update && sudo apt install -y \
 			build-essential \
 			pkg-config \
-			libsqlite3-dev \
-			libnfs-dev \
-			libclang-dev \
-			llvm-dev; \
+			libnfs-dev; \
 		echo -e "$(GREEN)✓ Dependencies installed$(NC)"; \
 	elif command -v dnf &> /dev/null; then \
 		echo "  Using dnf package manager"; \
 		sudo dnf install -y \
 			gcc \
+			make \
 			pkg-config \
-			sqlite-devel \
-			libnfs-devel \
-			clang-devel \
-			llvm-devel; \
+			libnfs-devel; \
 		echo -e "$(GREEN)✓ Dependencies installed$(NC)"; \
 	else \
 		echo -e "$(RED)✗ Unsupported package manager$(NC)"; \
-		echo "  Please install manually: build-essential pkg-config libsqlite3-dev libnfs-dev libclang-dev"; \
+		echo "  Please install manually: build-essential pkg-config libnfs-dev"; \
 		exit 1; \
 	fi
 
 #------------------------------------------------------------------------------
-# Run clippy linter and format check
+# Run clippy + format check
 #------------------------------------------------------------------------------
 check:
 	@echo -e "$(BLUE)Running code checks...$(NC)"
@@ -424,6 +301,7 @@ check:
 	}
 	@echo ""
 	@echo -e "$(BLUE)Running clippy...$(NC)"
+	@mkdir -p $(BUILD_DIR)
 	@cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee $(BUILD_DIR)/clippy.log; \
 	if [ $${PIPESTATUS[0]} -eq 0 ]; then \
 		echo -e "$(GREEN)✓ All checks passed$(NC)"; \
@@ -485,34 +363,33 @@ help:
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  docker-rocky    Build portable server binary for Rocky/RHEL 9+ via Docker (RECOMMENDED)"
-	@echo "  docker-release  Build RocksDB binary for Ubuntu 20.04+ via Docker"
-	@echo "  build           Build native binary with RocksDB (current system)"
-	@echo "  release         Build static musl binary without RocksDB (smallest)"
-	@echo "  debug           Build debug binary"
+	@echo "  build           Native release build (links system libnfs/glibc)"
+	@echo "  release         Static musl binary (any Linux)"
+	@echo "  debug           Debug build"
+	@echo "  docker-rocky    Rocky-9 build via Docker (server + dashboard, glibc 2.34+)"
+	@echo "  docker-musl     Static musl build via Docker"
 	@echo "  clean           Remove all build artifacts and cache"
 	@echo "  clean-cache     Remove only cached objects"
 	@echo ""
 	@echo "Test targets:"
-	@echo "  test         Run all tests with summary"
-	@echo "  bench        Run benchmarks"
-	@echo "  check        Run clippy and format check"
+	@echo "  test            Run all tests with summary"
+	@echo "  check           Run clippy and format check"
 	@echo ""
 	@echo "Utility targets:"
-	@echo "  fmt          Format code with rustfmt"
-	@echo "  install-deps Install system dependencies"
-	@echo "  install-musl Install musl toolchain for static builds"
-	@echo "  info         Show project info"
-	@echo "  list         List available binaries"
-	@echo "  help         Show this help"
+	@echo "  fmt             Format code with rustfmt"
+	@echo "  install-deps    Install build-time system dependencies (libnfs)"
+	@echo "  install-musl    Install musl toolchain for static builds"
+	@echo "  info            Show project info"
+	@echo "  list            List available binaries"
+	@echo "  help            Show this help"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make                 # Build release binary (RocksDB + CSV export)"
-	@echo "  make test            # Run tests"
-	@echo "  make clean build     # Clean rebuild"
+	@echo "  make build                              # Native release"
+	@echo "  make test                               # Run tests"
+	@echo "  make clean build                        # Clean rebuild"
 	@echo ""
 	@echo "After building:"
-	@echo "  build/nfs-walker nfs://server/export -o scan.rocks -w 32"
-	@echo "  build/nfs-walker export-csv scan.rocks ./csv -p --gzip"
-	@echo "  build/nfs-walker stats scan.rocks --by-extension"
+	@echo "  build/nfs-walker nfs://server/export -o scan.parquet -w 32"
+	@echo "  build/nfs-walker stats scan.parquet"
+	@echo "  duckdb -c \"SELECT count(*) FROM 'scan.parquet/scans/*/part-*.parquet'\""
 	@echo ""

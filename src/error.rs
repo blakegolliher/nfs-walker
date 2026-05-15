@@ -2,7 +2,7 @@
 //!
 //! This module defines a comprehensive error hierarchy that covers:
 //! - NFS connection and protocol errors
-//! - SQLite database errors
+//! - Parquet writer errors
 //! - Configuration and CLI errors
 //! - Worker thread errors
 //!
@@ -21,16 +21,7 @@ pub enum WalkerError {
     #[error("NFS error: {0}")]
     Nfs(#[from] NfsError),
 
-    /// Database errors
-    #[error("Database error: {0}")]
-    Database(#[from] DbError),
-
-    /// RocksDB errors
-    #[error("RocksDB error: {0}")]
-    Rocks(#[from] RocksError),
-
-    /// Parquet export errors
-    #[cfg(feature = "parquet")]
+    /// Parquet writer errors
     #[error("Parquet error: {0}")]
     Parquet(#[from] ParquetError),
 
@@ -137,34 +128,6 @@ impl NfsError {
     }
 }
 
-/// Database errors
-#[derive(Error, Debug)]
-pub enum DbError {
-    /// SQLite error
-    #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
-
-    /// Failed to create database file
-    #[error("Failed to create database at '{path}': {reason}")]
-    CreateFailed { path: PathBuf, reason: String },
-
-    /// Schema error
-    #[error("Database schema error: {0}")]
-    Schema(String),
-
-    /// Transaction failed
-    #[error("Transaction failed: {0}")]
-    Transaction(String),
-
-    /// Writer channel closed unexpectedly
-    #[error("Database writer channel closed unexpectedly")]
-    ChannelClosed,
-
-    /// Database is locked
-    #[error("Database is locked - another process may be using it")]
-    Locked,
-}
-
 /// Configuration and CLI errors
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -187,10 +150,6 @@ pub enum ConfigError {
     /// Output path error
     #[error("Invalid output path '{path}': {reason}")]
     InvalidOutputPath { path: PathBuf, reason: String },
-
-    /// Resume database not found or invalid
-    #[error("Cannot resume from '{path}': {reason}")]
-    InvalidResumeDb { path: PathBuf, reason: String },
 
     /// Pipeline depth out of range
     #[error("Invalid pipeline depth {depth}: must be between 0 and {max}")]
@@ -233,35 +192,7 @@ pub enum WorkerError {
     NfsError { id: usize, source: NfsError },
 }
 
-/// RocksDB errors
-#[derive(Error, Debug)]
-pub enum RocksError {
-    /// RocksDB operation failed
-    #[error("RocksDB error: {0}")]
-    Rocks(#[from] rocksdb::Error),
-
-    /// Bincode serialization/deserialization error
-    #[error("Serialization error: {0}")]
-    Bincode(String),
-
-    /// I/O error (file operations)
-    #[error("I/O error: {0}")]
-    Io(String),
-
-    /// Database not found
-    #[error("Database not found: {0}")]
-    NotFound(String),
-
-    /// Invalid database format
-    #[error("Invalid database format: {0}")]
-    InvalidFormat(String),
-}
-
-/// Result type alias for RocksError
-pub type RocksResult<T> = std::result::Result<T, RocksError>;
-
-/// Parquet export errors
-#[cfg(feature = "parquet")]
+/// Parquet writer errors
 #[derive(Error, Debug)]
 pub enum ParquetError {
     /// Arrow error
@@ -286,7 +217,6 @@ pub enum ParquetError {
 }
 
 /// Result type alias for ParquetError
-#[cfg(feature = "parquet")]
 pub type ParquetResult<T> = std::result::Result<T, ParquetError>;
 
 /// Analytics server errors
@@ -353,9 +283,6 @@ pub type Result<T> = std::result::Result<T, WalkerError>;
 
 /// Result type alias for NfsError
 pub type NfsResult<T> = std::result::Result<T, NfsError>;
-
-/// Result type alias for DbError
-pub type DbResult<T> = std::result::Result<T, DbError>;
 
 /// Represents the outcome of walking a single directory
 #[derive(Debug)]

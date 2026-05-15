@@ -1,9 +1,7 @@
-//! Direct-write streaming Parquet writers.
+//! Streaming Parquet writers fed directly from the walker pipeline.
 //!
-//! Variant of `parallel_convert` that consumes `Vec<DbEntry>` batches
-//! from a crossbeam channel (one per shard) instead of iterating a
-//! RocksDB column family. Used by the walker when
-//! `--output-format parquet` is set, so entries flow:
+//! Consumes `Vec<DbEntry>` batches from a crossbeam channel (one per
+//! shard). Entries flow:
 //!
 //! ```text
 //! workers → ShardedSender → per-shard channel → per-shard Parquet writer
@@ -14,11 +12,9 @@
 //! rotates to a new part file once the current one crosses
 //! `target_file_size`. Row-group flush is triggered by row count.
 //!
-//! No RocksDB is involved. Resume/incremental rescan is unavailable in
-//! this mode — that capability lives in `--output-format rocksdb`.
-//!
-//! See `tasks/todo.md` for the design and the motivating customer
-//! benchmark (libnfs + DuckDB → 3 M files/sec with 32 parallel writers).
+//! No incremental rescan / resume capability — a crashed scan starts
+//! over. The throughput win — 690 K files/sec on the 810 M-file prod
+//! bench — is the trade.
 //!
 //! # Failure handling
 //!
@@ -185,7 +181,8 @@ pub struct DirectWritePool {
 
 /// Spawn the per-shard streaming Parquet writer pool.
 ///
-/// Mirrors `walker::simple::spawn_sharded_rocksdb_writers` but produces
+/// Spawns one writer thread per shard. Each owns a single `ArrowWriter`
+/// rotating part files within its shard, and produces
 /// Parquet files directly. The walker funnels `Vec<DbEntry>` batches
 /// into `senders[shard]` via the existing `ShardedSender`; each writer
 /// drains its channel and flushes row groups to its part files.
@@ -193,7 +190,7 @@ pub struct DirectWritePool {
 /// The output sub-directory `<output_dir>/scans/<scan_id>/` is created
 /// here (not by the per-shard thread) so concurrent writers don't race
 /// on `create_dir_all`. We refuse to spawn if the directory already
-/// exists, mirroring the post-hoc converter's safety check.
+/// exists.
 pub fn spawn_direct_parquet_writers(
     config: DirectWriteConfig,
     metrics: Arc<ScanMetrics>,
@@ -273,11 +270,8 @@ pub fn spawn_direct_parquet_writers(
         let row_ctx = RowContext {
             scan_id: config.scan_id.clone(),
             scan_timestamp_us: config.scan_timestamp_us,
-            // DbEntry mtime/atime/ctime are already microseconds
-            // (see nfs/types.rs); the seconds→micros multiplier only
-            // applies to the RocksDB → Parquet post-hoc converter
-            // reading legacy databases. Direct-write must use 1 or
-            // every row gets scaled twice.
+            // DbEntry mtime/atime/ctime are already microseconds (see
+            // nfs/types.rs), so no rescale.
             mtime_scale: 1,
         };
 

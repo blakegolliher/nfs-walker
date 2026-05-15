@@ -1,7 +1,6 @@
-# Build nfs-walker with all features for RHEL/Rocky 9+ compatibility
+# Build nfs-walker for RHEL/Rocky 9+ compatibility.
 #
 # Uses Rocky Linux 9 as base to ensure glibc 2.34 compatibility.
-# Statically links libstdc++ to eliminate C++ runtime dependency.
 # Embeds the React dashboard into the binary via rust-embed.
 # Result works on Rocky 9, RHEL 9, AlmaLinux 9, and newer distros.
 #
@@ -18,25 +17,15 @@ RUN dnf install -y epel-release && \
     dnf module enable nodejs:18 -y && \
     dnf install -y --allowerasing \
         gcc \
-        gcc-c++ \
         make \
-        cmake \
         git \
         autoconf \
         automake \
         libtool \
         pkgconfig \
-        clang \
-        llvm-devel \
-        clang-devel \
-        lz4-devel \
         libzstd-devel \
-        snappy-devel \
-        bzip2-devel \
         zlib-devel \
-        zlib-static \
         glibc-static \
-        libstdc++-static \
         openssl-devel \
         perl \
         curl \
@@ -67,12 +56,9 @@ RUN echo "=== libnfs installation ===" && \
     find /usr/local -name "libnfs*" -o -name "nfs.pc" 2>/dev/null && \
     cat /usr/local/lib/pkgconfig/libnfs.pc 2>/dev/null || true
 
-# Set environment for static C++ linking
+# Static-link libnfs (it's the only C dep that isn't part of the base image).
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
-ENV LIBCLANG_PATH=/usr/lib64
-# Static link libstdc++ and libnfs
-# Must wrap libnfs in -Bstatic/-Bdynamic to link statically
-ENV RUSTFLAGS="-C target-feature=+aes,+sse2 -C link-arg=-static-libstdc++ -C link-arg=-Wl,-Bstatic -C link-arg=-L/usr/local/lib -C link-arg=-lnfs -C link-arg=-Wl,-Bdynamic"
+ENV RUSTFLAGS="-C target-feature=+aes,+sse2 -C link-arg=-Wl,-Bstatic -C link-arg=-L/usr/local/lib -C link-arg=-lnfs -C link-arg=-Wl,-Bdynamic"
 
 # Copy project source
 COPY . /build/src
@@ -84,7 +70,7 @@ RUN cd web && npm install && npm run build
 # Clean any stale artifacts
 RUN rm -f Cargo.lock
 
-# Build release binary with all features (rocksdb + parquet + server with embedded dashboard)
+# Build release binary with the analytics server + embedded dashboard.
 RUN cargo build --release --features server
 
 # Strip for smaller size

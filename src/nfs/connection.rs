@@ -1017,8 +1017,7 @@ impl NfsConnection {
 
         // Build stat if we have full attributes. Pack seconds + nanoseconds
         // into a single microseconds-since-epoch value so sub-second
-        // precision survives the trip through RocksDB into Parquet's
-        // mtime_us column.
+        // precision survives the trip into the Parquet `mtime_us` column.
         let stat = Some(NfsStat {
             size: d.size,
             inode: d.inode,

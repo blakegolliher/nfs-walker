@@ -151,7 +151,7 @@ pub struct NfsStat {
     ///
     /// Packs the libnfs sec + nsec fields together via the helpers in
     /// `connection.rs` so sub-second precision is preserved end-to-end
-    /// (RocksDB → Parquet `atime_us` → migration `nfs_utimes`).
+    /// into the Parquet `atime_us` column.
     pub atime: Option<i64>,
 
     /// Last modification time (microseconds since Unix epoch)

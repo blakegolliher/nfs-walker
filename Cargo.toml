@@ -3,43 +3,41 @@ name = "nfs-walker"
 version = "0.1.0"
 edition = "2021"
 authors = ["VAST Data"]
-description = "High-performance NFS filesystem scanner with RocksDB storage and multiple export formats"
+description = "High-performance NFS filesystem scanner with sharded Parquet output"
 license = "MIT"
 readme = "README.md"
-keywords = ["nfs", "filesystem", "walker", "scanner"]
+keywords = ["nfs", "filesystem", "walker", "scanner", "parquet"]
 categories = ["command-line-utilities", "filesystem"]
 
 [features]
-# Default = everything. The optional features exist so build matrices that
-# strip parquet/server (e.g. minimal static binaries) can opt out via
-# --no-default-features, but a vanilla `cargo build` ships the whole CLI.
+# Default = everything. The optional `server` feature exists so build
+# matrices that strip the analytics dashboard (e.g. minimal static
+# binaries) can opt out via --no-default-features, but a vanilla
+# `cargo build` ships the whole CLI.
 default = ["server"]
-parquet = ["dep:arrow", "dep:parquet", "dep:uuid", "dep:serde_json"]
-server = ["parquet", "dep:datafusion", "dep:axum", "dep:tower-http", "dep:tokio", "dep:rust-embed", "dep:mime_guess"]
+server = ["dep:datafusion", "dep:axum", "dep:tower-http", "dep:tokio", "dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
 # Global allocator. cargo-zigbuild's binary links to Zig's std SmpAllocator
 # via its C-shim malloc, which returns NULL for ~30 KB requests once thread
 # count crosses ~250. Rooting the global allocator at mimalloc bypasses that
 # code path so every Rust allocation (Vec, hashbrown, parquet dict encoders)
-# uses a real thread-aware allocator. See tasks/todo.md "Production scan"
-# section for the 2026-05-15 segfault investigation.
+# uses a real thread-aware allocator. See
+# tasks/parquet-experiment-review.md for the 2026-05-15 segfault
+# investigation.
 #
 # `default-features = false` is a no-op today (the `mimalloc` crate declares
 # `default = []`) but is set explicitly so a future upstream change that
 # adds default features (e.g. `secure`, which has a measurable perf
 # impact) doesn't silently bleed into our binary. Caveat: only Rust-side
-# allocations route through mimalloc; libnfs/librocksdb/libzstd/snappy
-# still call into the system malloc (Zig SmpAllocator on musl). If the
-# 250-thread crash resurfaces under different thread mixes, suspect
-# C-side allocator pressure as the next root cause.
+# allocations route through mimalloc; libnfs/libzstd/snappy still call
+# into the system malloc (Zig SmpAllocator on musl). If the 250-thread
+# crash resurfaces under different thread mixes, suspect C-side allocator
+# pressure as the next root cause.
 mimalloc = { version = "0.1", default-features = false }
 
 # CLI parsing with derive macros
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
-
-# SQLite with bundled for static linking
-rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 
 # Concurrency primitives - crossbeam is battle-tested
 crossbeam-channel = "0.5"
@@ -71,16 +69,12 @@ libc = "0.2"
 gxhash = "3"
 infer = "0.15"
 
-# RocksDB is the canonical scan output (always required)
-rocksdb = { version = "0.22", default-features = false, features = ["lz4", "zstd"] }
-bincode = "1.3"
+# Parquet output: required (no longer feature-gated)
+arrow = { version = "54", default-features = false, features = ["ipc"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
+uuid = { version = "1", features = ["v4"] }
 serde = { version = "1.0", features = ["derive"] }
-
-# Parquet/Arrow export (optional)
-arrow = { version = "54", optional = true, default-features = false, features = ["ipc"] }
-parquet = { version = "54", optional = true, default-features = false, features = ["arrow", "zstd"] }
-uuid = { version = "1", optional = true, features = ["v4"] }
-serde_json = { version = "1", optional = true }
+serde_json = "1"
 
 # Analytics server (optional)
 datafusion = { version = "46", optional = true, default-features = false, features = ["parquet"] }
@@ -118,8 +112,3 @@ debug = "line-tables-only"
 
 [profile.dev]
 opt-level = 1
-
-[[bin]]
-name = "nfs-walker-parquet-parallel"
-path = "src/bin/nfs-walker-parquet-parallel.rs"
-required-features = ["parquet"]

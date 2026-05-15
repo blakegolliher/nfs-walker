@@ -208,7 +208,7 @@ pub async fn serve(
 
     if scan_count == 0 {
         eprintln!("Warning: No scans found in {}/scans/", data_dir.display());
-        eprintln!("Run 'nfs-walker export-parquet' first to create scan data.");
+        eprintln!("Run 'nfs-walker nfs://server/export -o {}' first to populate scan data.", data_dir.display());
     } else {
         eprintln!("Loaded {} scan(s)", scan_count);
         for info in analytics_ctx.scans.values() {

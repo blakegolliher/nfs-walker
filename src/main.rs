@@ -24,10 +24,10 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Raise the soft `RLIMIT_NOFILE` to at least `TARGET` (or the hard limit,
-/// whichever is lower). Large RocksDB scans can hold thousands of SST file
-/// handles plus per-worker NFS sockets, and the default soft limit of 1024
-/// on most distros causes "Too many open files" crashes at multi-billion-
-/// entry scale.
+/// whichever is lower). Large scans can hold thousands of per-worker NFS
+/// sockets plus per-shard Parquet writers, and the default soft limit of
+/// 1024 on most distros causes "Too many open files" crashes at
+/// multi-billion-entry scale.
 #[cfg(unix)]
 fn raise_fd_limit() {
     const TARGET: libc::rlim_t = 1_048_576;
@@ -83,8 +83,8 @@ fn run() -> Result<()> {
     // Setup logging
     setup_logging(args.verbose)?;
 
-    // Raise FD limit early so both scans (lots of NFS sockets) and stats
-    // queries (lots of SST handles) benefit before opening anything.
+    // Raise FD limit early so scans (lots of NFS sockets + Parquet part
+    // files per shard) don't hit the default 1024-FD soft limit.
     raise_fd_limit();
 
     // Handle subcommands
@@ -103,11 +103,7 @@ fn run() -> Result<()> {
             config.worker_count,
             &config.output_path.display().to_string(),
         );
-        let backend = match config.output_format {
-            nfs_walker::config::OutputFormat::Rocksdb => "RocksDB",
-            nfs_walker::config::OutputFormat::Parquet => "Parquet direct-write",
-        };
-        eprintln!("Mode: READDIRPLUS ({})", backend);
+        eprintln!("Mode: READDIRPLUS (streaming Parquet, {} shards)", config.writer_shards);
     }
 
     // Save output path before moving config
@@ -116,8 +112,8 @@ fn run() -> Result<()> {
     // Run the walker
     let result = run_simple_walker(config)?;
 
-    // Get database file size
-    let db_size = get_rocks_db_size(&output_path);
+    // Get on-disk scan output size (recursive — handles scans/<id>/*.parquet)
+    let db_size = get_scan_size(&output_path);
 
     // Print summary
     print_summary(
@@ -133,237 +129,169 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Handle subcommands (export-sql, export-parquet, stats, serve).
+/// Handle subcommands (stats, serve).
 fn handle_command(cmd: &Command) -> Result<()> {
     match cmd {
-        Command::ExportSql { input, output, progress } => {
-            run_export_sql(input, output, *progress)
-        }
-        #[cfg(feature = "parquet")]
-        Command::ExportParquet { input, output_dir, progress, file_size_mb, row_group_size, compression_level, parallelism } => {
-            run_export_parquet(input, output_dir, *progress, *file_size_mb, *row_group_size, *compression_level, *parallelism)
-        }
-        Command::Stats { db, live } => {
-            run_stats(db, *live)
-        }
+        Command::Stats { scan_dir } => run_stats(scan_dir),
         #[cfg(feature = "server")]
-        Command::Serve { data_dir, port, bind } => {
-            run_server(data_dir, bind, *port)
+        Command::Serve { data_dir, port, bind } => run_server(data_dir, bind, *port),
+    }
+}
+
+/// Print a scan-overview from a Parquet scan directory.
+///
+/// Reads `metadata.json` to find part files, then projects four columns
+/// (`file_type`, `size`, `allocated_blocks`, `depth`) and aggregates in
+/// one pass. Detail-level analytics live in DuckDB / DataFusion — this
+/// just produces the headline counts a caller would otherwise hand-roll.
+fn run_stats(scan_dir: &std::path::Path) -> Result<()> {
+    use arrow::array::{Array, StringArray, UInt16Array, UInt64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::ProjectionMask;
+    use std::fs::File;
+
+    let parts = list_parquet_parts(scan_dir)
+        .with_context(|| format!("Reading scan dir {}", scan_dir.display()))?;
+    if parts.is_empty() {
+        anyhow::bail!(
+            "No Parquet part files found under {} — is this a scan directory?",
+            scan_dir.display()
+        );
+    }
+
+    let mut total_entries: u64 = 0;
+    let mut total_files: u64 = 0;
+    let mut total_dirs: u64 = 0;
+    let mut total_symlinks: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut total_blocks: u64 = 0;
+    let mut max_depth: u16 = 0;
+
+    for part in &parts {
+        let file = File::open(part)
+            .with_context(|| format!("opening part {}", part.display()))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("opening Parquet reader for {}", part.display()))?;
+        let schema = builder.parquet_schema();
+        // Project only the columns we need; cuts >80% of the read.
+        let leaves = ["file_type", "size", "allocated_blocks", "depth"];
+        let proj_indices: Vec<usize> = leaves
+            .iter()
+            .map(|name| {
+                schema
+                    .columns()
+                    .iter()
+                    .position(|c| c.name() == *name)
+                    .ok_or_else(|| anyhow::anyhow!("column {} missing from {}", name, part.display()))
+            })
+            .collect::<Result<_, _>>()?;
+        let mask = ProjectionMask::leaves(schema, proj_indices);
+        let reader = builder
+            .with_projection(mask)
+            .build()
+            .with_context(|| format!("building reader for {}", part.display()))?;
+        for batch in reader {
+            let batch = batch?;
+            total_entries += batch.num_rows() as u64;
+            let ft = batch
+                .column_by_name("file_type")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| anyhow::anyhow!("file_type column type mismatch in {}", part.display()))?;
+            let size = batch
+                .column_by_name("size")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| anyhow::anyhow!("size column type mismatch in {}", part.display()))?;
+            let blocks = batch
+                .column_by_name("allocated_blocks")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| anyhow::anyhow!("allocated_blocks column type mismatch in {}", part.display()))?;
+            let depth = batch
+                .column_by_name("depth")
+                .and_then(|c| c.as_any().downcast_ref::<UInt16Array>())
+                .ok_or_else(|| anyhow::anyhow!("depth column type mismatch in {}", part.display()))?;
+            for i in 0..batch.num_rows() {
+                match ft.value(i) {
+                    "file" => {
+                        total_files += 1;
+                        total_bytes += size.value(i);
+                        total_blocks += blocks.value(i);
+                    }
+                    "directory" => total_dirs += 1,
+                    "symlink" => total_symlinks += 1,
+                    _ => {}
+                }
+                let d = depth.value(i);
+                if d > max_depth {
+                    max_depth = d;
+                }
+            }
         }
     }
-}
 
-/// Print the RocksDB scan overview (counts, total size, max depth).
-///
-/// Detail-level analytics (largest files, by-extension, duplicates, etc.) are
-/// no longer emitted from here — `nfs-walker export-parquet` followed by
-/// DuckDB / DataFusion queries gives a much faster path for that work.
-fn run_stats(db: &std::path::Path, live: bool) -> Result<()> {
-    use nfs_walker::rocksdb::{compute_stats, OpenMode};
-
-    let mode = if live { OpenMode::Secondary } else { OpenMode::Readonly };
-
-    {
-        let stats = compute_stats(db, mode).context("Failed to compute stats")?;
-        println!();
-        println!("Database Statistics");
-        println!("─────────────────────────────────────────────────");
-        println!("  Total entries:  {}", format_number(stats.total_entries));
-        println!("  Files:          {}", format_number(stats.total_files));
-        println!("  Directories:    {}", format_number(stats.total_dirs));
-        println!("  Symlinks:       {}", format_number(stats.total_symlinks));
-        println!("  Total size:     {}", format_size(stats.total_bytes, BINARY));
-        println!("  Allocated:      {}", format_size(stats.total_blocks * 512, BINARY));
-        println!("  Max depth:      {}", stats.max_depth);
-        println!();
-    }
+    println!();
+    println!("Scan Statistics");
+    println!("─────────────────────────────────────────────────");
+    println!("  Total entries:  {}", format_number(total_entries));
+    println!("  Files:          {}", format_number(total_files));
+    println!("  Directories:    {}", format_number(total_dirs));
+    println!("  Symlinks:       {}", format_number(total_symlinks));
+    println!("  Total size:     {}", format_size(total_bytes, BINARY));
+    println!("  Allocated:      {}", format_size(total_blocks * 512, BINARY));
+    println!("  Max depth:      {}", max_depth);
+    println!("  Part files:     {}", parts.len());
+    println!();
 
     Ok(())
 }
 
-/// Export a RocksDB scan to a SQLite database for ad-hoc SQL.
-fn run_export_sql(
-    input: &std::path::Path,
-    output: &std::path::Path,
-    show_progress: bool,
-) -> Result<()> {
-    use nfs_walker::rocksdb::{convert_rocks_to_sqlite, ConvertConfig};
-
-    eprintln!("Converting RocksDB to SQLite...");
-    eprintln!("  Input:  {}", input.display());
-    eprintln!("  Output: {}", output.display());
-
-    let config = ConvertConfig {
-        batch_size: 10_000,
-        progress: show_progress,
-    };
-
-    let progress_reporter = if show_progress {
-        let reporter = ProgressReporter::new();
-        reporter.set_status("Converting...");
-        Some(reporter)
+/// Collect part files from a scan dir. Prefers the `metadata.json` list
+/// (canonical), falls back to `scans/*/part-*.parquet` glob if missing.
+fn list_parquet_parts(scan_dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    // Look for `<scan_dir>/scans/<scan_id>/metadata.json`. We accept any
+    // single scan directly (most common) or recurse into all of them.
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    let scans_dir = scan_dir.join("scans");
+    if scans_dir.is_dir() {
+        for entry in std::fs::read_dir(&scans_dir)? {
+            let p = entry?.path();
+            if p.is_dir() {
+                roots.push(p);
+            }
+        }
+    } else if scan_dir.is_dir() {
+        // Maybe the user pointed directly at a scans/<id>/ dir.
+        roots.push(scan_dir.to_path_buf());
     } else {
-        None
-    };
-
-    let callback: Option<Box<dyn Fn(u64, u64) + Send>> = if let Some(ref p) = progress_reporter {
-        let p_clone = p.clone();
-        Some(Box::new(move |converted, _total| {
-            let msg = format!("Converted {} entries", format_number(converted));
-            p_clone.set_status(&msg);
-        }))
-    } else {
-        None
-    };
-
-    let stats = convert_rocks_to_sqlite(input, output, config, callback)
-        .context("Conversion failed")?;
-
-    if let Some(ref p) = progress_reporter {
-        p.finish("Conversion complete");
+        anyhow::bail!("Not a directory: {}", scan_dir.display());
     }
 
-    let db_size = std::fs::metadata(output)
-        .map(|m| format_size(m.len(), BINARY))
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    eprintln!("Conversion complete:");
-    eprintln!("  Entries: {}", format_number(stats.entries_converted));
-    eprintln!("  SQLite size: {}", db_size);
-
-    Ok(())
-}
-
-/// Run RocksDB to Parquet export
-#[cfg(feature = "parquet")]
-fn run_export_parquet(
-    input: &std::path::Path,
-    output_dir: &std::path::Path,
-    show_progress: bool,
-    file_size_mb: usize,
-    row_group_size: usize,
-    compression_level: i32,
-    parallelism: usize,
-) -> Result<()> {
-    eprintln!("Exporting RocksDB to Parquet...");
-    eprintln!("  Input:       {}", input.display());
-    eprintln!("  Output dir:  {}", output_dir.display());
-    eprintln!("  Parallelism: {}", parallelism);
-
-    let progress_reporter = if show_progress {
-        let reporter = ProgressReporter::new();
-        reporter.set_status("Exporting...");
-        Some(reporter)
-    } else {
-        None
-    };
-
-    let stats = if parallelism > 1 {
-        run_export_parquet_parallel(
-            input,
-            output_dir,
-            show_progress,
-            file_size_mb,
-            row_group_size,
-            compression_level,
-            parallelism,
-            progress_reporter.as_ref(),
-        )?
-    } else {
-        run_export_parquet_serial(
-            input,
-            output_dir,
-            show_progress,
-            file_size_mb,
-            row_group_size,
-            compression_level,
-            progress_reporter.as_ref(),
-        )?
-    };
-
-    if let Some(ref p) = progress_reporter {
-        p.finish("Export complete");
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for root in &roots {
+        let meta_path = root.join("metadata.json");
+        if meta_path.is_file() {
+            let raw = std::fs::read_to_string(&meta_path)
+                .with_context(|| format!("reading {}", meta_path.display()))?;
+            let v: serde_json::Value = serde_json::from_str(&raw)
+                .with_context(|| format!("parsing {}", meta_path.display()))?;
+            if let Some(arr) = v.get("parquet_files").and_then(|x| x.as_array()) {
+                for f in arr {
+                    if let Some(name) = f.as_str() {
+                        out.push(root.join(name));
+                    }
+                }
+                continue;
+            }
+        }
+        // Fallback: glob the directory directly.
+        for entry in std::fs::read_dir(root)? {
+            let p = entry?.path();
+            if p.extension().is_some_and(|e| e == "parquet") {
+                out.push(p);
+            }
+        }
     }
-
-    eprintln!("Export complete:");
-    eprintln!("  Scan ID:    {}", stats.scan_id);
-    eprintln!("  Entries:    {}", format_number(stats.entries_exported));
-    eprintln!("  Files:      {}", stats.files_written);
-    eprintln!(
-        "  Total size: {}",
-        format_size(stats.total_bytes_written, BINARY)
-    );
-
-    Ok(())
-}
-
-#[cfg(feature = "parquet")]
-fn run_export_parquet_serial(
-    input: &std::path::Path,
-    output_dir: &std::path::Path,
-    show_progress: bool,
-    file_size_mb: usize,
-    row_group_size: usize,
-    compression_level: i32,
-    progress_reporter: Option<&ProgressReporter>,
-) -> Result<nfs_walker::parquet::ExportStats> {
-    use nfs_walker::parquet::{convert_rocks_to_parquet, ExportConfig};
-
-    let config = ExportConfig {
-        row_group_size,
-        target_file_size: file_size_mb * 1024 * 1024,
-        compression_level,
-        progress: show_progress,
-    };
-
-    let callback: Option<Box<dyn Fn(u64, u64) + Send>> =
-        progress_reporter.map(|p| {
-            let p_clone = p.clone();
-            Box::new(move |exported, _total| {
-                let msg = format!("Exported {} entries", format_number(exported));
-                p_clone.set_status(&msg);
-            }) as Box<dyn Fn(u64, u64) + Send>
-        });
-
-    convert_rocks_to_parquet(input, output_dir, config, callback)
-        .context("Parquet export failed")
-}
-
-#[cfg(feature = "parquet")]
-#[allow(clippy::too_many_arguments)]
-fn run_export_parquet_parallel(
-    input: &std::path::Path,
-    output_dir: &std::path::Path,
-    show_progress: bool,
-    file_size_mb: usize,
-    row_group_size: usize,
-    compression_level: i32,
-    parallelism: usize,
-    progress_reporter: Option<&ProgressReporter>,
-) -> Result<nfs_walker::parquet::ExportStats> {
-    use nfs_walker::parquet::{
-        parallel_convert_rocks_to_parquet, ParallelExportConfig, ParallelProgressCallback,
-    };
-    use std::sync::Arc;
-
-    let config = ParallelExportConfig {
-        parallelism,
-        row_group_size,
-        target_file_size: file_size_mb * 1024 * 1024,
-        compression_level,
-        progress: show_progress,
-    };
-
-    let callback: Option<ParallelProgressCallback> = progress_reporter.map(|p| {
-        let p_clone = p.clone();
-        Arc::new(move |exported: u64, _total: u64| {
-            let msg = format!("Exported {} entries", format_number(exported));
-            p_clone.set_status(&msg);
-        }) as ParallelProgressCallback
-    });
-
-    parallel_convert_rocks_to_parquet(input, output_dir, config, callback)
-        .context("Parallel Parquet export failed")
+    out.sort();
+    Ok(out)
 }
 
 /// Start the analytics server
@@ -380,12 +308,10 @@ fn run_server(
     Ok(())
 }
 
-/// Get total size of a RocksDB directory
-/// Recursive size of the scan output directory. Walks subdirectories so
-/// the parquet layout (`scans/<id>/part-*.parquet`) reports honestly;
-/// the single-flat-directory case (RocksDB) still works since the walk
-/// just bottoms out one level down.
-fn get_rocks_db_size(path: &std::path::Path) -> Option<u64> {
+/// Recursive on-disk size of the scan output directory. Walks
+/// subdirectories so the `scans/<id>/part-*.parquet` layout reports
+/// honestly. Symlinks are never followed (lstat-based file_type).
+fn get_scan_size(path: &std::path::Path) -> Option<u64> {
     if !path.is_dir() {
         return None;
     }

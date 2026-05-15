@@ -1,15 +1,12 @@
 //! Shared row builder for Parquet output.
 //!
-//! Both the post-scan converter (`convert_rocks_to_parquet`) and the
-//! streaming writer used during a live scan accumulate rows into the
-//! same 24-column Arrow schema and then flush them as a `RecordBatch`.
-//! This module owns the column-builder boilerplate so neither path
-//! has to duplicate it.
+//! The streaming writer fed by the walker pipeline accumulates rows into
+//! the 24-column Arrow schema and then flushes them as a `RecordBatch`.
+//! This module owns the column-builder boilerplate.
 
 use crate::error::{ParquetError, WalkerError};
 use crate::nfs::types::DbEntry;
 use crate::parquet::schema::{compute_parent_path, file_type_string, parquet_schema_ref};
-use crate::rocksdb::schema::RocksEntry;
 use arrow::array::{
     ArrayRef, Int32Builder, Int64Builder, StringBuilder, StringDictionaryBuilder, UInt16Builder,
     UInt32Builder, UInt64Builder,
@@ -127,38 +124,8 @@ impl RowBuilder {
         self.rows == 0
     }
 
-    /// Append a row sourced from a `RocksEntry` (used by the post-scan
-    /// converter, which iterates RocksDB directly).
-    pub fn push_rocks_entry(&mut self, entry: &RocksEntry) {
-        let parent = compute_parent_path(&entry.path);
-        self.append_common(
-            &entry.path,
-            &entry.name,
-            entry.extension.as_deref(),
-            entry.inode,
-            entry.entry_type,
-            entry.size,
-            entry.blocks,
-            entry.nlink,
-            entry.uid,
-            entry.gid,
-            entry.mode,
-            entry.mtime,
-            entry.atime,
-            entry.ctime,
-            entry.mtime_sec,
-            entry.mtime_nsec,
-            entry.atime_sec,
-            entry.atime_nsec,
-            entry.ctime_sec,
-            entry.ctime_nsec,
-            entry.depth,
-            parent,
-        );
-    }
-
-    /// Append a row sourced from a `DbEntry` (used by the streaming
-    /// writer fed from the walker pipeline).
+    /// Append a row sourced from a `DbEntry` (the streaming writer fed
+    /// from the walker pipeline).
     pub fn push_db_entry(&mut self, entry: &DbEntry) {
         // Prefer the writer-supplied parent_path; fall back to recomputing
         // from the path string when it's None (root entries). The hot

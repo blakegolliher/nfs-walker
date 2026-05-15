@@ -2,7 +2,9 @@
 //!
 //! A high-performance tool for scanning NFS filesystems at scale, using
 //! READDIRPLUS for efficient directory traversal with work-stealing parallelism.
-//! Outputs to RocksDB; convert to SQLite or export to Parquet after the scan.
+//! Output streams directly to sharded Parquet files
+//! (`scans/<scan_id>/part-rNN-SSSSS.parquet` + `metadata.json`), which
+//! DuckDB / DataFusion / Polars can read without any post-hoc step.
 //!
 //! # Features
 //!
@@ -15,45 +17,39 @@
 //! - **Work-Stealing Parallelism**: Multiple workers with work-stealing deques
 //!   for efficient load balancing across workers.
 //!
-//! - **RocksDB Storage**: Fast primary storage; export to SQLite (`export-sql`)
-//!   or Parquet (`export-parquet`) after the scan.
-//!
-//! - **Big-Dir Hunt Mode**: Specialized mode to quickly find directories
-//!   with many files (useful for identifying hot spots).
+//! - **Sharded Parquet Output**: N independent writer threads each owning
+//!   their own Arrow builder + ZSTD encoder; the path-keyspace is split
+//!   via `gxhash % N` so writers never contend.
 //!
 //! # Architecture
 //!
 //! ```text
 //! Directory Queue (crossbeam deque - work stealing)
 //! │
-//! ├── Worker 0: pop dir → READDIRPLUS → send entries → push subdirs
-//! ├── Worker 1: pop dir → READDIRPLUS → send entries → push subdirs
-//! └── Worker N: pop dir → READDIRPLUS → send entries → push subdirs
+//! ├── Worker 0: pop dir → READDIRPLUS → ShardedSender(entry) → push subdirs
+//! ├── Worker 1: pop dir → READDIRPLUS → ShardedSender(entry) → push subdirs
+//! └── Worker N: pop dir → READDIRPLUS → ShardedSender(entry) → push subdirs
 //! │
-//! └── Writer Thread: recv entries → batch insert to RocksDB
+//! └── N Parquet Writers: recv batch → row group → part file
 //! ```
 //!
 //! # Example
 //!
 //! ```bash
-//! # Basic scan to RocksDB
-//! nfs-walker nfs://server/export -o scan.rocks
+//! # Scan to Parquet
+//! nfs-walker nfs://server/export -o scan.parquet -w 32
 //!
-//! # Export to SQLite for ad-hoc SQL
-//! nfs-walker export-sql scan.rocks scan.db --progress
-//!
+//! # Query directly with DuckDB — no conversion step
+//! duckdb -c "SELECT count(*) FROM 'scan.parquet/scans/*/part-*.parquet'"
 //! ```
 
 pub mod config;
 pub mod content;
-pub mod db;
 pub mod error;
 pub mod nfs;
-pub mod progress;
-pub mod rocksdb;
-pub mod scanlog;
-#[cfg(feature = "parquet")]
 pub mod parquet;
+pub mod progress;
+pub mod scanlog;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod walker;

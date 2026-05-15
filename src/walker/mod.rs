@@ -1,26 +1,12 @@
-//! Simple NFS filesystem walker
+//! NFS filesystem walker.
 //!
-//! This module implements a straightforward parallel directory walker
-//! using READDIR for names and parallel GETATTR for file attributes.
+//! Work-stealing parallel walker built on libnfs READDIRPLUS. Output
+//! streams to sharded Parquet via `crate::parquet::direct_writer` —
+//! one writer thread per shard, routed by `sharding::path_to_shard`.
 //!
-//! # Architecture
-//!
-//! ```text
-//!                     ┌─────────────────────────┐
-//!                     │     SimpleWalker        │
-//!                     │  - Coordinator thread   │
-//!                     │  - READDIR (names only) │
-//!                     └───────────┬─────────────┘
-//!                                 │
-//!       ┌─────────────────────────┼─────────────────────────┐
-//!       │                         │                         │
-//! ┌─────▼─────┐             ┌─────▼─────┐             ┌─────▼─────┐
-//! │  Worker 1 │             │  Worker 2 │             │  Worker N │
-//! │  GETATTR  │             │  GETATTR  │             │  GETATTR  │
-//! │  SQLite   │             │  SQLite   │             │  SQLite   │
-//! └───────────┘             └───────────┘             └───────────┘
-//! ```
+//! See `docs/ARCHITECTURE.md` for the full architecture diagram.
 
+pub mod sharding;
 pub mod simple;
 
 pub use simple::{SimpleWalker, WalkProgress, WalkStats};
