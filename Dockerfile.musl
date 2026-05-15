@@ -5,7 +5,7 @@
 #
 # Usage:
 #   podman build -f Dockerfile.musl -t nfs-walker-musl .
-#   podman run --rm nfs-walker-musl cat /app/target/x86_64-unknown-linux-musl/release/nfs-walker > nfs-walker
+#   podman run --rm nfs-walker-musl cat /app/target/x86_64-unknown-linux-musl/release-debug/nfs-walker > nfs-walker
 #   chmod +x nfs-walker
 
 FROM docker.io/library/rust:1.92.0-alpine as builder
