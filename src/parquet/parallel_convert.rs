@@ -275,6 +275,7 @@ where
         scan_timestamp_us,
         &source_url,
         total,
+        total_bytes,
         &parquet_files,
     )?;
 
@@ -602,6 +603,7 @@ fn write_metadata_json(
     scan_timestamp_us: i64,
     source_url: &str,
     total_entries: u64,
+    total_bytes: u64,
     parquet_files: &[String],
 ) -> Result<(), WalkerError> {
     let metadata = serde_json::json!({
@@ -609,6 +611,7 @@ fn write_metadata_json(
         "scan_timestamp_us": scan_timestamp_us,
         "source_url": source_url,
         "total_entries": total_entries,
+        "total_bytes": total_bytes,
         "parquet_files": parquet_files,
     });
 

@@ -222,6 +222,7 @@ where
         scan_timestamp_us,
         &source_url,
         total_exported,
+        total_bytes,
         &parquet_files,
     )?;
 
@@ -305,6 +306,7 @@ fn write_metadata_json(
     scan_timestamp_us: i64,
     source_url: &str,
     total_entries: u64,
+    total_bytes: u64,
     parquet_files: &[String],
 ) -> Result<(), WalkerError> {
     let metadata = serde_json::json!({
@@ -312,6 +314,7 @@ fn write_metadata_json(
         "scan_timestamp_us": scan_timestamp_us,
         "source_url": source_url,
         "total_entries": total_entries,
+        "total_bytes": total_bytes,
         "parquet_files": parquet_files,
     });
 
@@ -483,7 +486,7 @@ mod tests {
             total_rows += batch.num_rows();
 
             // Verify schema matches
-            assert_eq!(batch.num_columns(), 18);
+            assert_eq!(batch.num_columns(), 24);
             assert_eq!(batch.schema().field(0).name(), "path");
             assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
             assert_eq!(batch.schema().field(5).name(), "size");

@@ -2,7 +2,7 @@
 //!
 //! Both the post-scan converter (`convert_rocks_to_parquet`) and the
 //! streaming writer used during a live scan accumulate rows into the
-//! same 18-column Arrow schema and then flush them as a `RecordBatch`.
+//! same 24-column Arrow schema and then flush them as a `RecordBatch`.
 //! This module owns the column-builder boilerplate so neither path
 //! has to duplicate it.
 

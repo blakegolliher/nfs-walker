@@ -204,14 +204,25 @@ pub fn spawn_direct_parquet_writers(
         )));
     }
 
-    let scan_dir = config.output_dir.join("scans").join(&config.scan_id);
-    if scan_dir.exists() {
-        return Err(WalkerError::Parquet(ParquetError::Other(format!(
-            "Refusing to scan: {} already exists. Use a different --output or delete the existing scan directory.",
-            scan_dir.display()
-        ))));
+    let scans_root = config.output_dir.join("scans");
+    let scan_dir = scans_root.join(&config.scan_id);
+    // Create the parent first (idempotent), then atomically create the
+    // scan_id leaf with `create_dir` (not `_all`). This closes the
+    // exists()/create_dir_all() TOCTOU: two concurrent invocations
+    // with the same UUID can't both pass exists() and silently share
+    // the directory — the second `create_dir` will fail with
+    // AlreadyExists.
+    fs::create_dir_all(&scans_root).map_err(ParquetError::Io)?;
+    match fs::create_dir(&scan_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(WalkerError::Parquet(ParquetError::Other(format!(
+                "Refusing to scan: {} already exists. Use a different --output or delete the existing scan directory.",
+                scan_dir.display()
+            ))));
+        }
+        Err(e) => return Err(WalkerError::Parquet(ParquetError::Io(e))),
     }
-    fs::create_dir_all(&scan_dir).map_err(ParquetError::Io)?;
 
     info!(
         "Direct-write Parquet output: {} (scan_id={}, shards={})",
@@ -229,6 +240,18 @@ pub fn spawn_direct_parquet_writers(
     let mut senders: Vec<Sender<Vec<DbEntry>>> = Vec::with_capacity(config.shards);
     let mut joins: Vec<JoinHandle<Result<ShardSummary, WalkerError>>> =
         Vec::with_capacity(config.shards);
+
+    // Filename widths (`part-r{:02}-{:05}.parquet`) are wired into the
+    // lexicographic-sort guarantee in `write_metadata_json`. If anyone
+    // bumps MAX_WRITER_SHARDS above 99 or row_group_size below ~4 KiB
+    // (so part_seq exceeds 100K per shard on a billion-row scan), the
+    // widths need to grow too — otherwise sorts mis-order at the
+    // boundary. Caught here at spawn time, not silently at sort time.
+    debug_assert!(
+        config.shards <= 99,
+        "part-r{{:02}} width overflows at shards={} (>99); widen the format",
+        config.shards
+    );
 
     let channel_depth = config.channel_depth.max(1);
     for shard_idx in 0..config.shards {
@@ -533,6 +556,7 @@ pub fn write_metadata_json(
         "scan_timestamp_us": scan_timestamp_us,
         "source_url": source_url,
         "total_entries": total_entries,
+        "total_bytes": total_bytes,
         "parquet_files": parquet_files,
     });
 

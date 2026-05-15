@@ -1,6 +1,6 @@
 //! Canonical Arrow schema for Parquet export
 //!
-//! Single source of truth for the 18-column schema used in Parquet files.
+//! Single source of truth for the 24-column schema used in Parquet files.
 //! Designed for efficient DataFusion queries with predicate pushdown.
 
 use arrow::datatypes::{DataType, Field, Schema};
@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 /// Build the canonical Arrow schema for filesystem entries.
 ///
-/// 18 columns optimized for DataFusion analytics queries.
+/// 24 columns optimized for DataFusion analytics queries.
 pub fn parquet_schema() -> Schema {
     Schema::new(vec![
         Field::new("path", DataType::Utf8, false),
@@ -86,9 +86,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_schema_has_18_fields() {
+    fn test_schema_has_24_fields() {
         let schema = parquet_schema();
-        assert_eq!(schema.fields().len(), 18);
+        assert_eq!(schema.fields().len(), 24);
     }
 
     #[test]
