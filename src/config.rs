@@ -859,7 +859,7 @@ impl WalkConfig {
             output_format: args.output_format,
             parquet_compression: args.parquet_compression,
             parquet_row_group_size: args.parquet_row_group_size.max(1),
-            parquet_file_size_bytes: args.parquet_file_size_mb.saturating_mul(1024 * 1024),
+            parquet_file_size_bytes: args.parquet_file_size_mb.max(1).saturating_mul(1024 * 1024),
             parquet_channel_depth: args.parquet_channel_depth.max(1),
             server_ips,
             log,
