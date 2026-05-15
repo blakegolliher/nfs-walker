@@ -156,11 +156,13 @@ impl RowBuilder {
     /// writer fed from the walker pipeline).
     pub fn push_db_entry(&mut self, entry: &DbEntry) {
         // Prefer the writer-supplied parent_path; fall back to recomputing
-        // from the path string when it's None (root entries).
-        let parent_owned = entry
+        // from the path string when it's None (root entries). The hot
+        // path is `as_deref()` which doesn't allocate — the
+        // recompute-from-path branch only fires for root-ish entries.
+        let parent: &str = entry
             .parent_path
-            .clone()
-            .unwrap_or_else(|| compute_parent_path(&entry.path).to_string());
+            .as_deref()
+            .unwrap_or_else(|| compute_parent_path(&entry.path));
         self.append_common(
             &entry.path,
             &entry.name,
@@ -183,7 +185,7 @@ impl RowBuilder {
             entry.ctime_sec,
             entry.ctime_nsec,
             entry.depth,
-            &parent_owned,
+            parent,
         );
     }
 
