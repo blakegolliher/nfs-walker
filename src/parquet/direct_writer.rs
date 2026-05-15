@@ -19,6 +19,26 @@
 //!
 //! See `tasks/todo.md` for the design and the motivating customer
 //! benchmark (libnfs + DuckDB → 3 M files/sec with 32 parallel writers).
+//!
+//! # Failure handling
+//!
+//! Each in-flight part file is owned by an `InProgressPart` RAII guard.
+//! If a writer thread returns `Err` (e.g. `flush_row_group` fails or
+//! `ArrowWriter::close` fails on footer write), the guard's `Drop`
+//! removes the partial file from disk before the thread exits. The
+//! caller (`run_parquet`) skips `write_metadata_json` whenever any
+//! shard returns `Err`, so the scan-dir cannot end up containing
+//! footer-less part files plus a `metadata.json` that lies about
+//! completeness.
+//!
+//! Caveat: `Cargo.toml` sets `panic = "abort"` on the release profile,
+//! so a panic inside the writer thread terminates the process before
+//! `Drop` runs. Under abort, a partial part file may persist as
+//! `scans/<uuid>/part-rNN-SSSSS.parquet`, but `metadata.json` is also
+//! absent (it's written from the main thread only after every shard
+//! has joined cleanly) — the artifacts are orphan files, not lying
+//! summaries. `dev` builds (and any build switched to `panic =
+//! "unwind"`) get full panic cleanup via `Drop`.
 
 use crate::error::{ParquetError, WalkerError};
 use crate::nfs::types::DbEntry;
@@ -35,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Compression algorithm choice for the direct-write Parquet pipeline.
 ///
@@ -270,6 +290,60 @@ pub fn spawn_direct_parquet_writers(
     })
 }
 
+/// RAII guard for an in-flight `part-rNN-SSSSS.parquet`. Removes the
+/// file on `Drop` unless `commit()` has been called. Catches the Err
+/// paths of P0-5 fully and panic-unwind paths of P0-4 on `dev` /
+/// `panic = "unwind"` builds — see the module-level note on
+/// `panic = "abort"` for the release-build gap.
+struct InProgressPart {
+    path: PathBuf,
+    filename: String,
+    committed: bool,
+}
+
+impl InProgressPart {
+    fn new(scan_dir: &Path, shard_idx: usize, part_seq: u32) -> Self {
+        let filename = format!("part-r{:02}-{:05}.parquet", shard_idx, part_seq);
+        let path = scan_dir.join(&filename);
+        Self { path, filename, committed: false }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Mark the part file as successfully closed. Returns the filename
+    /// so the caller can record it on its `ShardSummary`. Consumes
+    /// `self`; subsequent `Drop` is a no-op.
+    fn commit(mut self) -> String {
+        self.committed = true;
+        std::mem::take(&mut self.filename)
+    }
+}
+
+impl Drop for InProgressPart {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(_) => debug!(
+                "removed in-progress part file {} (writer failed before commit)",
+                self.path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File::create may have failed before any bytes hit
+                // disk; nothing to clean up.
+            }
+            Err(e) => warn!(
+                "failed to remove in-progress part file {}: {}",
+                self.path.display(),
+                e
+            ),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn writer_loop(
     shard_idx: usize,
@@ -289,8 +363,8 @@ fn writer_loop(
 
     let mut row_builder = RowBuilder::new(row_ctx);
     let mut part_seq: u32 = 0;
-    let (mut writer, mut current_filename) =
-        open_part_writer(&scan_dir, shard_idx, part_seq, &schema, &props)?;
+    let mut inprogress = InProgressPart::new(&scan_dir, shard_idx, part_seq);
+    let mut writer = open_part_writer(inprogress.path(), &schema, &props)?;
     part_seq += 1;
 
     let mut summary = ShardSummary {
@@ -324,24 +398,17 @@ fn writer_loop(
 
                 // File rotation runs after the row group is written —
                 // never mid-group, so the closed file always has a
-                // valid footer.
+                // valid footer. Close + commit the current part before
+                // opening the next; if close() errors, `?` propagates
+                // out and `inprogress`'s Drop removes the partial.
                 if writer.bytes_written() as usize >= target_file_size {
-                    let (closed_bytes, closed_filename) = close_writer_take_name(
-                        writer,
-                        current_filename,
-                    )?;
+                    let closed_bytes = writer.bytes_written() as u64;
+                    writer.close().map_err(ParquetError::Parquet)?;
                     summary.bytes_written += closed_bytes;
-                    summary.part_files.push(closed_filename);
+                    summary.part_files.push(inprogress.commit());
 
-                    let opened = open_part_writer(
-                        &scan_dir,
-                        shard_idx,
-                        part_seq,
-                        &schema,
-                        &props,
-                    )?;
-                    writer = opened.0;
-                    current_filename = opened.1;
+                    inprogress = InProgressPart::new(&scan_dir, shard_idx, part_seq);
+                    writer = open_part_writer(inprogress.path(), &schema, &props)?;
                     part_seq += 1;
                 }
             }
@@ -359,9 +426,10 @@ fn writer_loop(
         )?;
     }
 
-    let (closed_bytes, closed_filename) = close_writer_take_name(writer, current_filename)?;
+    let closed_bytes = writer.bytes_written() as u64;
+    writer.close().map_err(ParquetError::Parquet)?;
     summary.bytes_written += closed_bytes;
-    summary.part_files.push(closed_filename);
+    summary.part_files.push(inprogress.commit());
 
     debug!(
         "parquet writer {} finished: {} entries, {} bytes, {} part files",
@@ -389,34 +457,19 @@ fn flush_row_group(
     Ok(())
 }
 
+/// Open a fresh part-file writer at `path`. The caller pairs this with
+/// an `InProgressPart` guard that owns the same path, so a returned
+/// `Err` (or a later Err propagated up the writer loop before commit)
+/// causes the guard's `Drop` to remove the partial file.
 fn open_part_writer(
-    scan_dir: &Path,
-    shard_idx: usize,
-    part_seq: u32,
+    path: &Path,
     schema: &Arc<Schema>,
     props: &Arc<WriterProperties>,
-) -> Result<(ArrowWriter<File>, String), WalkerError> {
-    let filename = format!("part-r{:02}-{:05}.parquet", shard_idx, part_seq);
-    let path: PathBuf = scan_dir.join(&filename);
-    let file = File::create(&path).map_err(ParquetError::Io)?;
-    let writer =
-        ArrowWriter::try_new(file, schema.clone(), Some(props.as_ref().clone()))
-            .map_err(ParquetError::Parquet)?;
-    Ok((writer, filename))
-}
-
-/// Close a writer and return the (bytes_written, filename).
-///
-/// `ArrowWriter::close` consumes the writer and finalizes the footer,
-/// so the caller must use the returned bytes count instead of probing
-/// the closed handle.
-fn close_writer_take_name(
-    writer: ArrowWriter<File>,
-    filename: String,
-) -> Result<(u64, String), WalkerError> {
-    let bytes = writer.bytes_written() as u64;
-    writer.close().map_err(ParquetError::Parquet)?;
-    Ok((bytes, filename))
+) -> Result<ArrowWriter<File>, WalkerError> {
+    let file = File::create(path).map_err(ParquetError::Io)?;
+    let writer = ArrowWriter::try_new(file, schema.clone(), Some(props.as_ref().clone()))
+        .map_err(ParquetError::Parquet)?;
+    Ok(writer)
 }
 
 /// Build the per-shard `WriterProperties`.
@@ -666,6 +719,55 @@ mod tests {
         let metrics = build_metrics(1);
         let result = spawn_direct_parquet_writers(cfg, metrics);
         assert!(result.is_err(), "must refuse to overwrite existing scan_dir");
+    }
+
+    #[test]
+    fn inprogress_part_drop_removes_uncommitted_file() {
+        let dir = tempdir().unwrap();
+        let scan_dir = dir.path().to_path_buf();
+
+        let path_on_disk = {
+            let inprogress = InProgressPart::new(&scan_dir, 0, 0);
+            // Simulate the writer touching the file.
+            File::create(inprogress.path()).unwrap();
+            assert!(inprogress.path().exists(), "setup: file must exist");
+            inprogress.path().to_path_buf()
+            // inprogress drops here without commit() — should remove file
+        };
+        assert!(
+            !path_on_disk.exists(),
+            "uncommitted Drop must remove {}",
+            path_on_disk.display()
+        );
+    }
+
+    #[test]
+    fn inprogress_part_commit_preserves_file() {
+        let dir = tempdir().unwrap();
+        let scan_dir = dir.path().to_path_buf();
+
+        let inprogress = InProgressPart::new(&scan_dir, 0, 0);
+        File::create(inprogress.path()).unwrap();
+        let path_on_disk = inprogress.path().to_path_buf();
+        let returned_filename = inprogress.commit();
+
+        assert!(
+            path_on_disk.exists(),
+            "committed file must persist after Drop"
+        );
+        assert_eq!(returned_filename, "part-r00-00000.parquet");
+    }
+
+    #[test]
+    fn inprogress_part_drop_tolerates_missing_file() {
+        // File::create may have failed before the guard saw bytes; Drop
+        // must not warn or error when the path doesn't exist.
+        let dir = tempdir().unwrap();
+        let scan_dir = dir.path().to_path_buf();
+        let inprogress = InProgressPart::new(&scan_dir, 3, 42);
+        // Don't create the file — let Drop run on an absent path.
+        drop(inprogress);
+        // No assertion needed; we're checking the call doesn't panic.
     }
 }
 
