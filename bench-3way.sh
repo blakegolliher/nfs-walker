@@ -84,6 +84,15 @@ G=$'\033[0;32m'; Y=$'\033[1;33m'; N=$'\033[0m'
 hdr() { printf '\n%s=== %s ===%s\n' "$G" "$1" "$N"; }
 note() { printf '%s%s%s\n' "$Y" "$1" "$N"; }
 
+# duckdb is only used for the post-run parquet row-count sanity check.
+# A fresh prod host without duckdb installed would silently produce
+# empty row counts ("rows: " in the summary), which previously read as
+# "scan emitted 0 rows" rather than "duckdb not present". Warn loudly
+# at start so the operator knows what's missing.
+if ! command -v duckdb >/dev/null 2>&1; then
+    note "warning: duckdb not on PATH — parquet row counts will be reported as 0"
+fi
+
 drop_caches() {
     if [ "$NO_CACHE_DROP" = "1" ]; then
         note "cache drop: skipped"
@@ -214,9 +223,12 @@ archive_output_dir() {
         }
     else
         note "archive: moving $name -> $dest_root/ (frees local disk)"
+        # Track which path we took so the "done" log isn't misleading.
+        local archive_method="mv"
         if mv "$out_dir" "$dest_root/" 2>/dev/null; then
             :
         else
+            archive_method="cp+rm"
             cp -r "$out_dir" "$dest_root/" || {
                 note "archive: copy fallback failed; leaving $name local"
                 return
@@ -228,7 +240,7 @@ archive_output_dir() {
     # and let the next run start eating /tmp + local page cache.
     sync
     t1=$(date +%s)
-    note "archive: $name done in $((t1 - t0))s (cp+sync)"
+    note "archive: $name done in $((t1 - t0))s (${archive_method:-cp}+sync)"
 }
 
 # Pre-flight: bail before starting a run if local disk is too tight to

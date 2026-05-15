@@ -69,6 +69,14 @@ note() {
     printf '%s%s%s\n' "$YELLOW" "$1" "$NC"
 }
 
+# duckdb is only used for the post-run parquet row-count sanity check.
+# Without it, the row count silently reports "unavailable" (line 177
+# below) — which previously left operators wondering whether duckdb
+# was missing or the scan was empty. Warn loudly at start instead.
+if ! command -v duckdb >/dev/null 2>&1; then
+    note "warning: duckdb not on PATH — parquet row count will be 'unavailable'"
+fi
+
 drop_caches() {
     if [ "$NO_CACHE_DROP" = "1" ]; then
         note "cache drop: skipped (NO_CACHE_DROP=1)"
