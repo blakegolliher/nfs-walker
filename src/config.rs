@@ -30,12 +30,16 @@ const MAX_BATCH_SIZE: usize = 100_000;
 /// per context and we'd risk hitting per-context server-side caps.
 const MAX_PIPELINE_DEPTH: usize = 64;
 
-/// Maximum writer-shard count. RocksDB's compaction thread pool is
-/// shared across CFs; with shards beyond ~32 the pool starts to thrash
-/// and per-shard memtable memory grows superlinearly with no further
-/// throughput gain. The Parquet direct-write path has no shared
-/// compaction pool, so this cap is artificially generous for it; the
-/// limit there is per-shard memory for in-flight Arrow builders.
+/// Maximum writer-shard count. The cap is set by the RocksDB backend:
+/// its compaction thread pool is shared across CFs and starts to thrash
+/// beyond ~32 shards (per-shard memtable memory grows superlinearly with
+/// no further throughput gain). The Parquet direct-write path has no
+/// shared compaction pool, so this cap is artificially low for it —
+/// the real limit there is per-shard memory for in-flight Arrow
+/// builders. We keep the cap uniform across both backends for simplicity
+/// and because 32 shards has been more than enough on every prod scan
+/// to date. Lifting the cap for parquet alone is a follow-up if a fat
+/// host genuinely wants 64+ parquet shards.
 const MAX_WRITER_SHARDS: usize = 32;
 
 /// Default writer-shard count when `--output-format parquet` is selected

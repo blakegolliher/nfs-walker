@@ -24,6 +24,15 @@ server = ["parquet", "dep:datafusion", "dep:axum", "dep:tower-http", "dep:tokio"
 # code path so every Rust allocation (Vec, hashbrown, parquet dict encoders)
 # uses a real thread-aware allocator. See tasks/todo.md "Production scan"
 # section for the 2026-05-15 segfault investigation.
+#
+# `default-features = false` is a no-op today (the `mimalloc` crate declares
+# `default = []`) but is set explicitly so a future upstream change that
+# adds default features (e.g. `secure`, which has a measurable perf
+# impact) doesn't silently bleed into our binary. Caveat: only Rust-side
+# allocations route through mimalloc; libnfs/librocksdb/libzstd/snappy
+# still call into the system malloc (Zig SmpAllocator on musl). If the
+# 250-thread crash resurfaces under different thread mixes, suspect
+# C-side allocator pressure as the next root cause.
 mimalloc = { version = "0.1", default-features = false }
 
 # CLI parsing with derive macros
