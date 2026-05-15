@@ -8,7 +8,7 @@
 #   podman run --rm nfs-walker-musl cat /app/target/x86_64-unknown-linux-musl/release/nfs-walker > nfs-walker
 #   chmod +x nfs-walker
 
-FROM docker.io/library/rust:1.83.0-alpine as builder
+FROM docker.io/library/rust:1.92.0-alpine as builder
 
 # Install build dependencies for musl + C++ + RocksDB
 RUN apk add --no-cache \
@@ -63,11 +63,10 @@ COPY . .
 # Clean any stale Cargo.lock
 RUN rm -f Cargo.lock
 
-# Build static musl binary with RocksDB
-RUN cargo build --release --target x86_64-unknown-linux-musl --features rocksdb
-
-# Strip the binary for smaller size
-RUN strip /app/target/x86_64-unknown-linux-musl/release/nfs-walker
+# Build static musl binary with debug info (release-debug profile).
+# Keeps line tables + symtab for crash-symbolication during the prod-segfault
+# investigation. No -C strip=symbols pass.
+RUN cargo build --profile release-debug --target x86_64-unknown-linux-musl
 
 # The final binary is at:
-# /app/target/x86_64-unknown-linux-musl/release/nfs-walker
+# /app/target/x86_64-unknown-linux-musl/release-debug/nfs-walker

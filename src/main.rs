@@ -2,6 +2,15 @@
 //!
 //! Entry point for the CLI application.
 
+// Route every Rust allocation through mimalloc instead of the system malloc.
+// The cargo-zigbuild musl binary links a Zig C-shim malloc backed by Zig's
+// SmpAllocator, which returns NULL for ~30 KB requests once thread count
+// crosses ~250 (observed reliably at WORKERS=230 + 32 parquet writers on
+// se-var-n8). Setting #[global_allocator] makes Rust skip the system malloc
+// entirely, so the parquet dict-encoder rehash path no longer crashes.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use humansize::{format_size, BINARY};

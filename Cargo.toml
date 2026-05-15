@@ -18,6 +18,14 @@ parquet = ["dep:arrow", "dep:parquet", "dep:uuid", "dep:serde_json"]
 server = ["parquet", "dep:datafusion", "dep:axum", "dep:tower-http", "dep:tokio", "dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
+# Global allocator. cargo-zigbuild's binary links to Zig's std SmpAllocator
+# via its C-shim malloc, which returns NULL for ~30 KB requests once thread
+# count crosses ~250. Rooting the global allocator at mimalloc bypasses that
+# code path so every Rust allocation (Vec, hashbrown, parquet dict encoders)
+# uses a real thread-aware allocator. See tasks/todo.md "Production scan"
+# section for the 2026-05-15 segfault investigation.
+mimalloc = { version = "0.1", default-features = false }
+
 # CLI parsing with derive macros
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 
@@ -91,6 +99,13 @@ codegen-units = 1
 panic = "abort"
 strip = true
 opt-level = 3
+
+# Same as release but keeps symbols + line tables for crash-symbolication.
+# Used for the debuginfo musl build during the prod-segfault investigation.
+[profile.release-debug]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
 
 [profile.dev]
 opt-level = 1
