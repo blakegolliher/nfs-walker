@@ -242,125 +242,139 @@ impl SimpleWalker {
         let metrics = self.build_metrics(shards);
         metrics.set_output_path(self.config.output_path.clone());
 
+        // Logger is started early so progress is visible before workers
+        // come up. It's joined in the unconditional cleanup block below.
         let logger_handle = self.maybe_start_logger(metrics.clone(), start);
 
-        let direct_cfg = DirectWriteConfig {
-            output_dir: self.config.output_path.clone(),
-            scan_id: scan_id.clone(),
-            scan_timestamp_us,
-            shards,
-            row_group_size: self.config.parquet_row_group_size,
-            target_file_size: self.config.parquet_file_size_bytes,
-            compression: self.config.parquet_compression.to_direct_writer(),
-            channel_depth: self.config.parquet_channel_depth,
-        };
+        // Run the body inside an IIFE so any `?` lands in `result`
+        // without skipping the logger join below.
+        let result = (|| -> Result<WalkStats> {
+            let direct_cfg = DirectWriteConfig {
+                output_dir: self.config.output_path.clone(),
+                scan_id: scan_id.clone(),
+                scan_timestamp_us,
+                shards,
+                row_group_size: self.config.parquet_row_group_size,
+                target_file_size: self.config.parquet_file_size_bytes,
+                compression: self.config.parquet_compression.to_direct_writer(),
+                channel_depth: self.config.parquet_channel_depth,
+            };
 
-        let pool =
-            spawn_direct_parquet_writers(direct_cfg, metrics.clone()).map_err(|e| match e {
-                WalkerError::Parquet(p) => WalkerError::Parquet(p),
-                other => other,
-            })?;
+            let pool = spawn_direct_parquet_writers(direct_cfg, metrics.clone())?;
 
-        // Register clones for queue-depth observation. MUST be paired
-        // with `release_write_senders()` before joining, same trap as
-        // the RocksDB shard path.
-        for tx in &pool.senders {
-            metrics.register_write_sender(tx.clone());
-        }
+            // Register clones for queue-depth observation. MUST be paired
+            // with `release_write_senders()` before joining writers.
+            for tx in &pool.senders {
+                metrics.register_write_sender(tx.clone());
+            }
 
-        self.run_workers(pool.senders, metrics.clone())?;
+            let scan_dir = pool.scan_dir.clone();
+            let workers_result = self.run_workers(pool.senders, metrics.clone());
 
-        // Drop the observability clones so each writer's recv() returns
-        // Err and the thread can flush its tail and close the part file.
-        metrics.release_write_senders();
-
-        let mut summaries = Vec::with_capacity(pool.joins.len());
-        let mut first_err: Option<WalkerError> = None;
-        for (idx, h) in pool.joins.into_iter().enumerate() {
-            match h.join() {
-                Ok(Ok(s)) => summaries.push(s),
-                Ok(Err(e)) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
+            // ALWAYS release the observability clones and join the
+            // writer threads, regardless of whether the workers
+            // succeeded. Skipping this step (e.g. by `?`-propagating
+            // workers_result here) would leave the writer threads
+            // blocked on recv() with the channels held open via the
+            // metrics-registered sender clones, and the main thread
+            // would exit before they finish flushing footers — yielding
+            // truncated `.parquet` files on disk.
+            metrics.release_write_senders();
+            let mut summaries = Vec::with_capacity(pool.joins.len());
+            let mut writer_err: Option<WalkerError> = None;
+            for (idx, h) in pool.joins.into_iter().enumerate() {
+                match h.join() {
+                    Ok(Ok(s)) => summaries.push(s),
+                    Ok(Err(e)) => {
+                        if writer_err.is_none() {
+                            writer_err = Some(e);
+                        }
+                        warn!("parquet writer shard {} failed", idx);
                     }
-                    warn!("parquet writer shard {} failed", idx);
-                }
-                Err(_) => {
-                    if first_err.is_none() {
-                        first_err = Some(WalkerError::Parquet(
-                            crate::error::ParquetError::Other(format!(
-                                "parquet writer shard {} panicked",
-                                idx
-                            )),
-                        ));
+                    Err(_) => {
+                        if writer_err.is_none() {
+                            writer_err = Some(WalkerError::Parquet(
+                                crate::error::ParquetError::Other(format!(
+                                    "parquet writer shard {} panicked",
+                                    idx
+                                )),
+                            ));
+                        }
                     }
                 }
             }
-        }
-        if let Some(e) = first_err {
-            return Err(e);
-        }
 
-        let source_url = self.config.nfs_url.to_display_string();
-        let (total_entries, _total_bytes, _files) = write_direct_metadata_json(
-            &pool.scan_dir,
-            &scan_id,
-            scan_timestamp_us,
-            &source_url,
-            &summaries,
-        )?;
-
-        let dirs = self.dirs_count.load(Ordering::Relaxed);
-        let files = self.files_count.load(Ordering::Relaxed);
-        let bytes = self.bytes_count.load(Ordering::Relaxed);
-        let errors = self.errors_count.load(Ordering::Relaxed);
-
-        // Walker counters and parquet row count measure different
-        // things and can't be compared directly:
-        //   - `dirs_count` counts directories we READ (called
-        //     readdirplus on), not directories we EMITTED.
-        //   - `files_count` counts files we saw inside those reads.
-        //   - parquet rows = every non-dot entry returned by any
-        //     readdir that we completed (subdirs are emitted by their
-        //     parent's readdir even when we don't recurse into them).
-        //
-        // The relation with no depth limit (and no exclude patterns)
-        // is `parquet_rows == files + dirs - 1` (minus one because the
-        // root directory is never emitted as a child of its parent).
-        // With a depth limit, there's an additional "seen but skipped"
-        // term we don't track separately, so any mismatch is expected.
-        if self.config.max_depth.is_none() && self.config.exclude_patterns.is_empty() {
-            let expected = files.saturating_add(dirs.saturating_sub(1));
-            if total_entries != expected {
-                warn!(
-                    "parquet row count {} != expected {} (files {} + dirs {} - 1) — \
-                     entries may have been dropped",
-                    total_entries, expected, files, dirs
-                );
+            // Workers' error wins (it's the upstream cause). Only if
+            // workers succeeded does a writer error become the failure.
+            workers_result?;
+            if let Some(e) = writer_err {
+                return Err(e);
             }
-        }
 
-        let stats = WalkStats {
-            dirs,
-            files,
-            bytes,
-            errors,
-            duration: start.elapsed(),
-            completed: !self.shutdown.load(Ordering::Relaxed),
-        };
+            let source_url = self.config.nfs_url.to_display_string();
+            let (total_entries, _total_bytes, _files) = write_direct_metadata_json(
+                &scan_dir,
+                &scan_id,
+                scan_timestamp_us,
+                &source_url,
+                &summaries,
+            )?;
 
+            let dirs = self.dirs_count.load(Ordering::Relaxed);
+            let files = self.files_count.load(Ordering::Relaxed);
+            let bytes = self.bytes_count.load(Ordering::Relaxed);
+            let errors = self.errors_count.load(Ordering::Relaxed);
+
+            // Walker counters and parquet row count measure different
+            // things and can't be compared directly:
+            //   - `dirs_count` counts directories we READ (called
+            //     readdirplus on), not directories we EMITTED.
+            //   - `files_count` counts files we saw inside those reads.
+            //   - parquet rows = every non-dot entry returned by any
+            //     readdir that we completed (subdirs are emitted by their
+            //     parent's readdir even when we don't recurse into them).
+            //
+            // The relation with no depth limit (and no exclude patterns)
+            // is `parquet_rows == files + dirs - 1` (minus one because
+            // the root directory is never emitted as a child of its
+            // parent). With a depth limit, there's an additional "seen
+            // but skipped" term we don't track separately, so any
+            // mismatch is expected.
+            if self.config.max_depth.is_none() && self.config.exclude_patterns.is_empty() {
+                let expected = files.saturating_add(dirs.saturating_sub(1));
+                if total_entries != expected {
+                    warn!(
+                        "parquet row count {} != expected {} (files {} + dirs {} - 1) — \
+                         entries may have been dropped",
+                        total_entries, expected, files, dirs
+                    );
+                }
+            }
+
+            info!(
+                "Direct-write Parquet scan complete: {} rows in {} part files",
+                total_entries,
+                summaries.iter().map(|s| s.part_files.len()).sum::<usize>()
+            );
+
+            Ok(WalkStats {
+                dirs,
+                files,
+                bytes,
+                errors,
+                duration: start.elapsed(),
+                completed: !self.shutdown.load(Ordering::Relaxed),
+            })
+        })();
+
+        // ALWAYS stop the logger and join its thread — must run on both
+        // success and failure paths.
         metrics.signal_shutdown();
         if let Some(h) = logger_handle {
             let _ = h.join();
         }
 
-        info!(
-            "Direct-write Parquet scan complete: {} rows in {} part files",
-            total_entries,
-            summaries.iter().map(|s| s.part_files.len()).sum::<usize>()
-        );
-
-        Ok(stats)
+        result
     }
 
     /// Run walker with RocksDB output. Fans out to `writer_shards`
@@ -379,107 +393,151 @@ impl SimpleWalker {
         let metrics = self.build_metrics(shards);
         metrics.set_output_path(rocks_path.clone());
 
-        // Spawn the progress-logfile snapshot thread.
+        // Spawn the progress-logfile snapshot thread. Joined in the
+        // unconditional cleanup block at the bottom of this function.
         let logger_handle = self.maybe_start_logger(metrics.clone(), start);
 
-        let rocks_handle: Arc<RocksHandle> = if shards <= 1 {
-            // Single-shard path: legacy single rocks-writer thread.
-            let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(1024);
-            metrics.register_write_sender(entry_tx.clone());
+        // Body wrapped in an IIFE so any `?` lands in `result` without
+        // skipping the logger cleanup below.
+        let result = (|| -> Result<WalkStats> {
+            let rocks_handle: Arc<RocksHandle> = if shards <= 1 {
+                // Single-shard path: legacy single rocks-writer thread.
+                let (entry_tx, entry_rx) = bounded::<Vec<DbEntry>>(1024);
+                metrics.register_write_sender(entry_tx.clone());
 
-            let writer_handle = self.spawn_rocksdb_writer(
-                rocks_path.clone(),
-                entry_rx,
-                metrics.clone(),
-            )?;
+                let writer_handle = self.spawn_rocksdb_writer(
+                    rocks_path.clone(),
+                    entry_rx,
+                    metrics.clone(),
+                )?;
 
-            self.run_workers(vec![entry_tx], metrics.clone())?;
+                let workers_result = self.run_workers(vec![entry_tx], metrics.clone());
 
-            // Release the cloned sender so the writer's recv() unblocks
-            // when the workers' senders drop. (Sender clones held here for
-            // queue-depth observation otherwise keep the channel alive.)
-            metrics.release_write_senders();
+                // ALWAYS release the observability clone and join the
+                // writer thread, regardless of workers_result. Skipping
+                // either step (e.g. via `?`-propagating workers_result)
+                // would block the writer in recv() forever (channel kept
+                // alive by the metrics-registered clone) or detach the
+                // writer thread (handle dropped without join) — either
+                // way the writer never gets to commit its tail batch.
+                metrics.release_write_senders();
+                let writer_result: Result<Arc<RocksHandle>> = match writer_handle.join() {
+                    Ok(Ok(h)) => Ok(Arc::new(h)),
+                    Ok(Err(e)) => Err(WalkerError::Rocks(e)),
+                    Err(_) => Err(WalkerError::Worker(crate::error::WorkerError::Panicked {
+                        id: 0,
+                        message: "RocksDB writer thread panicked".to_string(),
+                    })),
+                };
 
-            let h = writer_handle
-                .join()
-                .expect("RocksDB writer thread panicked")
-                .map_err(WalkerError::Rocks)?;
-            Arc::new(h)
-        } else {
-            // Multi-shard path: spawn N writers, each owning one path
-            // shard CF. Final summary is the merge of each shard's
-            // accumulator.
-            let (rocks_handle, writer_handles, txs) =
-                self.spawn_sharded_rocksdb_writers(rocks_path.clone(), shards, metrics.clone())?;
-            for tx in &txs {
-                metrics.register_write_sender(tx.clone());
-            }
+                // Workers' error takes precedence (upstream cause); only
+                // surface the writer error if workers succeeded.
+                workers_result?;
+                writer_result?
+            } else {
+                // Multi-shard path: spawn N writers, each owning one
+                // path shard CF. Final summary is the merge of each
+                // shard's accumulator.
+                let (rocks_handle, writer_handles, txs) = self.spawn_sharded_rocksdb_writers(
+                    rocks_path.clone(),
+                    shards,
+                    metrics.clone(),
+                )?;
+                for tx in &txs {
+                    metrics.register_write_sender(tx.clone());
+                }
 
-            // Run workers (route per-entry into shard channels).
-            self.run_workers(txs, metrics.clone())?;
+                let workers_result = self.run_workers(txs, metrics.clone());
 
-            // Same fix as the single-shard path: release the cloned
-            // senders so each per-shard writer's recv() unblocks.
-            metrics.release_write_senders();
+                // ALWAYS release observability senders + join writers.
+                // Same reasoning as the single-shard arm above.
+                metrics.release_write_senders();
+                use crate::rocksdb::summary::SummaryAccumulator;
+                let mut merged = SummaryAccumulator::new();
+                let mut writer_err: Option<WalkerError> = None;
+                for (shard_idx, h) in writer_handles.into_iter().enumerate() {
+                    match h.join() {
+                        Ok(Ok(shard_summary)) => {
+                            debug!(
+                                "shard {} contributed: files={} dirs={}",
+                                shard_idx,
+                                shard_summary.total.total_files,
+                                shard_summary.total.total_dirs
+                            );
+                            merged.merge_from(&shard_summary);
+                        }
+                        Ok(Err(e)) => {
+                            if writer_err.is_none() {
+                                writer_err = Some(WalkerError::Rocks(e));
+                            }
+                            warn!("rocks shard writer {} returned error", shard_idx);
+                        }
+                        Err(_) => {
+                            if writer_err.is_none() {
+                                writer_err = Some(WalkerError::Worker(
+                                    crate::error::WorkerError::Panicked {
+                                        id: shard_idx,
+                                        message: format!(
+                                            "RocksDB shard writer {} panicked",
+                                            shard_idx
+                                        ),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
 
-            // Join all shard writers; merge their accumulators into a
-            // single summary and flush it to the summary CF.
-            use crate::rocksdb::summary::SummaryAccumulator;
-            let mut merged = SummaryAccumulator::new();
-            for (shard_idx, h) in writer_handles.into_iter().enumerate() {
-                let shard_summary = h
-                    .join()
-                    .expect("RocksDB shard writer thread panicked")
+                workers_result?;
+                if let Some(e) = writer_err {
+                    return Err(e);
+                }
+
+                merged.touch_now();
+                let mut wopts = rocksdb::WriteOptions::default();
+                wopts.disable_wal(true);
+                flush_summary_to_cf(&rocks_handle, &merged, &wopts)
                     .map_err(WalkerError::Rocks)?;
-                debug!(
-                    "shard {} contributed: files={} dirs={}",
-                    shard_idx, shard_summary.total.total_files, shard_summary.total.total_dirs
-                );
-                merged.merge_from(&shard_summary);
-            }
-            merged.touch_now();
+                rocks_handle.db.flush().map_err(|e| {
+                    WalkerError::Rocks(crate::error::RocksError::Rocks(e))
+                })?;
 
-            let mut wopts = rocksdb::WriteOptions::default();
-            wopts.disable_wal(true);
-            flush_summary_to_cf(&rocks_handle, &merged, &wopts).map_err(WalkerError::Rocks)?;
-            rocks_handle.db.flush().map_err(|e| {
-                WalkerError::Rocks(crate::error::RocksError::Rocks(e))
-            })?;
+                rocks_handle
+            };
 
-            rocks_handle
-        };
+            // Finalize database
+            info!("Finalizing RocksDB...");
+            let stats_snapshot = WalkStatsSnapshot {
+                dirs: self.dirs_count.load(Ordering::Relaxed),
+                files: self.files_count.load(Ordering::Relaxed),
+                bytes: self.bytes_count.load(Ordering::Relaxed),
+                errors: self.errors_count.load(Ordering::Relaxed),
+            };
+            finalize_rocks_db(
+                &rocks_handle,
+                start.elapsed(),
+                !self.shutdown.load(Ordering::Relaxed),
+                &stats_snapshot,
+            )
+            .map_err(WalkerError::Rocks)?;
 
-        // Finalize database
-        info!("Finalizing RocksDB...");
-        let stats_snapshot = WalkStatsSnapshot {
-            dirs: self.dirs_count.load(Ordering::Relaxed),
-            files: self.files_count.load(Ordering::Relaxed),
-            bytes: self.bytes_count.load(Ordering::Relaxed),
-            errors: self.errors_count.load(Ordering::Relaxed),
-        };
-        finalize_rocks_db(
-            &rocks_handle,
-            start.elapsed(),
-            !self.shutdown.load(Ordering::Relaxed),
-            &stats_snapshot,
-        ).map_err(WalkerError::Rocks)?;
+            Ok(WalkStats {
+                dirs: stats_snapshot.dirs,
+                files: stats_snapshot.files,
+                bytes: stats_snapshot.bytes,
+                errors: stats_snapshot.errors,
+                duration: start.elapsed(),
+                completed: !self.shutdown.load(Ordering::Relaxed),
+            })
+        })();
 
-        let stats = WalkStats {
-            dirs: stats_snapshot.dirs,
-            files: stats_snapshot.files,
-            bytes: stats_snapshot.bytes,
-            errors: stats_snapshot.errors,
-            duration: start.elapsed(),
-            completed: !self.shutdown.load(Ordering::Relaxed),
-        };
-
-        // Final-flush the progress logfile.
+        // ALWAYS stop the logger and join its thread.
         metrics.signal_shutdown();
         if let Some(h) = logger_handle {
             let _ = h.join();
         }
 
-        Ok(stats)
+        result
     }
 
     /// Build a fresh `ScanMetrics` populated with references to the walker's
@@ -605,17 +663,31 @@ impl SimpleWalker {
         let mut fail_counts: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
 
-        // Spawn workers
+        // Spawn workers. A connection failure must NOT short-circuit out
+        // of this function via `?` — already-spawned workers below would
+        // be detached, their senders would stay alive (cloned into each
+        // thread), and `run_parquet`/`run_rocksdb` would never get to
+        // join the writer threads. Instead, capture the error, signal
+        // shutdown so any already-spawned worker exits its loop, then
+        // fall through to the drop+join cleanup at the end.
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        let mut spawn_err: Option<WalkerError> = None;
 
-        for (id, local) in workers_local.into_iter().enumerate() {
+        'spawn: for (id, local) in workers_local.into_iter().enumerate() {
             // Pick an IP with failover. The round-robin position is the
             // first choice; on failure, walk the rest of the pool in
             // order. An IP whose consecutive-failure count is at or
             // above FAIL_THRESHOLD is skipped. Fatal only if EVERY IP is
             // either at threshold or fails this worker's attempt.
             let nfs = if server_ips.is_empty() {
-                self.create_connection_with_ip(None)?
+                match self.create_connection_with_ip(None) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.shutdown.store(true, Ordering::SeqCst);
+                        spawn_err = Some(e);
+                        break 'spawn;
+                    }
+                }
             } else {
                 let n = server_ips.len();
                 let primary_idx = id % n;
@@ -666,7 +738,8 @@ impl SimpleWalker {
                             "Worker {} could not mount on any of {} VIPs ({} at fail-threshold). Aborting.",
                             id, n, blacklisted
                         );
-                        return Err(last_err.unwrap_or_else(|| {
+                        self.shutdown.store(true, Ordering::SeqCst);
+                        spawn_err = Some(last_err.unwrap_or_else(|| {
                             WalkerError::Nfs(crate::error::NfsError::ConnectionFailed {
                                 server: self.config.nfs_url.server.clone(),
                                 reason: format!(
@@ -675,6 +748,7 @@ impl SimpleWalker {
                                 ),
                             })
                         }));
+                        break 'spawn;
                     }
                 }
             };
@@ -757,15 +831,23 @@ impl SimpleWalker {
             handles.push(handle);
         }
 
-        // Drop our senders so writers know when to stop.
+        // Drop our senders so writers know when to stop. (Per-worker
+        // sender clones still live inside each thread and drop when the
+        // thread returns from its loop.)
         drop(entry_txs);
 
-        // Wait for workers
+        // Wait for all already-spawned workers. ALWAYS run this — even
+        // when spawn_err is Some, we must drain the threads we already
+        // launched before returning, otherwise our caller's writer-join
+        // step deadlocks or partially-completes.
         for handle in handles {
             let _ = handle.join();
         }
 
-        Ok(())
+        match spawn_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     pub fn run_with_progress<F>(&self, progress_callback: F) -> Result<WalkStats>
