@@ -394,10 +394,17 @@ fn get_rocks_db_size(path: &std::path::Path) -> Option<u64> {
     while let Some(dir) = stack.pop() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
-                let Ok(meta) = entry.metadata() else { continue };
-                if meta.is_dir() {
+                // file_type() is lstat-based; never follow symlinks, so
+                // a self-referencing or cyclic symlink under the output
+                // path can't put us in an infinite walk.
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_symlink() {
+                    continue;
+                }
+                if ft.is_dir() {
                     stack.push(entry.path());
                 } else {
+                    let Ok(meta) = entry.metadata() else { continue };
                     total += meta.len();
                 }
             }
