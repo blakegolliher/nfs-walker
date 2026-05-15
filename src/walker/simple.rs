@@ -594,20 +594,26 @@ impl SimpleWalker {
             ips
         };
 
-        // IPs that have already failed at least one mount attempt — later
-        // workers skip these instead of paying the same timeout again.
-        // Per-run only (no global state); a freshly-launched scan retries
-        // every IP from scratch.
-        let mut dead_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Per-VIP consecutive-failure counts. An IP is skipped once it
+        // reaches FAIL_THRESHOLD. Any successful mount on any IP clears
+        // all counts (VIPs come back; transient flakes shouldn't retire
+        // them). With the builder's own --retries (default 3) baked into
+        // each `create_connection_with_ip` attempt, threshold=3 means a
+        // truly-dead VIP costs ~3 × (timeout × retries) before the rest
+        // of the spawn loop stops touching it.
+        const FAIL_THRESHOLD: u32 = 3;
+        let mut fail_counts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         // Spawn workers
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
         for (id, local) in workers_local.into_iter().enumerate() {
             // Pick an IP with failover. The round-robin position is the
-            // first choice; on failure, walk the rest of the pool in order.
-            // A single dead VIP is logged and skipped; only fatal if EVERY
-            // IP refuses to mount.
+            // first choice; on failure, walk the rest of the pool in
+            // order. An IP whose consecutive-failure count is at or
+            // above FAIL_THRESHOLD is skipped. Fatal only if EVERY IP is
+            // either at threshold or fails this worker's attempt.
             let nfs = if server_ips.is_empty() {
                 self.create_connection_with_ip(None)?
             } else {
@@ -618,7 +624,7 @@ impl SimpleWalker {
                 let mut last_err: Option<WalkerError> = None;
                 for offset in 0..n {
                     let ip = &server_ips[(primary_idx + offset) % n];
-                    if dead_ips.contains(ip) {
+                    if fail_counts.get(ip).copied().unwrap_or(0) >= FAIL_THRESHOLD {
                         continue;
                     }
                     match self.create_connection_with_ip(Some(ip)) {
@@ -627,14 +633,24 @@ impl SimpleWalker {
                                 info!("Worker {} mounted via {} after failover from {:?}",
                                       id, ip, tried);
                             }
+                            if fail_counts.values().any(|v| *v > 0) {
+                                info!(
+                                    "Worker {} mounted successfully on {}; clearing failure counts (VIP recovery)",
+                                    id, ip
+                                );
+                                fail_counts.clear();
+                            }
                             connected = Some(c);
                             break;
                         }
                         Err(e) => {
-                            warn!("Worker {} mount on VIP {} failed: {} (marking dead, falling back)",
-                                  id, ip, e);
+                            let count = fail_counts.entry(ip.clone()).or_insert(0);
+                            *count = count.saturating_add(1);
+                            warn!(
+                                "Worker {} mount on VIP {} failed: {} (consecutive failures: {}/{})",
+                                id, ip, e, count, FAIL_THRESHOLD
+                            );
                             tried.push(ip.clone());
-                            dead_ips.insert(ip.clone());
                             last_err = Some(e);
                         }
                     }
@@ -642,15 +658,19 @@ impl SimpleWalker {
                 match connected {
                     Some(c) => c,
                     None => {
+                        let blacklisted = fail_counts
+                            .values()
+                            .filter(|v| **v >= FAIL_THRESHOLD)
+                            .count();
                         error!(
-                            "Worker {} could not mount on any of {} VIPs ({} are dead). Aborting.",
-                            id, n, dead_ips.len()
+                            "Worker {} could not mount on any of {} VIPs ({} at fail-threshold). Aborting.",
+                            id, n, blacklisted
                         );
                         return Err(last_err.unwrap_or_else(|| {
                             WalkerError::Nfs(crate::error::NfsError::ConnectionFailed {
                                 server: self.config.nfs_url.server.clone(),
                                 reason: format!(
-                                    "worker {} could not mount on any of {} VIPs (all marked dead by earlier workers)",
+                                    "worker {} could not mount on any of {} VIPs (all at fail-threshold from earlier workers)",
                                     id, n
                                 ),
                             })
