@@ -682,20 +682,24 @@ impl SimpleWalker {
             // order. An IP whose consecutive-failure count is at or
             // above FAIL_THRESHOLD is skipped. Fatal only if EVERY IP is
             // either at threshold or fails this worker's attempt.
-            let nfs = if server_ips.is_empty() {
-                match self.create_connection_with_ip(None) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        self.shutdown.store(true, Ordering::SeqCst);
-                        spawn_err = Some(e);
-                        break 'spawn;
-                    }
-                }
-            } else {
+            //
+            // `server_ips` is guaranteed non-empty: either `--server-ips`
+            // populated it (config validation rejects empty) or
+            // `resolve_dns` returned at least the hostname-as-passthrough
+            // fallback. Asserting here so a future contract break is
+            // loud in dev rather than silent in release.
+            debug_assert!(
+                !server_ips.is_empty(),
+                "server_ips must be non-empty: --server-ips validation and resolve_dns fallback both guarantee it"
+            );
+            let nfs = {
                 let n = server_ips.len();
                 let primary_idx = id % n;
                 let mut connected: Option<NfsConnection> = None;
-                let mut tried: Vec<String> = Vec::new();
+                // Lazy: only allocate when a failover actually happens.
+                // The common success-on-first-try path never touches the
+                // Vec at all.
+                let mut tried: Option<Vec<String>> = None;
                 let mut last_err: Option<WalkerError> = None;
                 for offset in 0..n {
                     let ip = &server_ips[(primary_idx + offset) % n];
@@ -704,9 +708,11 @@ impl SimpleWalker {
                     }
                     match self.create_connection_with_ip(Some(ip)) {
                         Ok(c) => {
-                            if !tried.is_empty() {
-                                info!("Worker {} mounted via {} after failover from {:?}",
-                                      id, ip, tried);
+                            if let Some(t) = &tried {
+                                info!(
+                                    "Worker {} mounted via {} after failover from {:?}",
+                                    id, ip, t
+                                );
                             }
                             if fail_counts.values().any(|v| *v > 0) {
                                 info!(
@@ -725,7 +731,7 @@ impl SimpleWalker {
                                 "Worker {} mount on VIP {} failed: {} (consecutive failures: {}/{})",
                                 id, ip, e, count, FAIL_THRESHOLD
                             );
-                            tried.push(ip.clone());
+                            tried.get_or_insert_with(Vec::new).push(ip.clone());
                             last_err = Some(e);
                         }
                     }
