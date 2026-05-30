@@ -51,8 +51,13 @@ jobs:
       - name: Verify binary is fully static
         run: |
           file "$ASSET"
-          file "$ASSET" | grep -q "statically linked" \
-            || { echo "::error::binary is not statically linked"; exit 1; }
+          # musl + crt-static yields a static-PIE, which `file` labels
+          # "static-pie linked" rather than "statically linked". Assert the
+          # binary is NOT dynamically linked instead of matching one wording.
+          if file "$ASSET" | grep -q "dynamically linked"; then
+            echo "::error::binary is dynamically linked"; exit 1
+          fi
+          # Smoke-test that it actually runs (catches a broken/incompatible build).
           ./"$ASSET" --version || ./"$ASSET" --help | head -n 1
 
       - name: Generate SHA-256 checksum
