@@ -11,7 +11,8 @@
 
 FROM docker.io/library/rust:1.92.0-alpine as builder
 
-# Install build dependencies for musl + libnfs + parquet codecs.
+# Install build dependencies for musl + libnfs + parquet codecs, plus
+# nodejs/npm to build the embedded React analytics dashboard (server feature).
 RUN apk add --no-cache \
     build-base \
     musl-dev \
@@ -23,7 +24,9 @@ RUN apk add --no-cache \
     zstd-dev \
     zstd-static \
     zlib-dev \
-    zlib-static
+    zlib-static \
+    nodejs \
+    npm
 
 WORKDIR /app
 
@@ -61,6 +64,11 @@ COPY . .
 
 # Clean any stale Cargo.lock
 RUN rm -f Cargo.lock
+
+# Build the React analytics dashboard so rust-embed can bake web/dist/ into the
+# binary (the `server` default feature). web/dist/ is gitignored, so it is
+# absent on a clean checkout and must be generated here before cargo build.
+RUN cd web && npm install && npm run build
 
 # Build the static musl binary. The profile is parameterized:
 #   PROFILE=release        -> stripped, LTO'd binary for distribution (GH releases)
