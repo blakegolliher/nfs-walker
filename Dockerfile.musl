@@ -39,9 +39,19 @@ RUN git clone https://github.com/sahlberg/libnfs.git && \
     cd .. && \
     rm -rf libnfs
 
-# Set up for static musl build
+# Set up for static musl build.
+#
+# RUSTFLAGS here (an env var) OVERRIDES the per-target rustflags in
+# .cargo/config.toml rather than merging, so every flag the musl build needs
+# must be listed here:
+#   +crt-static  static C runtime (the whole point of the musl build)
+#   +aes,+sse2   gxhash needs AES + SSE2 intrinsics at compile time and has no
+#                portable fallback. sse2 is baseline on x86-64; aes (AES-NI) is
+#                present on essentially all server CPUs since ~2010. Using the
+#                explicit features (not target-cpu=native) keeps the binary
+#                portable instead of pinning it to the build host's exact CPU.
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
-ENV RUSTFLAGS="-C target-feature=+crt-static"
+ENV RUSTFLAGS="-C target-feature=+crt-static,+aes,+sse2"
 
 # Add musl target
 RUN rustup target add x86_64-unknown-linux-musl
