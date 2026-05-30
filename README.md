@@ -43,6 +43,32 @@ scan.parquet/
 
 ## Installation
 
+### Download a prebuilt binary (no build required)
+
+Grab the latest static binary from the
+[Releases page](https://github.com/blakegolliher/nfs-walker/releases). It is a
+fully static x86_64 Linux binary — musl libc, libnfs, zstd and zlib are all baked
+in, so there is no glibc or shared-library dependency. It runs on any Linux distro.
+
+```bash
+# Replace v0.1.0 with the release you want
+VER=v0.1.0
+curl -LO https://github.com/blakegolliher/nfs-walker/releases/download/$VER/nfs-walker-$VER-x86_64-unknown-linux-musl
+curl -LO https://github.com/blakegolliher/nfs-walker/releases/download/$VER/nfs-walker-$VER-x86_64-unknown-linux-musl.sha256
+
+# Verify the checksum, then install
+sha256sum -c nfs-walker-$VER-x86_64-unknown-linux-musl.sha256
+install -m 0755 nfs-walker-$VER-x86_64-unknown-linux-musl /usr/local/bin/nfs-walker
+
+# NFSv3 mountd needs a privileged source port — run scans with sudo
+sudo nfs-walker --help
+```
+
+`ldd nfs-walker` should report `not a dynamic executable`, confirming it is
+fully static.
+
+### Build from source
+
 ```bash
 # Static musl binary (any Linux)
 make release

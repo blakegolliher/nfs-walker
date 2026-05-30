@@ -52,10 +52,14 @@ COPY . .
 # Clean any stale Cargo.lock
 RUN rm -f Cargo.lock
 
-# Build static musl binary with debug info (release-debug profile).
-# Keeps line tables + symtab for crash-symbolication during the prod-segfault
-# investigation. No -C strip=symbols pass.
-RUN cargo build --profile release-debug --target x86_64-unknown-linux-musl
+# Build the static musl binary. The profile is parameterized:
+#   PROFILE=release        -> stripped, LTO'd binary for distribution (GH releases)
+#   PROFILE=release-debug  -> keeps line tables + symtab for crash-symbolication
+#                             during the prod-segfault investigation (default,
+#                             preserves the `make docker-musl` extraction path).
+ARG PROFILE=release-debug
+RUN cargo build --profile ${PROFILE} --target x86_64-unknown-linux-musl
 
-# The final binary is at:
-# /app/target/x86_64-unknown-linux-musl/release-debug/nfs-walker
+# The final binary is at (output dir tracks the profile name):
+#   PROFILE=release       -> /app/target/x86_64-unknown-linux-musl/release/nfs-walker
+#   PROFILE=release-debug -> /app/target/x86_64-unknown-linux-musl/release-debug/nfs-walker

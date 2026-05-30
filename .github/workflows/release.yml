@@ -1,0 +1,75 @@
+name: Release
+
+# Manually-triggered release. Builds a fully static x86_64 Linux binary
+# (musl + statically-linked libnfs/zstd/zlib, no glibc dependency) via
+# Dockerfile.musl and publishes it as a GitHub Release asset.
+#
+# Run it from the Actions tab: "Release" -> "Run workflow", enter a tag
+# like v0.1.0. The git tag is created at the dispatched commit if it does
+# not already exist.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark this release as a pre-release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build static musl binary and publish release
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag }}
+      ASSET: nfs-walker-${{ inputs.tag }}-x86_64-unknown-linux-musl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build static musl binary (release profile)
+        run: |
+          docker build \
+            -f Dockerfile.musl \
+            --build-arg PROFILE=release \
+            -t nfs-walker-musl .
+
+      - name: Extract binary from image
+        run: |
+          docker run --rm nfs-walker-musl \
+            cat /app/target/x86_64-unknown-linux-musl/release/nfs-walker > "$ASSET"
+          chmod +x "$ASSET"
+
+      - name: Verify binary is fully static
+        run: |
+          file "$ASSET"
+          file "$ASSET" | grep -q "statically linked" \
+            || { echo "::error::binary is not statically linked"; exit 1; }
+          ./"$ASSET" --version || ./"$ASSET" --help | head -n 1
+
+      - name: Generate SHA-256 checksum
+        run: sha256sum "$ASSET" > "$ASSET.sha256"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          PRERELEASE_FLAG=""
+          if [ "$PRERELEASE" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "nfs-walker $TAG" \
+            --generate-notes \
+            $PRERELEASE_FLAG \
+            "$ASSET" "$ASSET.sha256"
