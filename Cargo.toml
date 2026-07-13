@@ -65,9 +65,9 @@ ctrlc = "3"
 # libc for NFS FFI types
 libc = "0.2"
 
-# Content analysis - checksum and file type detection
+# Path→writer-shard routing hash (see src/walker/sharding.rs). musl
+# builds need `-C target-feature=+aes,+sse2` (Dockerfile.musl sets it).
 gxhash = "3"
-infer = "0.15"
 
 # Parquet output: required (no longer feature-gated)
 arrow = { version = "54", default-features = false, features = ["ipc"] }

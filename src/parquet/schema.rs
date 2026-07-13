@@ -37,7 +37,7 @@ pub fn parquet_schema() -> Schema {
         // buffer ~9 MB of repeated UUID bytes per row group. DuckDB,
         // Spark, and pandas see this as a regular VARCHAR/string
         // column; Arrow-native readers get a DictionaryArray they can
-        // operate on directly. See P1-4 in tasks/code-review-audit.md.
+        // operate on directly.
         Field::new(
             "scan_id",
             DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
@@ -52,19 +52,20 @@ pub fn parquet_schema_ref() -> Arc<Schema> {
     Arc::new(parquet_schema())
 }
 
-/// Convert entry_type u8 to a human-readable string.
+/// Convert entry_type u8 (see `EntryType`'s repr values) to a
+/// human-readable string. Every variant gets its own name so DuckDB
+/// users can distinguish device nodes, FIFOs, and sockets.
 pub fn file_type_string(entry_type: u8) -> &'static str {
     match entry_type {
         0 => "file",
         1 => "directory",
         2 => "symlink",
-        _ => "other",
+        3 => "block_device",
+        4 => "char_device",
+        5 => "fifo",
+        6 => "socket",
+        _ => "unknown",
     }
-}
-
-/// Convert seconds (epoch) to microseconds.
-pub fn seconds_to_microseconds(secs: i64) -> i64 {
-    secs.saturating_mul(1_000_000)
 }
 
 /// Extract the parent path from a full path.
@@ -134,7 +135,8 @@ mod tests {
             .iter()
             .map(|f| (f.name().as_str(), f.is_nullable()))
             .collect();
-        // Only extension, mtime_us, atime_us, ctime_us should be nullable
+        // Nullable: extension plus every timestamp column (the three
+        // legacy *_us columns and the six sec/nsec pairs).
         for (name, is_nullable) in &nullable {
             let expected = matches!(*name, "extension" | "mtime_us" | "atime_us" | "ctime_us" | "mtime_sec" | "mtime_nsec" | "atime_sec" | "atime_nsec" | "ctime_sec" | "ctime_nsec");
             assert_eq!(
@@ -150,20 +152,11 @@ mod tests {
         assert_eq!(file_type_string(0), "file");
         assert_eq!(file_type_string(1), "directory");
         assert_eq!(file_type_string(2), "symlink");
-        assert_eq!(file_type_string(3), "other");
-        assert_eq!(file_type_string(255), "other");
-    }
-
-    #[test]
-    fn test_seconds_to_microseconds() {
-        assert_eq!(seconds_to_microseconds(0), 0);
-        assert_eq!(seconds_to_microseconds(1), 1_000_000);
-        assert_eq!(seconds_to_microseconds(1_234_567_890), 1_234_567_890_000_000);
-        // Saturating: no overflow
-        assert_eq!(
-            seconds_to_microseconds(i64::MAX),
-            i64::MAX // saturates
-        );
+        assert_eq!(file_type_string(3), "block_device");
+        assert_eq!(file_type_string(4), "char_device");
+        assert_eq!(file_type_string(5), "fifo");
+        assert_eq!(file_type_string(6), "socket");
+        assert_eq!(file_type_string(255), "unknown");
     }
 
     #[test]

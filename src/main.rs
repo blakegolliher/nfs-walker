@@ -15,12 +15,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use humansize::{format_size, BINARY};
 use nfs_walker::config::{CliArgs, Command, WalkConfig};
-use nfs_walker::progress::{format_elapsed, print_header, print_summary, ProgressReporter};
+use nfs_walker::progress::{format_elapsed, format_number, print_header, print_summary, ProgressReporter};
 use nfs_walker::walker::{SimpleWalker, WalkStats};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Raise the soft `RLIMIT_NOFILE` to at least `TARGET` (or the hard limit,
@@ -69,7 +69,6 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            error!("{:#}", e);
             eprintln!("Error: {:#}", e);
             ExitCode::FAILURE
         }
@@ -81,7 +80,7 @@ fn run() -> Result<()> {
     let args = CliArgs::parse();
 
     // Setup logging
-    setup_logging(args.verbose)?;
+    setup_logging(args.verbose);
 
     // Raise FD limit early so scans (lots of NFS sockets + Parquet part
     // files per shard) don't hit the default 1024-FD soft limit.
@@ -339,7 +338,7 @@ fn get_scan_size(path: &std::path::Path) -> Option<u64> {
     Some(total)
 }
 
-fn setup_logging(verbose: bool) -> Result<()> {
+fn setup_logging(verbose: bool) {
     let filter = if verbose {
         EnvFilter::new("nfs_walker=info,warn")
     } else {
@@ -353,8 +352,6 @@ fn setup_logging(verbose: bool) -> Result<()> {
         .with_file(false)
         .with_line_number(false)
         .init();
-
-    Ok(())
 }
 
 fn run_simple_walker(config: WalkConfig) -> Result<WalkStats> {
@@ -423,17 +420,4 @@ fn run_simple_walker(config: WalkConfig) -> Result<WalkStats> {
     }
 
     Ok(result)
-}
-
-/// Format a number with thousands separators
-fn format_number(n: u64) -> String {
-    let s = n.to_string();
-    let bytes: Vec<_> = s.bytes().rev().collect();
-    let chunks: Vec<String> = bytes
-        .chunks(3)
-        .map(|chunk| {
-            chunk.iter().rev().map(|&b| b as char).collect::<String>()
-        })
-        .collect();
-    chunks.into_iter().rev().collect::<Vec<_>>().join(",")
 }

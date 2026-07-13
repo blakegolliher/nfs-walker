@@ -17,10 +17,10 @@
 //! ```
 
 use crate::config::WalkConfig;
-use crate::content::{checksum::compute_gxhash, filetype::detect_file_type as detect_mime_type};
-use crate::error::{Result, WalkerError};
-use crate::nfs::types::{DbEntry, EntryType};
+use crate::error::{NfsError, Result, WalkerError};
+use crate::nfs::types::{extract_extension, DbEntry, EntryType};
 use crate::nfs::{resolve_dns, NfsConnection, NfsConnectionBuilder};
+use regex::Regex;
 use crate::parquet::direct_writer::{
     spawn_direct_parquet_writers, write_metadata_json as write_direct_metadata_json,
     DirectWriteConfig,
@@ -153,8 +153,6 @@ pub struct WalkProgress {
     pub files: u64,
     pub bytes: u64,
     pub errors: u64,
-    pub queue_size: usize,
-    pub active_workers: usize,
     pub total_workers: usize,
     pub elapsed: Duration,
 }
@@ -202,8 +200,6 @@ impl SimpleWalker {
             files: self.files_count.load(Ordering::Relaxed),
             bytes: self.bytes_count.load(Ordering::Relaxed),
             errors: self.errors_count.load(Ordering::Relaxed),
-            queue_size: 0,
-            active_workers: 0,
             total_workers: self.config.worker_count,
             elapsed,
         }
@@ -245,10 +241,10 @@ impl SimpleWalker {
                 scan_id: scan_id.clone(),
                 scan_timestamp_us,
                 shards,
-                row_group_size: self.config.parquet_row_group_size,
-                target_file_size: self.config.parquet_file_size_bytes,
+                row_group_size: crate::parquet::direct_writer::DEFAULT_ROW_GROUP_SIZE,
+                target_file_size: crate::parquet::direct_writer::DEFAULT_TARGET_FILE_SIZE,
                 compression: self.config.parquet_compression.to_direct_writer(),
-                channel_depth: self.config.parquet_channel_depth,
+                channel_depth: crate::parquet::direct_writer::DEFAULT_CHANNEL_DEPTH,
             };
 
             let pool = spawn_direct_parquet_writers(direct_cfg, metrics.clone())?;
@@ -325,16 +321,19 @@ impl SimpleWalker {
             //     readdir that we completed (subdirs are emitted by their
             //     parent's readdir even when we don't recurse into them).
             //
-            // The relation with no depth limit and no dirs-only mode is
-            // `parquet_rows == files + dirs - 1` (minus one because the
-            // root directory is never emitted as a child of its parent).
-            // `dirs_only` makes the worker drop file entries before they
-            // reach the writer, which breaks the relation. `max_depth`
-            // adds a "seen but skipped" term we don't track separately,
-            // also breaking it. `exclude_patterns` is gathered into the
-            // config but never consulted by the worker today, so it
-            // doesn't perturb the count — no carve-out needed.
-            if self.config.max_depth.is_none() && !self.config.dirs_only {
+            // The relation with no depth limit, no dirs-only mode, and
+            // no exclusions is `parquet_rows == files + dirs - 1` (minus
+            // one because the root directory is never emitted as a child
+            // of its parent). `dirs_only` makes the worker drop file
+            // entries before they reach the writer, which breaks the
+            // relation. `max_depth` adds a "seen but skipped" term we
+            // don't track separately; `--exclude` drops matched entries
+            // before both counting and emission — either disables the
+            // check.
+            if self.config.max_depth.is_none()
+                && !self.config.dirs_only
+                && self.config.exclude_patterns.is_empty()
+            {
                 let expected = files.saturating_add(dirs.saturating_sub(1));
                 if total_entries != expected {
                     warn!(
@@ -419,21 +418,6 @@ impl SimpleWalker {
         entry_txs: Vec<Sender<Vec<DbEntry>>>,
         metrics: Arc<crate::scanlog::ScanMetrics>,
     ) -> Result<()> {
-        // Pipelined mode currently does not support per-file content
-        // analysis (checksum / file-type detection). Warn loudly if the
-        // combination is requested; the pipelined worker silently skips
-        // those reads.
-        if self.config.pipeline_depth > 0
-            && (self.config.compute_checksum || self.config.detect_file_type)
-        {
-            warn!(
-                "--pipeline-depth {} ignores --checksum and --file-type; \
-                 content analysis is not yet wired into the pipelined worker. \
-                 Drop --pipeline-depth (or set it to 0) for full content metadata.",
-                self.config.pipeline_depth
-            );
-        }
-
         // Work-stealing deque for directories
         let injector: Arc<Injector<DirWork>> = Arc::new(Injector::new());
 
@@ -502,6 +486,10 @@ impl SimpleWalker {
         // the drop+join cleanup at the end.
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
         let mut spawn_err: Option<WalkerError> = None;
+
+        // Shared compiled --exclude patterns; workers skip matched paths
+        // (no emission, no descent). Empty for the common case.
+        let exclude: Arc<Vec<Regex>> = Arc::new(self.config.exclude_patterns.clone());
 
         'spawn: for (id, local) in workers_local.into_iter().enumerate() {
             // Pick an IP with failover. The round-robin position is the
@@ -603,13 +591,10 @@ impl SimpleWalker {
             let metrics = Arc::clone(&metrics);
             let max_depth = self.config.max_depth;
             let dirs_only = self.config.dirs_only;
-            let worker_count = self.config.worker_count;
             let batch_size = self.config.batch_size;
-            let compute_checksum = self.config.compute_checksum;
-            let detect_file_type = self.config.detect_file_type;
-            let max_checksum_size = self.config.max_checksum_size;
             let pipeline_depth = self.config.pipeline_depth;
             let big_dir_split_after = self.config.big_dir_split_after;
+            let exclude = Arc::clone(&exclude);
 
             let handle = thread::Builder::new()
                 .name(format!("walker-{}", id))
@@ -631,6 +616,7 @@ impl SimpleWalker {
                             pending_work,
                             max_depth,
                             dirs_only,
+                            exclude,
                             batch_size,
                             pipeline_depth,
                             big_dir_split_after,
@@ -653,11 +639,8 @@ impl SimpleWalker {
                             pending_work,
                             max_depth,
                             dirs_only,
-                            worker_count,
+                            exclude,
                             batch_size,
-                            compute_checksum,
-                            detect_file_type,
-                            max_checksum_size,
                             metrics,
                         );
                     }
@@ -705,8 +688,6 @@ impl SimpleWalker {
                     files: files.load(Ordering::Relaxed),
                     bytes: bytes.load(Ordering::Relaxed),
                     errors: errors.load(Ordering::Relaxed),
-                    queue_size: 0,
-                    active_workers: 0,
                     total_workers,
                     elapsed: start.elapsed(),
                 };
@@ -761,24 +742,18 @@ fn worker_loop(
     pending_work: Arc<AtomicU64>,
     max_depth: Option<usize>,
     dirs_only: bool,
-    _worker_count: usize,
+    exclude: Arc<Vec<Regex>>,
     batch_size: usize,
-    compute_checksum: bool,
-    detect_file_type: bool,
-    max_checksum_size: u64,
     metrics: Arc<crate::scanlog::ScanMetrics>,
 ) {
     debug!("Worker {} started", id);
 
-    let shards = entry_txs.len().max(1);
-    // Local in-progress staging: when content analysis is active we need
-    // a flat buffer so the post-readdir pass can patch checksum/file_type
-    // by index. We push to staging first, then drain into the
-    // ShardedSender once analysis is done.
-    let mut staging: Vec<DbEntry> = Vec::with_capacity(batch_size);
     let mut sender = ShardedSender::new(entry_txs, batch_size);
     let mut idle_spins = 0;
-    const MAX_IDLE_SPINS: u32 = 1000;
+    // Steal-sweep budget before yielding. Each idle spin scans the
+    // injector plus every peer's stealer; a large budget just burns
+    // cores and cache-line traffic at the scan tail with many workers.
+    const MAX_IDLE_SPINS: u32 = 64;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -886,22 +861,14 @@ fn worker_loop(
         let mut chunk_byte_count = 0u64;
         let mut channel_broken = false;
 
-        // Track files that need content analysis (path, batch_index, size)
-        // We'll process them after the directory walk completes
-        let needs_content = compute_checksum || detect_file_type;
-        let mut files_for_content: Vec<(String, usize, u64)> = Vec::new();
-
         // Define the callback that processes directory entries
-        // This is used by both readdir_plus_by_fh and readdir_plus_with_fh
+        // This is used by both readdir_plus_by_fh and readdir_plus_with_fh.
+        // "." / ".." never reach here — readdirplus_full_callback strips
+        // them at the FFI boundary.
         let metrics_for_chunks = Arc::clone(&metrics);
         let mut process_entries = |chunk: Vec<crate::nfs::types::NfsDirEntry>| -> bool {
             metrics_for_chunks.record_entries(id, 0, chunk.len() as u64);
-            for nfs_entry in chunk {
-                // Skip . and ..
-                if nfs_entry.name == "." || nfs_entry.name == ".." {
-                    continue;
-                }
-
+            for mut nfs_entry in chunk {
                 let full_path = if work.path == "/" {
                     format!("/{}", nfs_entry.name)
                 } else {
@@ -915,25 +882,41 @@ fn worker_loop(
                     continue;
                 }
 
-                // Extract extension from filename (for files only)
-                let extension = if nfs_entry.entry_type == EntryType::File {
-                    nfs_entry.name.rsplit('.').next()
-                        .filter(|ext| ext.len() < 10 && !ext.contains('/'))
-                        .map(|s| s.to_lowercase())
-                } else {
-                    None
-                };
+                // --exclude: matched paths are neither emitted nor
+                // descended into. Empty in the common case.
+                if !exclude.is_empty() && exclude.iter().any(|re| re.is_match(&full_path)) {
+                    continue;
+                }
 
-                // Create DB entry from READDIRPLUS attributes
+                let size = nfs_entry.size();
+
+                if is_dir {
+                    // Queue subdirectory for processing with cached file
+                    // handle. The only per-entry clone left in this loop:
+                    // the path is needed by both the DirWork and the
+                    // DbEntry, and only for directories.
+                    subdir_count += 1;
+                    pending_work.fetch_add(1, Ordering::SeqCst);
+                    local.push(DirWork::fresh(
+                        full_path.clone(),
+                        work.depth + 1,
+                        nfs_entry.file_handle.take(),
+                    ));
+                } else {
+                    chunk_file_count += 1;
+                    chunk_byte_count += size;
+                }
+
+                // Create DB entry from READDIRPLUS attributes. `name` is
+                // moved (the loop owns nfs_entry), `path` is moved, and
+                // parent_path stays None — the writer derives it from
+                // `path` zero-copy — so files cost zero extra allocations
+                // here.
                 let db_entry = DbEntry {
-                    parent_path: Some(work.path.clone()),
-                    name: nfs_entry.name.clone(),
-                    path: full_path.clone(),
+                    parent_path: None,
+                    path: full_path,
                     entry_type: nfs_entry.entry_type,
-                    size: nfs_entry.size(),
-                    mtime: nfs_entry.mtime(),
-                    atime: nfs_entry.atime(),
-                    ctime: nfs_entry.ctime(),
+                    size,
                     mtime_sec: nfs_entry.mtime_sec(),
                     mtime_nsec: nfs_entry.mtime_nsec(),
                     atime_sec: nfs_entry.atime_sec(),
@@ -946,49 +929,28 @@ fn worker_loop(
                     nlink: nfs_entry.nlink(),
                     inode: nfs_entry.inode,
                     depth: work.depth + 1,
-                    extension,
+                    extension: if nfs_entry.entry_type == EntryType::File {
+                        extract_extension(&nfs_entry.name)
+                    } else {
+                        None
+                    },
                     blocks: nfs_entry.blocks(),
-                    checksum: None,
-                    file_type: None,
+                    name: nfs_entry.name,
                 };
 
-                if is_dir {
-                    // Queue subdirectory for processing with cached file handle
-                    subdir_count += 1;
-                    pending_work.fetch_add(1, Ordering::SeqCst);
-                    local.push(DirWork::fresh(
-                        full_path.clone(),
-                        work.depth + 1,
-                        nfs_entry.file_handle.clone(),
-                    ));
-                } else {
-                    chunk_file_count += 1;
-                    chunk_byte_count += nfs_entry.size();
+                // Push straight into the ShardedSender; it auto-flushes
+                // the per-shard batch when full.
+                if sender.push(db_entry).is_err() {
+                    channel_broken = true;
+                    return false;
                 }
-
-                if needs_content {
-                    // Stage flat so the post-readdir patch step can
-                    // address by index; track files needing analysis.
-                    let entry_idx = staging.len();
-                    if !is_dir {
-                        files_for_content.push((full_path, entry_idx, nfs_entry.size()));
-                    }
-                    staging.push(db_entry);
-                } else {
-                    // Push straight into the ShardedSender; it auto-
-                    // flushes the per-shard batch when full.
-                    if sender.push(db_entry).is_err() {
-                        channel_broken = true;
-                        return false;
-                    }
-                    // Update progress counters incrementally for real-time
-                    // display (matters on flat dirs with millions of entries).
-                    if chunk_file_count >= batch_size as u64 {
-                        files_count.fetch_add(chunk_file_count, Ordering::Relaxed);
-                        bytes_count.fetch_add(chunk_byte_count, Ordering::Relaxed);
-                        chunk_file_count = 0;
-                        chunk_byte_count = 0;
-                    }
+                // Update progress counters incrementally for real-time
+                // display (matters on flat dirs with millions of entries).
+                if chunk_file_count >= batch_size as u64 {
+                    files_count.fetch_add(chunk_file_count, Ordering::Relaxed);
+                    bytes_count.fetch_add(chunk_byte_count, Ordering::Relaxed);
+                    chunk_file_count = 0;
+                    chunk_byte_count = 0;
                 }
             }
             !channel_broken // Continue reading if channel is OK
@@ -1006,56 +968,6 @@ fn worker_loop(
 
         match result {
             Ok(entry_count) => {
-                // Process content analysis for files if enabled
-                // This happens AFTER the directory walk completes so nfs is no longer borrowed
-                if needs_content && !files_for_content.is_empty() {
-                    for (path, idx, size) in files_for_content.drain(..) {
-                        if idx >= staging.len() {
-                            continue; // Safety check
-                        }
-
-                        // Determine what content we need to read
-                        let need_full_file = compute_checksum && size <= max_checksum_size;
-                        let need_header = detect_file_type && !need_full_file;
-
-                        // Read content
-                        let content = if need_full_file {
-                            // Read entire file for checksum (also use for file type)
-                            match nfs.read_file_content(&path, max_checksum_size) {
-                                Ok(Some(data)) => Some(data),
-                                Ok(None) => None, // File too large
-                                Err(e) => {
-                                    debug!("Failed to read file content {}: {}", path, e);
-                                    None
-                                }
-                            }
-                        } else if need_header {
-                            // Only read header for file type detection
-                            match nfs.read_file_header(&path, 8192) {
-                                Ok(data) => Some(data),
-                                Err(e) => {
-                                    debug!("Failed to read file header {}: {}", path, e);
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        };
-
-                        // Compute checksum and/or file type
-                        if let Some(data) = content {
-                            if compute_checksum && data.len() as u64 == size {
-                                // Only set checksum if we read the full file
-                                staging[idx].checksum = Some(compute_gxhash(&data));
-                            }
-                            if detect_file_type {
-                                let header_len = std::cmp::min(data.len(), 8192);
-                                staging[idx].file_type = detect_mime_type(&data[..header_len]);
-                            }
-                        }
-                    }
-                }
-
                 // Update directory count and any remaining files from final partial batch
                 dirs_count.fetch_add(1, Ordering::Relaxed);
                 files_count.fetch_add(chunk_file_count, Ordering::Relaxed);
@@ -1065,28 +977,32 @@ fn worker_loop(
                     "Worker {} READDIRPLUS complete: {} -> {} entries ({} subdirs)",
                     id, work.path, entry_count, subdir_count
                 );
-
-                // Drain content-analysis staging into the ShardedSender.
-                // (The non-content path already pushed directly inside
-                // the readdir callback.)
-                if needs_content && !staging.is_empty() {
-                    for entry in staging.drain(..) {
-                        if sender.push(entry).is_err() {
-                            debug!("Worker {} channel closed during content drain", id);
-                            break;
-                        }
-                    }
-                }
             }
             Err(e) => {
                 errors_count.fetch_add(1, Ordering::Relaxed);
-                // Not found errors are common on active filesystems (race condition)
-                // Log them at debug level to reduce noise
-                if e.to_string().contains("not found") || e.to_string().contains("No such file")
-                    || e.to_string().contains("Permission denied") {
-                    debug!("Worker {} READDIRPLUS error: {} -> {}", id, work.path, e);
-                } else {
-                    warn!("Worker {} READDIRPLUS failed: {} -> {}", id, work.path, e);
+                // NOENT / EACCES are routine on live filesystems (the
+                // tree mutates under the scan); keep them at debug.
+                match &e {
+                    NfsError::NotFound { .. } | NfsError::PermissionDenied { .. } => {
+                        debug!("Worker {} READDIRPLUS error: {} -> {}", id, work.path, e)
+                    }
+                    _ => warn!("Worker {} READDIRPLUS failed: {} -> {}", id, work.path, e),
+                }
+
+                // An RPC timeout poisons the connection (see
+                // NfsConnection::poison) — it can never be serviced
+                // again. Exit so the remaining queue is stolen by
+                // workers with live connections.
+                if !nfs.is_connected() {
+                    error!(
+                        "Worker {} connection poisoned after RPC failure; exiting \
+                         (peers steal its remaining queue)",
+                        id
+                    );
+                    pending_work.fetch_sub(1, Ordering::SeqCst);
+                    active_workers.fetch_sub(1, Ordering::Relaxed);
+                    metrics.exit_dir(id, 0);
+                    break;
                 }
             }
         }
@@ -1097,16 +1013,8 @@ fn worker_loop(
         metrics.exit_dir(id, 0);
     }
 
-    // Drain residual staging entries (content-analysis path may have
-    // queued some between the last iteration and shutdown) and any
-    // partial per-shard batches in the ShardedSender.
-    for entry in staging.drain(..) {
-        if sender.push(entry).is_err() {
-            break;
-        }
-    }
+    // Ship any partial per-shard batches left in the ShardedSender.
     sender.flush_all();
-    let _ = shards;
 
     debug!("Worker {} finished", id);
 }
@@ -1120,11 +1028,10 @@ fn worker_loop(
 // completions as they arrive. See `docs/PIPELINED_READDIRPLUS_DESIGN.md`.
 //
 // The legacy `worker_loop` above must remain bit-for-bit identical to
-// its pre-pipelining behavior — content-analysis, error logging, and
-// counter ordering all live there. The pipelined worker duplicates the
-// entry-emission logic inline rather than refactoring the legacy
-// closure (intentional duplication; revisit once pipelining is the
-// default).
+// its pre-pipelining behavior — error logging and counter ordering
+// live there. The pipelined worker duplicates the entry-emission logic
+// inline rather than refactoring the legacy closure (intentional
+// duplication; revisit once pipelining is the default).
 
 /// Per-slot state tracked alongside an in-flight READDIRPLUS.
 struct DirState {
@@ -1210,6 +1117,7 @@ fn worker_loop_pipelined(
     pending_work: Arc<AtomicU64>,
     max_depth: Option<usize>,
     dirs_only: bool,
+    exclude: Arc<Vec<Regex>>,
     batch_size: usize,
     pipeline_depth: usize,
     big_dir_split_after: u64,
@@ -1235,6 +1143,27 @@ fn worker_loop_pipelined(
 
     'outer: loop {
         if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // A poisoned connection (RPC timeout in a sync LOOKUP) can never
+        // be serviced again. Fail the in-flight slots and exit so peers
+        // steal the remaining queue — without this check the worker
+        // would drain the global queue, erroring every item.
+        if !nfs.is_connected() {
+            error!(
+                "Worker {} connection poisoned; exiting (dropping {} in-flight slots)",
+                id,
+                slots.len()
+            );
+            let n = slots.len() as u64;
+            errors_count.fetch_add(n, Ordering::Relaxed);
+            pending_work.fetch_sub(n, Ordering::SeqCst);
+            for s in &states {
+                metrics.exit_dir(id, s.tag);
+            }
+            slots.clear();
+            states.clear();
             break;
         }
 
@@ -1406,17 +1335,13 @@ fn worker_loop_pipelined(
                 let mut chunk_byte_count = 0u64;
                 let mut channel_broken = false;
                 // Capture page entry count up front — `result.entries` is
-                // moved into the for loop below. We use the raw page count
-                // (including "." / "..") so threshold accounting is
-                // monotonic and matches what the server sent.
+                // moved into the for loop below. "." / ".." never appear
+                // here (readdirplus_full_callback strips them), so this
+                // counts exactly the emittable entries of the page.
                 let entries_in_page = result.entries.len() as u64;
                 metrics.record_entries(id, state.tag, entries_in_page);
 
-                for nfs_entry in result.entries {
-                    if nfs_entry.name == "." || nfs_entry.name == ".." {
-                        continue;
-                    }
-
+                for mut nfs_entry in result.entries {
                     let full_path = if state.work.path == "/" {
                         format!("/{}", nfs_entry.name)
                     } else {
@@ -1429,26 +1354,36 @@ fn worker_loop_pipelined(
                         continue;
                     }
 
-                    let extension = if nfs_entry.entry_type == EntryType::File {
-                        nfs_entry
-                            .name
-                            .rsplit('.')
-                            .next()
-                            .filter(|ext| ext.len() < 10 && !ext.contains('/'))
-                            .map(|s| s.to_lowercase())
-                    } else {
-                        None
-                    };
+                    // --exclude: matched paths are neither emitted nor
+                    // descended into (mirrors the legacy worker).
+                    if !exclude.is_empty()
+                        && exclude.iter().any(|re| re.is_match(&full_path))
+                    {
+                        continue;
+                    }
 
+                    let size = nfs_entry.size();
+
+                    if is_dir {
+                        subdir_count += 1;
+                        pending_work.fetch_add(1, Ordering::SeqCst);
+                        local.push(DirWork::fresh(
+                            full_path.clone(),
+                            state.work.depth + 1,
+                            nfs_entry.file_handle.take(),
+                        ));
+                    } else {
+                        chunk_file_count += 1;
+                        chunk_byte_count += size;
+                    }
+
+                    // Same zero-copy shape as the legacy worker: move
+                    // name + path, let the writer derive parent_path.
                     let db_entry = DbEntry {
-                        parent_path: Some(state.work.path.clone()),
-                        name: nfs_entry.name.clone(),
-                        path: full_path.clone(),
+                        parent_path: None,
+                        path: full_path,
                         entry_type: nfs_entry.entry_type,
-                        size: nfs_entry.size(),
-                        mtime: nfs_entry.mtime(),
-                        atime: nfs_entry.atime(),
-                        ctime: nfs_entry.ctime(),
+                        size,
                         mtime_sec: nfs_entry.mtime_sec(),
                         mtime_nsec: nfs_entry.mtime_nsec(),
                         atime_sec: nfs_entry.atime_sec(),
@@ -1461,25 +1396,14 @@ fn worker_loop_pipelined(
                         nlink: nfs_entry.nlink(),
                         inode: nfs_entry.inode,
                         depth: state.work.depth + 1,
-                        extension,
+                        extension: if nfs_entry.entry_type == EntryType::File {
+                            extract_extension(&nfs_entry.name)
+                        } else {
+                            None
+                        },
                         blocks: nfs_entry.blocks(),
-                        // Pipelined mode does not (yet) compute these.
-                        checksum: None,
-                        file_type: None,
+                        name: nfs_entry.name,
                     };
-
-                    if is_dir {
-                        subdir_count += 1;
-                        pending_work.fetch_add(1, Ordering::SeqCst);
-                        local.push(DirWork::fresh(
-                            full_path.clone(),
-                            state.work.depth + 1,
-                            nfs_entry.file_handle.clone(),
-                        ));
-                    } else {
-                        chunk_file_count += 1;
-                        chunk_byte_count += nfs_entry.size();
-                    }
 
                     if sender.push(db_entry).is_err() {
                         channel_broken = true;
@@ -1593,6 +1517,12 @@ fn worker_loop_pipelined(
                             states.push(state);
                         }
                         Err(e) => {
+                            // The directory is abandoned mid-read: rows
+                            // from its earlier pages were already
+                            // emitted but the dir counts as an error,
+                            // so the run(-level) row-count
+                            // reconciliation warning may fire. That's
+                            // the honest signal — entries were dropped.
                             errors_count.fetch_add(1, Ordering::Relaxed);
                             warn!(
                                 "Worker {} pipelined re-submit failed: {} -> {}",

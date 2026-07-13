@@ -11,6 +11,7 @@
 use crate::config::NfsUrl;
 use crate::error::{NfsError, NfsResult};
 use crate::nfs::types::{EntryType, NfsDirEntry, NfsStat};
+use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::ptr;
 use std::time::Duration;
@@ -32,8 +33,10 @@ pub struct NfsConnection {
     /// Export path we're mounted on
     export: String,
 
-    /// Whether we're currently mounted
-    mounted: bool,
+    /// Whether we're currently mounted. `Cell` because an RPC timeout
+    /// poisons the connection through `&self` (see `poison()`); the
+    /// type is `!Sync` so this is single-thread interior mutability.
+    mounted: Cell<bool>,
 
     /// RPC timeout in milliseconds (used for wait_for_rpc_completion)
     rpc_timeout_ms: i32,
@@ -44,95 +47,73 @@ pub struct NfsConnection {
 unsafe impl Send for NfsConnection {}
 // NOT implementing Sync - libnfs is not thread-safe
 
-/// Pack a (seconds, nanoseconds) timestamp into microseconds-since-epoch.
+/// READDIRPLUS transfer-size hints, shared by the synchronous and
+/// pipelined submit paths so the two can't drift apart.
 ///
-/// Used at every libnfs stat callsite so the sub-second component of
-/// mtime/atime/ctime survives the trip into the database. Without this
-/// every row downstream rounds to whole seconds.
-///
-/// `nsec` is clamped to `[0, 999_999_999]`. Real filesystems shouldn't
-/// produce out-of-range values, but garbage in stat structs (e.g. from a
-/// libnfs version with a different field layout, or clock-skew races on
-/// the server) shouldn't be allowed to corrupt the microsecond math.
-#[inline]
-fn pack_micros(sec: i64, nsec: i64) -> i64 {
-    let nsec = nsec.clamp(0, 999_999_999);
-    sec.saturating_mul(1_000_000)
-        .saturating_add(nsec / 1_000)
-}
-
-/// libnfs `nfsdirent.{atime,mtime,ctime}_nsec` are u32. Widen and pack.
-#[inline]
-fn timeval_to_micros(sec: i64, nsec: u32) -> i64 {
-    pack_micros(sec, nsec as i64)
-}
-
-/// libnfs `nfs_stat_64.nfs_*_nsec` are u64. Widen and pack.
-#[inline]
-fn nfs_stat64_to_micros(sec: u64, nsec: u64) -> i64 {
-    // u64 epoch seconds happily fit in i64 until year 292277026596.
-    // Cap nsec at i64::MAX before signed conversion to avoid wraparound
-    // on absurd inputs from a malformed stat struct.
-    let nsec_i64 = nsec.min(i64::MAX as u64) as i64;
-    pack_micros(sec as i64, nsec_i64)
-}
-
-/// NFS3 `nfstime3` exposes `seconds: u32` and `nseconds: u32`. Widen.
-#[inline]
-fn nfstime3_to_micros(sec: u32, nsec: u32) -> i64 {
-    pack_micros(sec as i64, nsec as i64)
-}
+/// Deliberately small: large buffers make the server assemble huge
+/// replies and time out on giant directories. ~16 KB ≈ 60–100 entries
+/// per RPC, each of which completes quickly; the pipelined worker
+/// recovers the round-trip cost by keeping several pages in flight.
+const READDIRPLUS_DIRCOUNT: u32 = 8192;
+const READDIRPLUS_MAXCOUNT: u32 = 16384;
 
 /// Translate a negated NFS3 status code to a human-readable string.
 ///
 /// libnfs callbacks store the NFS3 status as `-(res.status as i32)`,
 /// so NFS3ERR_PERM (1) becomes -1, NFS3ERR_ACCES (13) becomes -13, etc.
 fn nfs3_status_to_string(status: i32) -> String {
-    match status {
-        s if s == -(ffi::nfsstat3_NFS3ERR_PERM as i32) => "NFS3ERR_PERM (operation not permitted)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_NOENT as i32) => "NFS3ERR_NOENT (no such file or directory)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_IO as i32) => "NFS3ERR_IO (I/O error)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_NXIO as i32) => "NFS3ERR_NXIO (no such device or address)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_ACCES as i32) => "NFS3ERR_ACCES (permission denied)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_EXIST as i32) => "NFS3ERR_EXIST (file exists)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_XDEV as i32) => "NFS3ERR_XDEV (cross-device link)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_NODEV as i32) => "NFS3ERR_NODEV (no such device)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_NOTDIR as i32) => "NFS3ERR_NOTDIR (not a directory)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_ISDIR as i32) => "NFS3ERR_ISDIR (is a directory)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_INVAL as i32) => "NFS3ERR_INVAL (invalid argument)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_FBIG as i32) => "NFS3ERR_FBIG (file too large)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_NOSPC as i32) => "NFS3ERR_NOSPC (no space left on device)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_ROFS as i32) => "NFS3ERR_ROFS (read-only file system)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_MLINK as i32) => "NFS3ERR_MLINK (too many links)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_NAMETOOLONG as i32) => "NFS3ERR_NAMETOOLONG (name too long)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_NOTEMPTY as i32) => "NFS3ERR_NOTEMPTY (directory not empty)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_DQUOT as i32) => "NFS3ERR_DQUOT (disk quota exceeded)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_STALE as i32) => "NFS3ERR_STALE (stale file handle)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_REMOTE as i32) => "NFS3ERR_REMOTE (too many levels of remote in path)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_BADHANDLE as i32) => "NFS3ERR_BADHANDLE (illegal NFS file handle)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_NOT_SYNC as i32) => "NFS3ERR_NOT_SYNC (update synchronization mismatch)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_BAD_COOKIE as i32) => "NFS3ERR_BAD_COOKIE (stale cookie)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_NOTSUPP as i32) => "NFS3ERR_NOTSUPP (operation not supported)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_TOOSMALL as i32) => "NFS3ERR_TOOSMALL (buffer or request too small)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_SERVERFAULT as i32) => "NFS3ERR_SERVERFAULT (server fault)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_BADTYPE as i32) => "NFS3ERR_BADTYPE (bad type)".into(),
-        s if s == -(ffi::nfsstat3_NFS3ERR_JUKEBOX as i32) => "NFS3ERR_JUKEBOX (jukebox/try again later)".into(),
+    // Callbacks store NFS3 errors negated; non-negative values are
+    // RPC-layer statuses and must not be mistaken for NFS3 codes.
+    if status >= 0 {
+        return format!("unknown NFS3 status ({})", status);
+    }
+    match status.unsigned_abs() {
+        ffi::nfsstat3_NFS3ERR_PERM => "NFS3ERR_PERM (operation not permitted)".into(),
+        ffi::nfsstat3_NFS3ERR_NOENT => "NFS3ERR_NOENT (no such file or directory)".into(),
+        ffi::nfsstat3_NFS3ERR_IO => "NFS3ERR_IO (I/O error)".into(),
+        ffi::nfsstat3_NFS3ERR_NXIO => "NFS3ERR_NXIO (no such device or address)".into(),
+        ffi::nfsstat3_NFS3ERR_ACCES => "NFS3ERR_ACCES (permission denied)".into(),
+        ffi::nfsstat3_NFS3ERR_EXIST => "NFS3ERR_EXIST (file exists)".into(),
+        ffi::nfsstat3_NFS3ERR_XDEV => "NFS3ERR_XDEV (cross-device link)".into(),
+        ffi::nfsstat3_NFS3ERR_NODEV => "NFS3ERR_NODEV (no such device)".into(),
+        ffi::nfsstat3_NFS3ERR_NOTDIR => "NFS3ERR_NOTDIR (not a directory)".into(),
+        ffi::nfsstat3_NFS3ERR_ISDIR => "NFS3ERR_ISDIR (is a directory)".into(),
+        ffi::nfsstat3_NFS3ERR_INVAL => "NFS3ERR_INVAL (invalid argument)".into(),
+        ffi::nfsstat3_NFS3ERR_FBIG => "NFS3ERR_FBIG (file too large)".into(),
+        ffi::nfsstat3_NFS3ERR_NOSPC => "NFS3ERR_NOSPC (no space left on device)".into(),
+        ffi::nfsstat3_NFS3ERR_ROFS => "NFS3ERR_ROFS (read-only file system)".into(),
+        ffi::nfsstat3_NFS3ERR_MLINK => "NFS3ERR_MLINK (too many links)".into(),
+        ffi::nfsstat3_NFS3ERR_NAMETOOLONG => "NFS3ERR_NAMETOOLONG (name too long)".into(),
+        ffi::nfsstat3_NFS3ERR_NOTEMPTY => "NFS3ERR_NOTEMPTY (directory not empty)".into(),
+        ffi::nfsstat3_NFS3ERR_DQUOT => "NFS3ERR_DQUOT (disk quota exceeded)".into(),
+        ffi::nfsstat3_NFS3ERR_STALE => "NFS3ERR_STALE (stale file handle)".into(),
+        ffi::nfsstat3_NFS3ERR_REMOTE => "NFS3ERR_REMOTE (too many levels of remote in path)".into(),
+        ffi::nfsstat3_NFS3ERR_BADHANDLE => "NFS3ERR_BADHANDLE (illegal NFS file handle)".into(),
+        ffi::nfsstat3_NFS3ERR_NOT_SYNC => "NFS3ERR_NOT_SYNC (update synchronization mismatch)".into(),
+        ffi::nfsstat3_NFS3ERR_BAD_COOKIE => "NFS3ERR_BAD_COOKIE (stale cookie)".into(),
+        ffi::nfsstat3_NFS3ERR_NOTSUPP => "NFS3ERR_NOTSUPP (operation not supported)".into(),
+        ffi::nfsstat3_NFS3ERR_TOOSMALL => "NFS3ERR_TOOSMALL (buffer or request too small)".into(),
+        ffi::nfsstat3_NFS3ERR_SERVERFAULT => "NFS3ERR_SERVERFAULT (server fault)".into(),
+        ffi::nfsstat3_NFS3ERR_BADTYPE => "NFS3ERR_BADTYPE (bad type)".into(),
+        ffi::nfsstat3_NFS3ERR_JUKEBOX => "NFS3ERR_JUKEBOX (jukebox/try again later)".into(),
         _ => format!("unknown NFS3 status ({})", status),
     }
 }
 
 /// Convert a negated NFS3 status code to a typed NfsError with a path context.
 fn nfs3_status_to_nfs_error(status: i32, path: &str) -> NfsError {
-    match status {
-        s if s == -(ffi::nfsstat3_NFS3ERR_PERM as i32) || s == -(ffi::nfsstat3_NFS3ERR_ACCES as i32) => {
+    if status >= 0 {
+        return NfsError::ReadDirFailed {
+            path: path.into(),
+            reason: nfs3_status_to_string(status),
+        };
+    }
+    match status.unsigned_abs() {
+        ffi::nfsstat3_NFS3ERR_PERM | ffi::nfsstat3_NFS3ERR_ACCES => {
             NfsError::PermissionDenied { path: path.into() }
         }
-        s if s == -(ffi::nfsstat3_NFS3ERR_NOENT as i32) => {
-            NfsError::NotFound { path: path.into() }
-        }
-        s if s == -(ffi::nfsstat3_NFS3ERR_STALE as i32) => {
-            NfsError::StaleHandle { path: path.into() }
-        }
+        ffi::nfsstat3_NFS3ERR_NOENT => NfsError::NotFound { path: path.into() },
+        ffi::nfsstat3_NFS3ERR_STALE => NfsError::StaleHandle { path: path.into() },
         _ => NfsError::ReadDirFailed {
             path: path.into(),
             reason: nfs3_status_to_string(status),
@@ -172,26 +153,14 @@ impl NfsConnection {
             context,
             server: url.server.clone(),
             export: url.export.clone(),
-            mounted: false,
+            mounted: Cell::new(false),
             rpc_timeout_ms: 30000, // Default 30 seconds, updated by connect()
         })
     }
 
-    /// Set READDIR buffer size before connecting
-    ///
-    /// Must be called before `connect()`. Larger buffers reduce RPC round-trips
-    /// for directory listings. Default is 8KB, max is 4MB.
-    ///
-    /// Note: Some servers may not handle large buffers well. Test with your server.
-    pub fn set_readdir_buffer_size(&self, size: u32) {
-        unsafe {
-            ffi::nfs_set_readdir_max_buffer_size(self.context, size, size);
-        }
-    }
-
     /// Connect and mount the NFS export
     pub fn connect(&mut self, timeout: Duration) -> NfsResult<()> {
-        if self.mounted {
+        if self.mounted.get() {
             return Ok(());
         }
 
@@ -236,159 +205,20 @@ impl NfsConnection {
             });
         }
 
-        self.mounted = true;
+        self.mounted.set(true);
         Ok(())
     }
 
-    /// Create a connected NFS connection in one step
-    pub fn connect_to(url: &NfsUrl, timeout: Duration) -> NfsResult<Self> {
-        let mut conn = Self::new(url)?;
-        conn.connect(timeout)?;
-        Ok(conn)
-    }
-
-    /// Read directory entries using READDIRPLUS for efficiency
-    ///
-    /// This returns all entries in the directory with their attributes,
-    /// avoiding separate stat calls for each entry.
-    pub fn readdir_plus(&self, path: &str) -> NfsResult<Vec<NfsDirEntry>> {
-        if !self.mounted {
-            return Err(NfsError::ReadDirFailed {
-                path: path.into(),
-                reason: "Not mounted".into(),
-            });
-        }
-
-        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadDirFailed {
-            path: path.into(),
-            reason: "Path contains null bytes".into(),
-        })?;
-
-        // Open directory
-        let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
-        let result = unsafe {
-            ffi::nfs_opendir(self.context, path_cstr.as_ptr(), &mut dir_handle)
-        };
-
-        if result != 0 {
-            return Err(self.translate_error(path, result));
-        }
-
-        // Read all entries
-        let mut entries = Vec::new();
-
-        loop {
-            let dirent = unsafe { ffi::nfs_readdir(self.context, dir_handle) };
-
-            if dirent.is_null() {
-                break;
-            }
-
-            // Safety: dirent is valid until next readdir call or closedir
-            let entry = unsafe { self.convert_dirent(dirent) };
-            entries.push(entry);
-        }
-
-        // Close directory
-        unsafe {
-            ffi::nfs_closedir(self.context, dir_handle);
-        }
-
-        Ok(entries)
-    }
-
-    /// Read directory entries in chunks, calling a callback for each chunk
-    ///
-    /// This is more memory-efficient for large directories and allows
-    /// distributing work across workers as entries are read.
-    ///
-    /// Returns the total number of entries processed.
-    pub fn readdir_plus_chunked<F>(
-        &self,
-        path: &str,
-        chunk_size: usize,
-        mut callback: F,
-    ) -> NfsResult<usize>
-    where
-        F: FnMut(Vec<NfsDirEntry>) -> bool, // Return false to stop early
-    {
-        if !self.mounted {
-            return Err(NfsError::ReadDirFailed {
-                path: path.into(),
-                reason: "Not mounted".into(),
-            });
-        }
-
-        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadDirFailed {
-            path: path.into(),
-            reason: "Path contains null bytes".into(),
-        })?;
-
-        // Open directory
-        let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
-        let open_start = std::time::Instant::now();
-        let result = unsafe {
-            ffi::nfs_opendir(self.context, path_cstr.as_ptr(), &mut dir_handle)
-        };
-        let open_elapsed = open_start.elapsed();
-
-        if result != 0 {
-            return Err(self.translate_error(path, result));
-        }
-
-        // Log if opendir was slow (> 100ms) - debug level so it only shows with -v
-        if open_elapsed.as_millis() > 100 {
-            tracing::debug!("nfs_opendir({}) took {:?}", path, open_elapsed);
-        }
-
-        let mut total_entries = 0;
-        let mut chunk = Vec::with_capacity(chunk_size);
-        let mut first_read = true;
-        let read_start = std::time::Instant::now();
-
-        loop {
-            let dirent = unsafe { ffi::nfs_readdir(self.context, dir_handle) };
-
-            // Log if first readdir was slow - debug level so it only shows with -v
-            if first_read {
-                let first_read_elapsed = read_start.elapsed();
-                if first_read_elapsed.as_millis() > 100 {
-                    tracing::debug!("first nfs_readdir({}) took {:?}", path, first_read_elapsed);
-                }
-                first_read = false;
-            }
-
-            if dirent.is_null() {
-                // End of directory - send final chunk if any
-                if !chunk.is_empty() {
-                    total_entries += chunk.len();
-                    callback(chunk);
-                }
-                break;
-            }
-
-            // Safety: dirent is valid until next readdir call or closedir
-            let entry = unsafe { self.convert_dirent(dirent) };
-            chunk.push(entry);
-
-            // When chunk is full, send it to callback
-            if chunk.len() >= chunk_size {
-                total_entries += chunk.len();
-                let continue_reading = callback(chunk);
-                chunk = Vec::with_capacity(chunk_size);
-
-                if !continue_reading {
-                    break;
-                }
-            }
-        }
-
-        // Close directory
-        unsafe {
-            ffi::nfs_closedir(self.context, dir_handle);
-        }
-
-        Ok(total_entries)
+    /// Mark the connection unusable after an RPC left the context in an
+    /// unknown state (e.g. a timed-out PDU still queued inside libnfs
+    /// holding a pointer to a dead stack frame). Every subsequent
+    /// operation fails fast with "Not mounted", so `rpc_service` is
+    /// never driven again on this context and the stale callback can
+    /// never fire. `Drop` also skips the unmount RPC for a poisoned
+    /// connection — `nfs_destroy_context` cancels in-flight PDUs
+    /// without invoking their callbacks.
+    fn poison(&self) {
+        self.mounted.set(false);
     }
 
     /// Read a directory using direct RPC, returning entries with file handles
@@ -408,7 +238,7 @@ impl NfsConnection {
     where
         F: FnMut(Vec<NfsDirEntry>) -> bool,
     {
-        if !self.mounted {
+        if !self.mounted.get() {
             return Err(NfsError::ReadDirFailed {
                 path: path.into(),
                 reason: "Not mounted".into(),
@@ -478,11 +308,12 @@ impl NfsConnection {
             })?;
 
             let mut cb_data = LookupCallbackData {
-                completed: false,
+                completed: Cell::new(false),
                 status: 0,
                 fh_len: 0,
                 fh_data: [0; 128],
             };
+            let cb_ptr: *mut LookupCallbackData = &mut cb_data;
 
             // Build LOOKUP args
             let mut args: ffi::LOOKUP3args = unsafe { std::mem::zeroed() };
@@ -495,7 +326,7 @@ impl NfsConnection {
                     rpc,
                     Some(lookup_callback),
                     &mut args,
-                    &mut cb_data as *mut _ as *mut std::ffi::c_void,
+                    cb_ptr as *mut std::ffi::c_void,
                 )
             };
 
@@ -506,10 +337,20 @@ impl NfsConnection {
                 });
             }
 
-            if let Err(e) = wait_for_rpc_completion(rpc, &cb_data.completed, self.rpc_timeout_ms) {
+            let completed = unsafe { std::ptr::addr_of!((*cb_ptr).completed) };
+            if let Err(e) = wait_for_rpc_completion(rpc, completed, self.rpc_timeout_ms) {
+                // The PDU may still be queued inside libnfs with a
+                // pointer to `cb_data` on this soon-dead stack frame.
+                // Poison the connection so no code path ever services
+                // this context again (which would fire the stale
+                // callback into freed memory).
+                self.poison();
                 return Err(NfsError::ReadDirFailed {
                     path: path.into(),
-                    reason: format!("LOOKUP '{}' failed: {}", component, e),
+                    reason: format!(
+                        "LOOKUP '{}' failed: {} (connection poisoned)",
+                        component, e
+                    ),
                 });
             }
 
@@ -548,7 +389,7 @@ impl NfsConnection {
     where
         F: FnMut(Vec<NfsDirEntry>) -> bool, // Return false to stop early
     {
-        if !self.mounted {
+        if !self.mounted.get() {
             return Err(NfsError::ReadDirFailed {
                 path: "(by file handle)".into(),
                 reason: "Not mounted".into(),
@@ -571,21 +412,16 @@ impl NfsConnection {
         let mut cookie: u64 = 0;
         let mut cookieverf: [i8; 8] = [0; 8];
 
-        // Use smaller buffer sizes - large buffers cause timeouts on huge directories
-        // because the server takes too long to prepare the response.
-        // Smaller buffers = more RPCs but each completes quickly.
-        let dircount: u32 = 8192;   // 8KB
-        let maxcount: u32 = 16384;  // 16KB
-
         loop {
             let mut cb_data = ReaddirplusFullData {
-                completed: false,
+                completed: Cell::new(false),
                 status: 0,
                 eof: false,
                 cookie: 0,
                 cookieverf: [0i8; 8],
                 entries: Vec::with_capacity(chunk_size),
             };
+            let cb_ptr: *mut ReaddirplusFullData = &mut cb_data;
 
             // Build READDIRPLUS args with the cached file handle
             let mut args: ffi::READDIRPLUS3args = unsafe { std::mem::zeroed() };
@@ -593,15 +429,15 @@ impl NfsConnection {
             args.dir.data.data_val = file_handle.as_ptr() as *mut i8;
             args.cookie = cookie;
             args.cookieverf = cookieverf;
-            args.dircount = dircount;
-            args.maxcount = maxcount;
+            args.dircount = READDIRPLUS_DIRCOUNT;
+            args.maxcount = READDIRPLUS_MAXCOUNT;
 
             let pdu = unsafe {
                 ffi::rpc_nfs3_readdirplus_task(
                     rpc,
                     Some(readdirplus_full_callback),
                     &mut args,
-                    &mut cb_data as *mut _ as *mut std::ffi::c_void,
+                    cb_ptr as *mut std::ffi::c_void,
                 )
             };
 
@@ -613,10 +449,15 @@ impl NfsConnection {
             }
 
             // Wait for completion
-            if let Err(e) = wait_for_rpc_completion(rpc, &cb_data.completed, self.rpc_timeout_ms) {
+            let completed = unsafe { std::ptr::addr_of!((*cb_ptr).completed) };
+            if let Err(e) = wait_for_rpc_completion(rpc, completed, self.rpc_timeout_ms) {
+                // Same rationale as the LOOKUP path: the timed-out PDU
+                // may still reference this stack frame. Poison so the
+                // context is never serviced again.
+                self.poison();
                 return Err(NfsError::ReadDirFailed {
                     path: "(by file handle)".into(),
-                    reason: format!("READDIRPLUS failed: {}", e),
+                    reason: format!("READDIRPLUS failed: {} (connection poisoned)", e),
                 });
             }
 
@@ -681,7 +522,7 @@ impl NfsConnection {
         cookieverf: [i8; 8],
         tag: u64,
     ) -> NfsResult<InflightReaddir> {
-        if !self.mounted {
+        if !self.mounted.get() {
             return Err(NfsError::ReadDirFailed {
                 path: "(pipelined)".into(),
                 reason: "Not mounted".into(),
@@ -702,12 +543,14 @@ impl NfsConnection {
         // InflightReaddir; the raw pointer below stays valid until that
         // InflightReaddir is dropped.
         let mut cb_data: Box<ReaddirplusFullData> = Box::new(ReaddirplusFullData {
-            completed: false,
+            completed: Cell::new(false),
             status: 0,
             eof: false,
             cookie: 0,
             cookieverf: [0i8; 8],
-            entries: Vec::new(),
+            // A ~16 KB READDIRPLUS page holds ~60–100 entries; one
+            // up-front reservation avoids the realloc ladder per page.
+            entries: Vec::with_capacity(128),
         });
 
         // Build args. The args struct can stay stack-allocated because
@@ -718,8 +561,8 @@ impl NfsConnection {
         args.dir.data.data_val = file_handle.as_ptr() as *mut i8;
         args.cookie = cookie;
         args.cookieverf = cookieverf;
-        args.dircount = 8192;
-        args.maxcount = 16384;
+        args.dircount = READDIRPLUS_DIRCOUNT;
+        args.maxcount = READDIRPLUS_MAXCOUNT;
 
         let private =
             (&mut *cb_data) as *mut ReaddirplusFullData as *mut std::ffi::c_void;
@@ -767,6 +610,15 @@ impl NfsConnection {
         min_completions: usize,
         timeout_ms: i32,
     ) -> NfsResult<usize> {
+        // A poisoned context must never be serviced again: a timed-out
+        // PDU may hold a private_data pointer into a dead stack frame,
+        // and rpc_service would fire its callback.
+        if !self.mounted.get() {
+            return Err(NfsError::ReadDirFailed {
+                path: "(pipelined)".into(),
+                reason: "connection poisoned (not mounted)".into(),
+            });
+        }
         if slots.is_empty() {
             return Ok(0);
         }
@@ -869,7 +721,7 @@ impl NfsConnection {
     /// worker can fall back to a sync lookup for fh-less work items
     /// (the root dir, plus any externally-injected dir).
     pub fn resolve_path_to_fh(&self, path: &str) -> NfsResult<Vec<u8>> {
-        if !self.mounted {
+        if !self.mounted.get() {
             return Err(NfsError::ReadDirFailed {
                 path: path.into(),
                 reason: "Not mounted".into(),
@@ -907,68 +759,6 @@ impl NfsConnection {
         self.lookup_path_internal(rpc, &root_fh.1[..root_fh.0], path)
     }
 
-    /// Open a directory for manual iteration with seek support
-    ///
-    /// This allows for cookie-based parallel reading:
-    /// 1. Open directory
-    /// 2. Read entries, periodically calling telldir() to get position
-    /// 3. Later, seekdir() to jump to a saved position
-    pub fn opendir(&self, path: &str) -> NfsResult<NfsDirHandle> {
-        if !self.mounted {
-            return Err(NfsError::ReadDirFailed {
-                path: path.into(),
-                reason: "Not mounted".into(),
-            });
-        }
-
-        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadDirFailed {
-            path: path.into(),
-            reason: "Path contains null bytes".into(),
-        })?;
-
-        let mut dir_handle: *mut ffi::nfsdir = ptr::null_mut();
-        let result = unsafe {
-            ffi::nfs_opendir(self.context, path_cstr.as_ptr(), &mut dir_handle)
-        };
-
-        if result != 0 {
-            return Err(self.translate_error(path, result));
-        }
-
-        Ok(NfsDirHandle {
-            context: self.context,
-            handle: dir_handle,
-            path: path.to_string(),
-        })
-    }
-
-    /// Stat a single path
-    pub fn stat(&self, path: &str) -> NfsResult<NfsStat> {
-        if !self.mounted {
-            return Err(NfsError::StatFailed {
-                path: path.into(),
-                reason: "Not mounted".into(),
-            });
-        }
-
-        let path_cstr = CString::new(path).map_err(|_| NfsError::StatFailed {
-            path: path.into(),
-            reason: "Path contains null bytes".into(),
-        })?;
-
-        let mut stat: ffi::nfs_stat_64 = unsafe { std::mem::zeroed() };
-
-        let result = unsafe {
-            ffi::nfs_stat64(self.context, path_cstr.as_ptr(), &mut stat)
-        };
-
-        if result != 0 {
-            return Err(self.translate_error(path, result));
-        }
-
-        Ok(self.convert_stat(&stat))
-    }
-
     /// Get the current error message from libnfs
     fn get_error(&self) -> String {
         let err_ptr = unsafe { ffi::nfs_get_error(self.context) };
@@ -978,94 +768,6 @@ impl NfsConnection {
 
         let c_str = unsafe { CStr::from_ptr(err_ptr) };
         c_str.to_string_lossy().into_owned()
-    }
-
-    /// Translate an NFS error code to our error type
-    fn translate_error(&self, path: &str, code: i32) -> NfsError {
-        let error_msg = self.get_error();
-
-        // Common NFS error codes (from nfsc/libnfs-raw-nfs.h)
-        match code {
-            -13 => NfsError::PermissionDenied { path: path.into() }, // EACCES
-            -2 => NfsError::NotFound { path: path.into() },         // ENOENT
-            -20 => NfsError::NotFound { path: path.into() },        // ENOTDIR
-            -70 => NfsError::StaleHandle { path: path.into() },     // ESTALE
-            _ => NfsError::Protocol {
-                code,
-                message: error_msg,
-            },
-        }
-    }
-
-    /// Convert a libnfs dirent to our NfsDirEntry
-    ///
-    /// Safety: dirent must be valid
-    unsafe fn convert_dirent(&self, dirent: *mut ffi::nfsdirent) -> NfsDirEntry {
-        let d = &*dirent;
-
-        // Get the name
-        let name = if d.name.is_null() {
-            String::new()
-        } else {
-            CStr::from_ptr(d.name).to_string_lossy().into_owned()
-        };
-
-        // Determine entry type
-        let entry_type = EntryType::from_mode(d.mode);
-
-        // Build stat if we have full attributes. Pack seconds + nanoseconds
-        // into a single microseconds-since-epoch value so sub-second
-        // precision survives the trip into the Parquet `mtime_us` column.
-        let stat = Some(NfsStat {
-            size: d.size,
-            inode: d.inode,
-            nlink: d.nlink as u64,
-            uid: d.uid,
-            gid: d.gid,
-            mode: d.mode,
-            atime: Some(timeval_to_micros(d.atime.tv_sec, d.atime_nsec)),
-            mtime: Some(timeval_to_micros(d.mtime.tv_sec, d.mtime_nsec)),
-            ctime: Some(timeval_to_micros(d.ctime.tv_sec, d.ctime_nsec)),
-            mtime_sec: Some(d.mtime.tv_sec),
-            mtime_nsec: Some(d.mtime_nsec as i32),
-            atime_sec: Some(d.atime.tv_sec),
-            atime_nsec: Some(d.atime_nsec as i32),
-            ctime_sec: Some(d.ctime.tv_sec),
-            ctime_nsec: Some(d.ctime_nsec as i32),
-            blksize: d.blksize,
-            blocks: d.blocks,
-        });
-
-        NfsDirEntry {
-            name,
-            entry_type,
-            stat,
-            inode: d.inode,
-            file_handle: None, // libnfs high-level API doesn't expose file handles
-        }
-    }
-
-    /// Convert a libnfs stat structure to our NfsStat
-    fn convert_stat(&self, stat: &ffi::nfs_stat_64) -> NfsStat {
-        NfsStat {
-            size: stat.nfs_size,
-            inode: stat.nfs_ino,
-            nlink: stat.nfs_nlink,
-            uid: stat.nfs_uid as u32,
-            gid: stat.nfs_gid as u32,
-            mode: stat.nfs_mode as u32,
-            atime: Some(nfs_stat64_to_micros(stat.nfs_atime, stat.nfs_atime_nsec)),
-            mtime: Some(nfs_stat64_to_micros(stat.nfs_mtime, stat.nfs_mtime_nsec)),
-            ctime: Some(nfs_stat64_to_micros(stat.nfs_ctime, stat.nfs_ctime_nsec)),
-            mtime_sec: Some(stat.nfs_mtime as i64),
-            mtime_nsec: Some(stat.nfs_mtime_nsec as i32),
-            atime_sec: Some(stat.nfs_atime as i64),
-            atime_nsec: Some(stat.nfs_atime_nsec as i32),
-            ctime_sec: Some(stat.nfs_ctime as i64),
-            ctime_nsec: Some(stat.nfs_ctime_nsec as i32),
-            blksize: stat.nfs_blksize,
-            blocks: stat.nfs_blocks,
-        }
     }
 
     /// Get the server name
@@ -1078,186 +780,24 @@ impl NfsConnection {
         &self.export
     }
 
-    /// Check if we're connected
+    /// Check if we're connected (false after `poison()`)
     pub fn is_connected(&self) -> bool {
-        self.mounted
-    }
-
-    /// Get raw NFS context pointer for async operations
-    ///
-    /// # Safety
-    /// The returned pointer is only valid while this NfsConnection exists.
-    /// The caller must not use this pointer after the connection is dropped.
-    /// The caller must not call any functions that would invalidate the context.
-    #[allow(dead_code)]
-    pub unsafe fn raw_context(&self) -> *mut ffi::nfs_context {
-        self.context
-    }
-
-    /// Read the first N bytes from a file for magic byte detection
-    ///
-    /// This is optimized for file type detection - it only reads the header bytes
-    /// needed to identify the file format.
-    pub fn read_file_header(&self, path: &str, max_bytes: usize) -> NfsResult<Vec<u8>> {
-        if !self.mounted {
-            return Err(NfsError::ReadFailed {
-                path: path.into(),
-                reason: "Not mounted".into(),
-            });
-        }
-
-        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadFailed {
-            path: path.into(),
-            reason: "Path contains null bytes".into(),
-        })?;
-
-        // Open file for reading (O_RDONLY = 0)
-        let mut fh: *mut ffi::nfsfh = ptr::null_mut();
-        let result = unsafe {
-            ffi::nfs_open(self.context, path_cstr.as_ptr(), 0, &mut fh)
-        };
-
-        if result != 0 {
-            return Err(NfsError::ReadFailed {
-                path: path.into(),
-                reason: self.get_error(),
-            });
-        }
-
-        // Read the header bytes
-        let mut buffer = vec![0u8; max_bytes];
-        let bytes_read = unsafe {
-            ffi::nfs_read(
-                self.context,
-                fh,
-                buffer.as_mut_ptr() as *mut std::ffi::c_void,
-                max_bytes,
-            )
-        };
-
-        // Close the file regardless of read result
-        unsafe {
-            ffi::nfs_close(self.context, fh);
-        }
-
-        if bytes_read < 0 {
-            return Err(NfsError::ReadFailed {
-                path: path.into(),
-                reason: self.get_error(),
-            });
-        }
-
-        // Truncate buffer to actual bytes read
-        buffer.truncate(bytes_read as usize);
-        Ok(buffer)
-    }
-
-    /// Read entire file content for checksum calculation
-    ///
-    /// Returns None if the file is larger than max_size to avoid excessive memory usage.
-    /// For very large files, consider using a streaming approach.
-    pub fn read_file_content(&self, path: &str, max_size: u64) -> NfsResult<Option<Vec<u8>>> {
-        if !self.mounted {
-            return Err(NfsError::ReadFailed {
-                path: path.into(),
-                reason: "Not mounted".into(),
-            });
-        }
-
-        let path_cstr = CString::new(path).map_err(|_| NfsError::ReadFailed {
-            path: path.into(),
-            reason: "Path contains null bytes".into(),
-        })?;
-
-        // First stat the file to check size
-        let mut stat: ffi::nfs_stat_64 = unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            ffi::nfs_stat64(self.context, path_cstr.as_ptr(), &mut stat)
-        };
-
-        if result != 0 {
-            return Err(NfsError::ReadFailed {
-                path: path.into(),
-                reason: self.get_error(),
-            });
-        }
-
-        let file_size = stat.nfs_size;
-
-        // Check if file is too large
-        if file_size > max_size {
-            return Ok(None);
-        }
-
-        // Open file for reading (O_RDONLY = 0)
-        let mut fh: *mut ffi::nfsfh = ptr::null_mut();
-        let result = unsafe {
-            ffi::nfs_open(self.context, path_cstr.as_ptr(), 0, &mut fh)
-        };
-
-        if result != 0 {
-            return Err(NfsError::ReadFailed {
-                path: path.into(),
-                reason: self.get_error(),
-            });
-        }
-
-        // Read the entire file in chunks
-        let mut buffer = Vec::with_capacity(file_size as usize);
-        let chunk_size: u64 = 1024 * 1024; // 1MB chunks
-        let mut offset: u64 = 0;
-
-        while offset < file_size {
-            let remaining = file_size - offset;
-            let to_read = std::cmp::min(remaining, chunk_size);
-            let mut chunk = vec![0u8; to_read as usize];
-
-            let bytes_read = unsafe {
-                ffi::nfs_pread(
-                    self.context,
-                    fh,
-                    chunk.as_mut_ptr() as *mut std::ffi::c_void,
-                    to_read as usize,
-                    offset,
-                )
-            };
-
-            if bytes_read < 0 {
-                // Close file and return error
-                unsafe { ffi::nfs_close(self.context, fh); }
-                return Err(NfsError::ReadFailed {
-                    path: path.into(),
-                    reason: self.get_error(),
-                });
-            }
-
-            if bytes_read == 0 {
-                // EOF reached
-                break;
-            }
-
-            chunk.truncate(bytes_read as usize);
-            buffer.extend_from_slice(&chunk);
-            offset += bytes_read as u64;
-        }
-
-        // Close the file
-        unsafe {
-            ffi::nfs_close(self.context, fh);
-        }
-
-        Ok(Some(buffer))
+        self.mounted.get()
     }
 }
 
 impl Drop for NfsConnection {
     fn drop(&mut self) {
         if !self.context.is_null() {
-            if self.mounted {
+            // Skip the unmount RPC for poisoned connections: servicing
+            // the context could fire a stale callback into a dead stack
+            // frame (see `poison()`). nfs_destroy_context alone cancels
+            // in-flight PDUs without invoking callbacks.
+            if self.mounted.get() {
                 unsafe {
                     ffi::nfs_umount(self.context);
                 }
-                self.mounted = false;
+                self.mounted.set(false);
             }
 
             unsafe {
@@ -1268,135 +808,14 @@ impl Drop for NfsConnection {
     }
 }
 
-/// Handle to an open NFS directory for sequential or parallel reading
+/// Context passed to RPC callbacks for LOOKUP operations.
 ///
-/// Provides access to telldir/seekdir for cookie-based positioning.
-/// The directory is automatically closed when the handle is dropped.
-pub struct NfsDirHandle {
-    context: *mut ffi::nfs_context,
-    handle: *mut ffi::nfsdir,
-    path: String,
-}
-
-// NfsDirHandle must be used with the same NfsConnection that created it
-// It's Send because NfsConnection is Send
-unsafe impl Send for NfsDirHandle {}
-
-impl NfsDirHandle {
-    /// Get the current position (cookie) in the directory
-    ///
-    /// This can be saved and later used with seekdir() to resume reading
-    /// from this position, potentially from a different connection.
-    pub fn telldir(&self) -> i64 {
-        unsafe { ffi::nfs_telldir(self.context, self.handle) as i64 }
-    }
-
-    /// Seek to a previously saved position (cookie)
-    ///
-    /// After seeking, the next readdir() call will return entries
-    /// starting from that position.
-    pub fn seekdir(&self, cookie: i64) {
-        unsafe { ffi::nfs_seekdir(self.context, self.handle, cookie as std::ffi::c_long) }
-    }
-
-    /// Rewind to the beginning of the directory
-    pub fn rewinddir(&self) {
-        unsafe { ffi::nfs_rewinddir(self.context, self.handle) }
-    }
-
-    /// Read the next directory entry
-    ///
-    /// Returns None when there are no more entries.
-    pub fn readdir(&self) -> Option<NfsDirEntry> {
-        let dirent = unsafe { ffi::nfs_readdir(self.context, self.handle) };
-
-        if dirent.is_null() {
-            return None;
-        }
-
-        // Safety: dirent is valid until next readdir call or closedir
-        Some(unsafe { Self::convert_dirent(dirent) })
-    }
-
-    /// Read up to `count` entries, returning them with the final cookie position
-    ///
-    /// Returns (entries, final_cookie) where final_cookie is the position
-    /// after the last entry read.
-    pub fn read_batch(&self, count: usize) -> (Vec<NfsDirEntry>, i64) {
-        let mut entries = Vec::with_capacity(count);
-
-        for _ in 0..count {
-            match self.readdir() {
-                Some(entry) => entries.push(entry),
-                None => break,
-            }
-        }
-
-        let cookie = self.telldir();
-        (entries, cookie)
-    }
-
-    /// Get the directory path
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-
-    /// Convert a libnfs dirent to our NfsDirEntry (same as NfsConnection::convert_dirent)
-    unsafe fn convert_dirent(dirent: *mut ffi::nfsdirent) -> NfsDirEntry {
-        let d = &*dirent;
-
-        let name = if d.name.is_null() {
-            String::new()
-        } else {
-            CStr::from_ptr(d.name).to_string_lossy().into_owned()
-        };
-
-        let entry_type = EntryType::from_mode(d.mode);
-
-        let stat = Some(NfsStat {
-            size: d.size,
-            inode: d.inode,
-            nlink: d.nlink as u64,
-            uid: d.uid,
-            gid: d.gid,
-            mode: d.mode,
-            atime: Some(timeval_to_micros(d.atime.tv_sec, d.atime_nsec)),
-            mtime: Some(timeval_to_micros(d.mtime.tv_sec, d.mtime_nsec)),
-            ctime: Some(timeval_to_micros(d.ctime.tv_sec, d.ctime_nsec)),
-            mtime_sec: Some(d.mtime.tv_sec),
-            mtime_nsec: Some(d.mtime_nsec as i32),
-            atime_sec: Some(d.atime.tv_sec),
-            atime_nsec: Some(d.atime_nsec as i32),
-            ctime_sec: Some(d.ctime.tv_sec),
-            ctime_nsec: Some(d.ctime_nsec as i32),
-            blksize: d.blksize,
-            blocks: d.blocks,
-        });
-
-        NfsDirEntry {
-            name,
-            entry_type,
-            stat,
-            inode: d.inode,
-            file_handle: None, // libnfs high-level API doesn't expose file handles
-        }
-    }
-}
-
-impl Drop for NfsDirHandle {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe {
-                ffi::nfs_closedir(self.context, self.handle);
-            }
-            self.handle = ptr::null_mut();
-        }
-    }
-}
-
-/// Context passed to RPC callbacks for LOOKUP operations
+/// `completed` is a `Cell` because the poll loop reads it while the
+/// libnfs callback (same thread, inside `rpc_service`) writes it — the
+/// Cell makes that access pattern well-defined without pretending the
+/// flag is immutable.
 struct LookupCallbackData {
-    completed: bool,
+    completed: Cell<bool>,
     status: i32,
     fh_len: usize,
     fh_data: [u8; 128], // NFS3 max file handle is 64 bytes, but use 128 for safety
@@ -1410,7 +829,7 @@ unsafe extern "C" fn lookup_callback(
     private_data: *mut ::std::os::raw::c_void,
 ) {
     let cb_data = &mut *(private_data as *mut LookupCallbackData);
-    cb_data.completed = true;
+    cb_data.completed.set(true);
     cb_data.status = status;
 
     if status == ffi::RPC_STATUS_SUCCESS as i32 {
@@ -1434,7 +853,8 @@ unsafe extern "C" fn lookup_callback(
 }
 
 struct ReaddirplusFullData {
-    completed: bool,
+    /// See `LookupCallbackData::completed` for why this is a `Cell`.
+    completed: Cell<bool>,
     status: i32,
     eof: bool,
     cookie: u64,
@@ -1497,7 +917,7 @@ impl InflightReaddir {
     /// Has the libnfs callback fired for this slot?
     #[inline]
     pub fn is_completed(&self) -> bool {
-        self.cb_data.completed
+        self.cb_data.completed.get()
     }
 
     /// Raw RPC status from the callback. Meaningful once
@@ -1532,7 +952,7 @@ unsafe extern "C" fn readdirplus_full_callback(
     private_data: *mut ::std::os::raw::c_void,
 ) {
     let cb_data = &mut *(private_data as *mut ReaddirplusFullData);
-    cb_data.completed = true;
+    cb_data.completed.set(true);
     cb_data.status = status;
 
     if status == ffi::RPC_STATUS_SUCCESS as i32 {
@@ -1545,10 +965,18 @@ unsafe extern "C" fn readdirplus_full_callback(
             // Copy cookieverf for next call
             cb_data.cookieverf.copy_from_slice(&resok.cookieverf);
 
-            // Collect entries with full attributes and file handles
+            // Collect entries with full attributes and file handles.
+            //
+            // libnfs XDR-decodes the entry list into 4-byte-aligned
+            // arena memory, but entryplus3 contains u64 fields (fileid,
+            // cookie) that make Rust demand 8-byte alignment — `&*ptr`
+            // here is UB and panics under debug's misaligned-deref
+            // check. Copy each node out with read_unaligned; interior
+            // pointers (name, handle data, nextentry) stay valid, they
+            // just point back into the arena.
             let mut entry_ptr = resok.reply.entries;
             while !entry_ptr.is_null() {
-                let entry = &*entry_ptr;
+                let entry = std::ptr::read_unaligned(entry_ptr);
                 cb_data.cookie = entry.cookie;
 
                 // Get entry name
@@ -1580,25 +1008,12 @@ unsafe extern "C" fn readdirplus_full_callback(
                             uid: attrs.uid,
                             gid: attrs.gid,
                             mode: attrs.mode,
-                            atime: Some(nfstime3_to_micros(
-                                attrs.atime.seconds,
-                                attrs.atime.nseconds,
-                            )),
-                            mtime: Some(nfstime3_to_micros(
-                                attrs.mtime.seconds,
-                                attrs.mtime.nseconds,
-                            )),
-                            ctime: Some(nfstime3_to_micros(
-                                attrs.ctime.seconds,
-                                attrs.ctime.nseconds,
-                            )),
                             mtime_sec: Some(attrs.mtime.seconds as i64),
                             mtime_nsec: Some(attrs.mtime.nseconds as i32),
                             atime_sec: Some(attrs.atime.seconds as i64),
                             atime_nsec: Some(attrs.atime.nseconds as i32),
                             ctime_sec: Some(attrs.ctime.seconds as i64),
                             ctime_nsec: Some(attrs.ctime.nseconds as i32),
-                            blksize: 4096, // NFS3 doesn't provide blksize
                             blocks: attrs.used.div_ceil(512), // Convert used bytes to 512-byte blocks
                         };
                         (et, Some(s))
@@ -1644,14 +1059,20 @@ unsafe extern "C" fn readdirplus_full_callback(
 
 /// Wait for an RPC operation to complete by polling
 ///
-/// The `completed` pointer points to a bool that is set by the RPC callback.
-/// This function keeps polling until either the callback is called or timeout.
+/// `completed` points at the callback-data's flag; the RPC callback sets
+/// it from inside `rpc_service` on this same thread. This function keeps
+/// polling until either the callback fires or the timeout elapses.
+///
+/// IMPORTANT: on `Err`, the PDU may still be queued inside libnfs with a
+/// pointer to the caller's callback data. Callers must poison the
+/// connection (see `NfsConnection::poison`) before letting that data go
+/// out of scope.
 ///
 /// # Safety
 /// The `completed` pointer must remain valid for the duration of this call.
 fn wait_for_rpc_completion(
     rpc: *mut ffi::rpc_context,
-    completed: *const bool,
+    completed: *const Cell<bool>,
     timeout_ms: i32,
 ) -> Result<(), String> {
     use std::os::unix::io::RawFd;
@@ -1665,10 +1086,7 @@ fn wait_for_rpc_completion(
     let timeout = std::time::Duration::from_millis(timeout_ms as u64);
     let mut iteration = 0u32;
 
-    // The libnfs C callback mutates `*completed`; clippy cannot see through
-    // the FFI boundary, but polling this flag is the wrapped API contract.
-    #[allow(clippy::while_immutable_condition)]
-    while !unsafe { *completed } {
+    while !unsafe { (*completed).get() } {
         if start.elapsed() > timeout {
             tracing::debug!(
                 "RPC timeout after {} iterations, fd={}, elapsed={:?}",
@@ -1782,9 +1200,6 @@ pub struct NfsConnectionBuilder {
     retries: u32,
     /// Override server with specific IP (for DNS round-robin)
     override_ip: Option<String>,
-    /// READDIR buffer size in bytes (default: 8KB, max: 4MB)
-    /// Larger buffers reduce RPC round-trips for directory listings.
-    readdir_buffer_size: Option<u32>,
 }
 
 impl NfsConnectionBuilder {
@@ -1795,7 +1210,6 @@ impl NfsConnectionBuilder {
             timeout: Duration::from_secs(30),
             retries: 3,
             override_ip: None,
-            readdir_buffer_size: None,
         }
     }
 
@@ -1815,16 +1229,6 @@ impl NfsConnectionBuilder {
     /// Set retry count
     pub fn retries(mut self, retries: u32) -> Self {
         self.retries = retries;
-        self
-    }
-
-    /// Set READDIR buffer size in bytes
-    ///
-    /// Larger buffers reduce RPC round-trips for directory listings.
-    /// Default is 8KB, max is 4MB. Values are rounded to 4KB boundaries.
-    /// For large directories, 1MB is a good choice.
-    pub fn readdir_buffer_size(mut self, size: u32) -> Self {
-        self.readdir_buffer_size = Some(size);
         self
     }
 
@@ -1851,21 +1255,13 @@ impl NfsConnectionBuilder {
                 std::thread::sleep(delay);
             }
 
-            // Create connection, apply settings, then connect
             match NfsConnection::new(&url) {
-                Ok(mut conn) => {
-                    // Apply readdir buffer size if configured
-                    if let Some(size) = self.readdir_buffer_size {
-                        conn.set_readdir_buffer_size(size);
+                Ok(mut conn) => match conn.connect(self.timeout) {
+                    Ok(()) => return Ok(conn),
+                    Err(e) => {
+                        last_error = Some(e);
                     }
-
-                    match conn.connect(self.timeout) {
-                        Ok(()) => return Ok(conn),
-                        Err(e) => {
-                            last_error = Some(e);
-                        }
-                    }
-                }
+                },
                 Err(e) => {
                     last_error = Some(e);
                 }
@@ -1882,23 +1278,28 @@ impl NfsConnectionBuilder {
 /// Resolve a hostname to all its IP addresses
 ///
 /// Returns a list of IP addresses for DNS round-robin load balancing.
-/// Makes multiple resolution attempts using `host` command to bypass
-/// system resolver caching and catch rotating DNS servers.
-/// If resolution fails, returns the original hostname as the only entry.
+/// Makes repeated queries via the `host` command to bypass system
+/// resolver caching and catch rotating DNS servers, stopping early once
+/// two consecutive queries add nothing new. Note: when the local
+/// resolver caches upstream answers, rotation is invisible no matter
+/// how many attempts run — `--server-ips` is the reliable escape hatch.
+/// If resolution fails entirely, returns the hostname as the only entry.
 pub fn resolve_dns(hostname: &str) -> Vec<String> {
-    resolve_dns_with_attempts(hostname, 20)
+    resolve_dns_with_attempts(hostname, 6)
 }
 
-/// Resolve DNS with a specified number of attempts to catch all rotating IPs
+/// Resolve DNS with a bounded number of attempts to catch rotating IPs.
 pub fn resolve_dns_with_attempts(hostname: &str, attempts: usize) -> Vec<String> {
     use std::collections::HashSet;
     use std::process::Command;
 
     let mut all_ips = HashSet::new();
+    let mut stale_rounds = 0;
 
-    // Use `host` command to bypass system resolver caching
-    // Each call to `host` does a fresh DNS query
+    // Each `host` invocation does a fresh DNS query (unlike getaddrinfo,
+    // which may serve the nscd/systemd-resolved cache).
     for _ in 0..attempts {
+        let before = all_ips.len();
         if let Ok(output) = Command::new("host")
             .arg(hostname)
             .output()
@@ -1914,6 +1315,14 @@ pub fn resolve_dns_with_attempts(hostname: &str, attempts: usize) -> Vec<String>
                     }
                 }
             }
+        }
+        if all_ips.len() == before {
+            stale_rounds += 1;
+            if stale_rounds >= 2 && !all_ips.is_empty() {
+                break;
+            }
+        } else {
+            stale_rounds = 0;
         }
     }
 
@@ -1949,85 +1358,6 @@ mod tests {
 
     // Note: Most tests require an actual NFS server
     // These are unit tests for the non-FFI parts
-
-    #[test]
-    fn pack_micros_combines_seconds_and_nanos() {
-        // Whole-second input, no nanos -> exact microsecond multiple.
-        assert_eq!(pack_micros(1_777_857_024, 0), 1_777_857_024_000_000);
-        // The example from the bug report: 1777857024.7166800450 -> us.
-        // 716680045 ns / 1000 = 716680 us.
-        assert_eq!(
-            pack_micros(1_777_857_024, 716_680_045),
-            1_777_857_024_716_680
-        );
-    }
-
-    #[test]
-    fn pack_micros_clamps_negative_nsec_to_zero() {
-        // Real filesystems don't produce negative nsec, but a malformed
-        // stat struct shouldn't be allowed to subtract from sec*1e6.
-        assert_eq!(pack_micros(1_000, -42), 1_000_000_000);
-    }
-
-    #[test]
-    fn pack_micros_clamps_overlarge_nsec() {
-        // 1.5 seconds of "nanoseconds" -> clamped to 999_999_999 ns
-        // = 999_999 us added to the seconds component.
-        assert_eq!(
-            pack_micros(1_000, 1_500_000_000),
-            1_000_000_000 + 999_999
-        );
-    }
-
-    #[test]
-    fn pack_micros_preserves_subsecond_remainder() {
-        // The whole point of the fix: every (sec, nsec >= 1000) input
-        // must produce a microsecond value whose %1_000_000 remainder is
-        // non-zero. Without the fix the remainder is always zero.
-        let cases: &[(i64, i64)] = &[
-            (1_700_000_000, 1_000),     // 1us
-            (1_700_000_000, 999_999_000), // 999_999us
-            (1_700_000_000, 500_500_500), // 500_500us
-        ];
-        for (sec, nsec) in cases {
-            let us = pack_micros(*sec, *nsec);
-            let rem = us.rem_euclid(1_000_000);
-            assert!(
-                rem != 0,
-                "pack_micros({}, {}) produced rem=0 -- subsecond data lost",
-                sec,
-                nsec
-            );
-        }
-    }
-
-    #[test]
-    fn timeval_to_micros_widens_unsigned_nsec() {
-        // u32 input; max value still fits the i64 path cleanly.
-        assert_eq!(timeval_to_micros(1, u32::MAX), 1_000_000 + 999_999);
-    }
-
-    #[test]
-    fn nfs_stat64_to_micros_widens_u64_nsec() {
-        // Normal case.
-        assert_eq!(
-            nfs_stat64_to_micros(1_777_857_024, 716_680_045),
-            1_777_857_024_716_680
-        );
-        // Garbage nsec (way past 1s) is clamped to 999_999us.
-        assert_eq!(
-            nfs_stat64_to_micros(0, u64::MAX),
-            999_999
-        );
-    }
-
-    #[test]
-    fn nfstime3_to_micros_widens_u32_pair() {
-        assert_eq!(
-            nfstime3_to_micros(1_777_857_024, 716_680_045),
-            1_777_857_024_716_680
-        );
-    }
 
     #[test]
     fn test_nfs_url_to_connection() {
@@ -2077,7 +1407,7 @@ mod tests {
             .collect();
         InflightReaddir {
             cb_data: Box::new(ReaddirplusFullData {
-                completed: true,
+                completed: Cell::new(true),
                 status,
                 eof,
                 cookie,
