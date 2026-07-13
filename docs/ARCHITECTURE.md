@@ -76,13 +76,11 @@ See `tasks/parquet-experiment-review.md` for the full bench writeup.
 - `NfsConnection` — manages NFS context lifecycle
 - `NfsConnectionBuilder` — fluent API for connection setup
 - READDIRPLUS support — returns names + attributes in single RPC
+- `resolve_dns` — repeated `host` queries collect rotating A records;
+  workers round-robin the pool with a per-VIP failure-count blacklist
+  (3 consecutive flakes), implemented in `walker/simple.rs`
 - Optional `--server-ips` override bypasses DNS round-robin when the
   resolver caches a single A record from a multi-VIP pool.
-
-**dns_resolver.rs** — multi-IP load balancing
-- Resolves hostname to all IPs
-- Round-robin assignment to workers
-- Failure-count threshold blacklist (3 consecutive flakes per VIP)
 
 **types.rs** — data structures
 - `EntryType` — File, Directory, Symlink, etc.
@@ -108,8 +106,8 @@ See `tasks/parquet-experiment-review.md` for the full bench writeup.
 
 **direct_writer.rs** — per-shard streaming writer
 - Owns one Arrow `RowBuilder` and one `ArrowWriter`
-- Rotates to a new part file once
-  `bytes_written >= --parquet-file-size-mb`
+- Rotates to a new part file once `bytes_written` crosses the 512 MiB
+  rotation threshold (`DEFAULT_TARGET_FILE_SIZE`)
 - Tail-flush + close on channel drop
 - `InProgressPart` RAII guard removes half-written files on `Err`
   (unwind path; abort path leaves orphan part files but no
@@ -117,7 +115,11 @@ See `tasks/parquet-experiment-review.md` for the full bench writeup.
 
 **builder.rs** — shared row builder (`DbEntry` → Arrow columns)
 - 24-column schema, scan_id dictionary-encoded
-- borrows `parent_path` to avoid per-row clones
+- derives `parent_path` zero-copy from `path` (the walker never clones
+  the parent string per entry) and the legacy `*_us` timestamp columns
+  from the (sec, nsec) pairs the walker carries
+- column builders pre-allocated to the row-group size and re-primed on
+  every `finish()`
 
 **schema.rs** — canonical Arrow schema definition
 
@@ -127,12 +129,15 @@ running row count.
 
 ### 4. Configuration (`src/config.rs`)
 
-CLI argument parsing with clap:
+CLI argument parsing with clap (numeric ranges enforced declaratively
+via `value_parser` ranges — no hand-rolled validation):
 - NFS URL parsing (`nfs://server/export` or `server:/export`)
-- Worker count, queue size, batch size
+- Worker count, batch size, `--exclude` regexes (skip emission + descent)
 - Output path, writer shards (default 32, cap 32)
-- Parquet tunables: compression, row-group size, file rotation
-  threshold, per-shard channel depth
+- Parquet compression (`--parquet-compression`); row-group size,
+  rotation threshold, and channel depth are fixed constants in
+  `direct_writer.rs` (`DEFAULT_ROW_GROUP_SIZE` etc.), validated by the
+  810 M-file bench
 - Timeout / retry / `--server-ips` override
 
 ### 5. Error handling (`src/error.rs`)
@@ -161,8 +166,9 @@ Structured `thiserror`-derived enums:
 
 3. **Writing**
    - Per-shard writer drains its channel, appends to Arrow builders
-   - Row group flush at `parquet_row_group_size` rows
-   - Part-file rotation at `parquet_file_size_bytes` bytes
+     (pre-sized to the row-group size — no re-growth per group)
+   - Row group flush every 256 K rows (`DEFAULT_ROW_GROUP_SIZE`)
+   - Part-file rotation at 512 MiB (`DEFAULT_TARGET_FILE_SIZE`)
    - On end-of-channel: tail flush + footer write
 
 4. **Finalization**
@@ -230,8 +236,25 @@ Main Thread
 
 ## Memory usage
 
-- **Bounded work queue** — prevents memory explosion on deep trees
 - **Bounded shard channels** — caps in-flight memory at roughly
-  `parquet_channel_depth × writer_shards × batch_size × ~200 B`
+  `channel_depth (64) × writer_shards × batch_size × ~200 B`
 - **Per-shard Arrow builder** — sized to the row-group threshold
 - Typical peak: ~2 GiB on default config (channel-depth 64, 32 shards)
+
+## Analytics server (`src/server/`, feature `server`)
+
+Thin DataFusion + axum layer over the Parquet output, embedded React
+dashboard served from the same binary via rust-embed:
+
+- `context.rs` — one `SessionContext` built at startup (4 GiB memory
+  pool, `NFS_WALKER_SERVE_MEM_GB` to override); every scan registered
+  as a table, newest scan aliased to `entries`
+- `catalog.rs` — declarative catalog of 36 canned queries; parameters
+  are typed, parsed, and clamped (no raw SQL endpoint by design)
+- `routes.rs` — `/api/scans`, `/api/queries/:id/execute`,
+  `/api/queries/batch` (bounded 4-way concurrency),
+  `POST /api/scans/reload`, embedded SPA with cache headers
+- `executor.rs` — per-query timeout (60 s default,
+  `NFS_WALKER_SERVE_TIMEOUT_SECS`)
+- Binds to `127.0.0.1` by default (no auth); pass `--bind 0.0.0.0`
+  to expose deliberately

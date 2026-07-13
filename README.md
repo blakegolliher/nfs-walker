@@ -11,7 +11,6 @@ production bench against a VAST cluster — see [Performance](#performance)).
 - **Work-stealing parallelism** — every worker pulls from a shared deque
 - **Sharded Parquet output** — N independent writer threads, ZSTD-compressed,
   layout matches what DuckDB / DataFusion / Polars expect out of the box
-- **Optional content analysis** — gxhash checksum and magic-bytes MIME detection
 - **Per-scan progress logfile** — sidecar `<output>.log` records throughput,
   worker activity, per-shard write latency every 5 s
 
@@ -104,44 +103,25 @@ nfs-walker nfs://server/export -o scan.parquet \
     --server-ips 172.200.202.1,172.200.202.2,172.200.202.3
 ```
 
-### Tuning the parquet writer
+### Tuning
 
 ```bash
 nfs-walker nfs://server/export -o scan.parquet \
     --writer-shards 32 \
-    --parquet-compression zstd3 \
-    --parquet-row-group-size 256000 \
-    --parquet-file-size-mb 512 \
-    --parquet-channel-depth 64
+    --parquet-compression zstd3
 ```
 
 | Flag                          | Default | What it controls |
 |-------------------------------|---------|------------------|
 | `--writer-shards`             | 32      | Parquet writer threads + path-keyspace shards |
 | `--parquet-compression`       | zstd3   | Compression algo (`zstd1/3/6`, `snappy`, `lz4-raw`, `none`) |
-| `--parquet-row-group-size`    | 256000  | Rows per Arrow row group |
-| `--parquet-file-size-mb`      | 512     | Rotate part file once it crosses this size |
-| `--parquet-channel-depth`     | 64      | Per-shard in-flight batches (caps writer-side memory) |
 | `-w, --workers`               | 2×CPU   | NFS worker threads |
 | `--pipeline-depth`            | 0       | READDIRPLUS RPCs in flight per worker (recommend 8–16) |
 | `--big-dir-split-after`       | 1000000 | Split a giant flat dir into continuations at this many entries |
 
-### Content analysis
-
-```bash
-# MIME type via magic bytes (reads first 8 KB)
-nfs-walker nfs://server/export -o scan.parquet -t
-
-# gxhash checksum per file (reads full content)
-nfs-walker nfs://server/export -o scan.parquet -c
-
-# Both, with checksum capped at 100 MB
-nfs-walker nfs://server/export -o scan.parquet -c -t --max-checksum-size 104857600
-```
-
-Two nullable columns are populated when these flags are set:
-- `checksum` — 128-bit gxhash hex string (32 chars)
-- `file_type_mime` — MIME type (`application/pdf`, `image/png`, …)
+Row-group size (256 K rows), part-file rotation (512 MiB), and writer
+channel depth (64 batches) are fixed at the values the 810 M-file
+production bench validated — they are internals, not tunables.
 
 ### Querying results
 
@@ -188,25 +168,54 @@ nfs-walker [OPTIONS]
 ### Analytics dashboard
 
 Visual web UI built on DataFusion, runs 36 pre-built queries against a
-Parquet scan directory.
+Parquet scan directory. It lives inside the same binary — no separate
+deployment, no external services.
+
+![Overview page](docs/images/overview.png)
+
+#### Walkthrough: scan → dashboard in three commands
 
 ```bash
-# 1. Build the dashboard (one-time)
-cd web && npm install && npm run build && cd ..
-cargo build --release --features server
+# 1. Build (the Makefile builds the React dashboard and embeds it)
+make build
 
-# 2. Start the server
-nfs-walker serve --data-dir scan.parquet
-# => Dashboard: http://localhost:8080
-# => API:       http://localhost:8080/api/health
+# 2. Scan an export — the dashboard needs a scan directory to serve.
+#    NFSv3 mountd wants a privileged source port, hence sudo.
+sudo ./build/nfs-walker nfs://server/export -o scan.parquet -w 32
+
+# 3. Serve it
+./build/nfs-walker serve --data-dir scan.parquet
+# Analytics server ready
+#   Dashboard: http://127.0.0.1:8080
+#   API:       http://127.0.0.1:8080/api/health
 ```
+
+Open http://localhost:8080 — the landing page (Overview) loads the most
+recent scan automatically: entry counts, size/age histograms, and top
+directories, all queried live from the Parquet files. The scan selector
+in the top bar switches between scans in the same `--data-dir`; the
+refresh button next to it picks up newly finished scans without a
+restart.
+
+Serving from a remote host? The server binds to loopback by default
+(there is no auth), so either tunnel:
+
+```bash
+ssh -L 8080:localhost:8080 user@scan-host
+```
+
+or expose it deliberately with `--bind 0.0.0.0`.
 
 Options:
 ```
 nfs-walker serve [OPTIONS] --data-dir <DIR>
   --data-dir <DIR>    Parquet scan directory
   --port <PORT>       Server port [default: 8080]
-  --bind <ADDR>       Bind address [default: 0.0.0.0]
+  --bind <ADDR>       Bind address [default: 127.0.0.1; use 0.0.0.0 to expose on the LAN]
+
+Environment:
+  NFS_WALKER_SERVE_MEM_GB        DataFusion memory pool cap [default: 4]
+  NFS_WALKER_SERVE_TIMEOUT_SECS  Per-query timeout [default: 60]
 ```
 
 Dashboard pages:
@@ -220,6 +229,15 @@ Dashboard pages:
 | Directories   | `/directories` | Depth/fanout distributions, widest/deepest/empty directories |
 | Query Explorer| `/queries`     | Browse and execute all 36 queries with custom parameters |
 
+<p align="center">
+  <img src="docs/images/files.png" width="49%" alt="Files page"/>
+  <img src="docs/images/capacity.png" width="49%" alt="Capacity page"/>
+</p>
+<p align="center">
+  <img src="docs/images/directories.png" width="49%" alt="Directories page"/>
+  <img src="docs/images/query-explorer.png" width="49%" alt="Query Explorer"/>
+</p>
+
 Development mode (hot-reload):
 
 ```bash
@@ -232,7 +250,7 @@ cd web && npm run dev    # http://localhost:5173, proxies /api/* to :8080
 ```
 nfs-walker [OPTIONS] <NFS_URL>
 nfs-walker stats <SCAN_DIR>
-nfs-walker serve --data-dir <DIR> [--port 8080] [--bind 0.0.0.0]
+nfs-walker serve --data-dir <DIR> [--port 8080] [--bind 127.0.0.1]
 
 Scan options:
   -o, --output <PATH>     Output parquet directory [default: walk.parquet]
@@ -241,20 +259,14 @@ Scan options:
   -q, --quiet             Suppress progress
   -v, --verbose           Show errors
   --dirs-only             Only record directories
-  --exclude <PATTERN>     Exclude paths (repeatable)
+  --exclude <PATTERN>     Exclude paths (repeatable, regex; skips emission and descent)
   --server-ips <IPS>      Comma-separated VIP list (bypasses DNS round-robin)
   --pipeline-depth <N>    READDIRPLUS RPCs in flight per worker
   --big-dir-split-after N Split giant flat dirs into continuations
-  -c, --checksum          Compute gxhash checksum per file
-  -t, --file-type         Detect MIME type via magic bytes
-  --max-checksum-size N   Skip checksum for files larger than N bytes [default: 1GB]
 
 Parquet writer:
   --writer-shards <N>          Writer threads [default: 32, cap 32]
   --parquet-compression <ALG>  zstd1/zstd3/zstd6/snappy/lz4-raw/none [default: zstd3]
-  --parquet-row-group-size N   Rows per row group [default: 256000]
-  --parquet-file-size-mb N     Part-file rotation threshold [default: 512]
-  --parquet-channel-depth N    Per-shard in-flight batches [default: 64]
 
 Progress logfile:
   --log <PATH>            Override sidecar log path
@@ -300,16 +312,6 @@ On a 16-core / 256 GiB dev host against a synthetic 50 M-entry tree:
 ZSTD-3 goes CPU-bound on small hosts; snappy wins there. On 128-core
 prod hosts, ZSTD-3 is no longer CPU-bound and the better compression
 ratio wins.
-
-### Content-analysis cost
-
-Reading file content costs (per-file I/O dominates):
-
-| Mode | Files/sec | Notes |
-|------|----------:|-------|
-| Metadata only          | 690K | Default; READDIRPLUS only |
-| File-type detection (`-t`) | ~4K | First 8 KB per file |
-| Checksum (`-c`)            | ~1K | Full file body (gxhash) |
 
 ### Why fast
 
