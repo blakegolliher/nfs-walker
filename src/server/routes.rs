@@ -37,7 +37,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/scans/:scan_id", get(get_scan))
         .route("/queries", get(list_queries))
         .route("/queries/:query_id/execute", post(execute_query))
-        .route("/queries/batch", post(batch_execute));
+        .route("/queries/batch", post(batch_execute))
+        .route("/scans/reload", post(reload_scans));
 
     Router::new()
         .nest("/api", api)
@@ -54,14 +55,35 @@ async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
     match Asset::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            (StatusCode::OK, [(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+            // Vite content-hashes everything under assets/, so those are safe
+            // to cache forever; index.html must always be revalidated.
+            let cache_control = if path.starts_with("assets/") {
+                "public, max-age=31536000, immutable"
+            } else {
+                "no-cache"
+            };
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, mime.as_ref()),
+                    (header::CACHE_CONTROL, cache_control),
+                ],
+                content.data,
+            )
+                .into_response()
         }
         None => {
             // SPA fallback: serve index.html for any unmatched route
             match Asset::get("index.html") {
-                Some(content) => {
-                    (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], content.data).into_response()
-                }
+                Some(content) => (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/html"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                    ],
+                    content.data,
+                )
+                    .into_response(),
                 None => (StatusCode::NOT_FOUND, "dashboard not found").into_response(),
             }
         }
@@ -78,16 +100,45 @@ async fn health() -> impl IntoResponse {
     }))
 }
 
+/// JSON payload shared by `GET /api/scans` and `POST /api/scans/reload`
+fn scans_json(ctx: &AnalyticsContext) -> serde_json::Value {
+    let mut scans: Vec<_> = ctx.scans.values().collect();
+    // Newest first, so the dashboard dropdown has a stable, sensible order
+    scans.sort_by(|a, b| {
+        b.scan_timestamp_us
+            .cmp(&a.scan_timestamp_us)
+            .then_with(|| b.scan_id.cmp(&a.scan_id))
+    });
+    serde_json::json!({
+        "scans": scans,
+        "count": scans.len(),
+        "default_scan": ctx.latest_scan_id,
+        "data_dir": ctx.data_dir,
+    })
+}
+
 async fn list_scans(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ServerError> {
     let ctx = state.context.read().await;
-    let scans: Vec<_> = ctx.scans.values().collect();
-    Ok(Json(serde_json::json!({
-        "scans": scans,
-        "count": scans.len(),
-        "default_scan": ctx.latest_scan_id,
-    })))
+    Ok(Json(scans_json(&ctx)))
+}
+
+/// Rescan the data directory and swap in a fresh DataFusion context
+async fn reload_scans(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ServerError> {
+    let data_dir = state.context.read().await.data_dir.clone();
+    // Build outside the write lock so in-flight queries keep working
+    let new_ctx = AnalyticsContext::build(&data_dir).await?;
+    let mut ctx = state.context.write().await;
+    *ctx = new_ctx;
+    eprintln!(
+        "Reloaded {} scan(s) from {}",
+        ctx.scans.len(),
+        ctx.data_dir.display()
+    );
+    Ok(Json(scans_json(&ctx)))
 }
 
 async fn get_scan(
@@ -158,38 +209,60 @@ struct BatchQueryItem {
     params: HashMap<String, String>,
 }
 
+/// How many batch queries run concurrently against DataFusion
+const BATCH_CONCURRENCY: usize = 4;
+
 async fn batch_execute(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BatchRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
-    let ctx = state.context.read().await;
-    let mut results = Vec::new();
+    // Run queries with bounded concurrency; results keep their request order.
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(BATCH_CONCURRENCY));
+    let scan_id = Arc::new(body.scan_id);
+    let count = body.queries.len();
+    let mut join_set = tokio::task::JoinSet::new();
 
-    for item in &body.queries {
-        let result = executor::execute_query(
-            &ctx,
-            &item.query_id,
-            &item.params,
-            body.scan_id.as_deref(),
-        )
-        .await;
+    for (idx, item) in body.queries.into_iter().enumerate() {
+        let context = state.context.clone();
+        let scan_id = scan_id.clone();
+        let semaphore = semaphore.clone();
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("batch semaphore closed");
+            let ctx = context.read().await;
+            let result = executor::execute_query(
+                &ctx,
+                &item.query_id,
+                &item.params,
+                scan_id.as_deref(),
+            )
+            .await;
+            (idx, item.query_id, result)
+        });
+    }
 
-        match result {
-            Ok(r) => results.push(serde_json::json!({
+    let mut results = vec![serde_json::Value::Null; count];
+    while let Some(joined) = join_set.join_next().await {
+        let (idx, query_id, result) = joined
+            .map_err(|e| ServerError::Other(format!("Batch query task failed: {}", e)))?;
+        results[idx] = match result {
+            Ok(r) => serde_json::json!({
                 "status": "ok",
                 "result": r,
-            })),
-            Err(e) => results.push(serde_json::json!({
+            }),
+            Err(e) => serde_json::json!({
                 "status": "error",
-                "query_id": item.query_id,
+                "query_id": query_id,
                 "error": e.to_string(),
-            })),
-        }
+            }),
+        };
     }
 
     Ok(Json(serde_json::json!({
         "results": results,
-        "count": results.len(),
+        "count": count,
     })))
 }
 
@@ -239,6 +312,7 @@ pub async fn serve(
     eprintln!("  GET  /api/health");
     eprintln!("  GET  /api/scans");
     eprintln!("  GET  /api/scans/:scan_id");
+    eprintln!("  POST /api/scans/reload");
     eprintln!("  GET  /api/queries");
     eprintln!("  POST /api/queries/:query_id/execute");
     eprintln!("  POST /api/queries/batch");

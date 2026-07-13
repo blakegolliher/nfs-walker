@@ -4,6 +4,18 @@
 //! The FFI bindings are pre-generated in src/nfs/bindings.rs.
 
 fn main() {
+    // The server feature embeds web/dist via rust-embed at compile time.
+    // Fail early with an actionable message instead of rust-embed's
+    // confusing "folder does not exist" error on a fresh clone.
+    if std::env::var_os("CARGO_FEATURE_SERVER").is_some()
+        && !std::path::Path::new("web/dist/index.html").exists()
+    {
+        panic!(
+            "web/dist missing — run `make web` or `cd web && npm install && npm run build`, \
+             or build with --no-default-features to skip the dashboard"
+        );
+    }
+
     let target = std::env::var("TARGET").unwrap_or_default();
 
     // For musl targets, use the musl-specific libnfs installation

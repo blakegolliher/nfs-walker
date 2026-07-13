@@ -1,5 +1,6 @@
 import { useBatchQueries, getFirstRow, getRows } from '../hooks/useBatchQueries';
 import { Q } from '../api/queries';
+import type { BatchQueryItem } from '../api/types';
 import { formatBytes, formatNumber } from '../lib/format';
 import { MetricCard } from '../components/data/MetricCard';
 import { MetricCardGrid } from '../components/data/MetricCardGrid';
@@ -10,7 +11,7 @@ import { DataTable } from '../components/data/DataTable';
 import { LoadingSpinner } from '../components/shared/LoadingSpinner';
 import { ErrorBanner } from '../components/shared/ErrorBanner';
 
-const QUERIES = [
+const QUERIES: BatchQueryItem[] = [
   { query_id: Q.SIZE_HISTOGRAM },
   { query_id: Q.LARGEST_FILES, params: { limit: '20' } },
   { query_id: Q.ZERO_BYTE, params: { limit: '20' } },
@@ -20,7 +21,7 @@ const QUERIES = [
   { query_id: Q.COUNT_BY_EXT, params: { limit: '15' } },
   { query_id: Q.TEMP_JUNK },
   { query_id: Q.COLD_DATA, params: { limit: '15' } },
-  { query_id: Q.HOT_DATA, params: { limit: '15' } },
+  { query_id: Q.HOT_DATA, params: { limit: '15', days: '30' } },
   { query_id: Q.GROWTH_BY_MONTH, params: { limit: '24' } },
 ];
 

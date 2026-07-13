@@ -15,7 +15,7 @@
 #   make help          - Show this help
 
 SHELL := /bin/bash
-.PHONY: all build release debug test clean clean-cache install-deps install-musl check fmt help docker-rocky docker-musl info list
+.PHONY: all build release debug web test clean clean-cache install-deps install-musl check fmt help docker-rocky docker-musl info list
 
 # Project info
 PROJECT_NAME := nfs-walker
@@ -48,9 +48,31 @@ NC := \033[0m
 all: build
 
 #------------------------------------------------------------------------------
+# Web dashboard (React) — rust-embed bakes web/dist into the server binary,
+# so cargo builds with the default `server` feature need it first.
+#------------------------------------------------------------------------------
+web:
+	@if ! command -v npm &> /dev/null; then \
+		if [ -f web/dist/index.html ]; then \
+			echo -e "$(YELLOW)⚠ npm not found; reusing existing web/dist$(NC)"; \
+		else \
+			echo -e "$(RED)✗ npm not found and web/dist missing. Install Node.js, or build with --no-default-features$(NC)"; \
+			exit 1; \
+		fi; \
+	else \
+		echo -e "$(BLUE)Building web dashboard...$(NC)"; \
+		if [ ! -d web/node_modules ]; then \
+			echo "  Installing npm dependencies..."; \
+			(cd web && (npm ci --silent 2>/dev/null || npm install --silent)); \
+		fi; \
+		(cd web && npm run build) || exit 1; \
+		echo -e "$(GREEN)✓ Dashboard built (web/dist)$(NC)"; \
+	fi
+
+#------------------------------------------------------------------------------
 # Native release build (links against system glibc + libnfs)
 #------------------------------------------------------------------------------
-build:
+build: web
 	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION)...$(NC)"
 	@mkdir -p $(BUILD_DIR)
 	@cargo build --release 2>&1 | tee $(BUILD_DIR)/build.log; \
@@ -73,7 +95,7 @@ build:
 #------------------------------------------------------------------------------
 # Static musl binary — works on any Linux
 #------------------------------------------------------------------------------
-release:
+release: web
 	@echo -e "$(BLUE)Building $(PROJECT_NAME) v$(VERSION) (static musl)...$(NC)"
 	@if ! rustup target list --installed | grep -q $(MUSL_TARGET); then \
 		echo -e "$(YELLOW)Installing musl target...$(NC)"; \
@@ -107,7 +129,7 @@ release:
 #------------------------------------------------------------------------------
 # Debug build
 #------------------------------------------------------------------------------
-debug:
+debug: web
 	@echo -e "$(BLUE)Building $(PROJECT_NAME) (debug)...$(NC)"
 	@mkdir -p $(BUILD_DIR)
 	@cargo build 2>&1 | tee $(BUILD_DIR)/build-debug.log; \
@@ -364,6 +386,7 @@ help:
 	@echo ""
 	@echo "Build targets:"
 	@echo "  build           Native release build (links system libnfs/glibc)"
+	@echo "  web             Build the React dashboard (web/dist, embedded by cargo)"
 	@echo "  release         Static musl binary (any Linux)"
 	@echo "  debug           Debug build"
 	@echo "  docker-rocky    Rocky-9 build via Docker (server + dashboard, glibc 2.34+)"

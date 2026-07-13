@@ -60,6 +60,7 @@ vendor/libnfs
 # Web dashboard
 web/node_modules/
 web/dist/
+web/tsconfig.tsbuildinfo
 
 # Data files (scans, rocks dbs, parquet outputs)
 # These match scan output directories and stray data files. The
