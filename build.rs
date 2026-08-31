@@ -6,6 +6,31 @@
 fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
 
+    // Explicit override for embedding consumers (e.g. mongoose, which
+    // compiles this crate in as a library and cross-links for an older
+    // glibc): a directory holding the libnfs to link. `libnfs.a` is
+    // preferred (fully static); `libnfs.so` is accepted. Checked before
+    // every auto-detection path — the /usr/local probe below would
+    // otherwise pick up a host-glibc build that poisons cross links.
+    println!("cargo:rerun-if-env-changed=NFS_WALKER_LIBNFS_DIR");
+    if let Some(dir) = std::env::var_os("NFS_WALKER_LIBNFS_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        println!("cargo:rustc-link-search=native={}", dir.display());
+        if dir.join("libnfs.a").exists() {
+            println!("cargo:rustc-link-lib=static=nfs");
+            eprintln!("Using static libnfs from NFS_WALKER_LIBNFS_DIR={}", dir.display());
+        } else if dir.join("libnfs.so").exists() {
+            println!("cargo:rustc-link-lib=dylib=nfs");
+            eprintln!("Using dynamic libnfs from NFS_WALKER_LIBNFS_DIR={}", dir.display());
+        } else {
+            panic!(
+                "NFS_WALKER_LIBNFS_DIR={} contains neither libnfs.a nor libnfs.so",
+                dir.display()
+            );
+        }
+        return;
+    }
+
     // For musl targets, use the musl-specific libnfs installation
     if target.contains("musl") {
         // Check for musl-specific libnfs installation
