@@ -71,7 +71,16 @@ fn main() -> ExitCode {
         Err(e) => {
             error!("{:#}", e);
             eprintln!("Error: {:#}", e);
-            ExitCode::FAILURE
+            // An incomplete scan is its own condition: the output is
+            // on disk but must not be consumed as a complete index.
+            if matches!(
+                e.downcast_ref::<nfs_walker::WalkerError>(),
+                Some(nfs_walker::WalkerError::ScanIncomplete { .. })
+            ) {
+                ExitCode::from(3)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -110,7 +119,42 @@ fn run() -> Result<()> {
     let output_path = config.output_path.clone();
 
     // Run the walker
-    let result = run_simple_walker(config)?;
+    let result = match run_simple_walker(config) {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(nfs_walker::WalkerError::ScanIncomplete {
+                stats,
+                failures,
+                failure_log,
+            }) = e.downcast_ref::<nfs_walker::WalkerError>()
+            {
+                let db_size = get_scan_size(&output_path);
+                print_summary(
+                    stats.dirs,
+                    stats.files,
+                    stats.bytes,
+                    stats.errors,
+                    stats.duration,
+                    &output_path.display().to_string(),
+                    db_size,
+                );
+                eprintln!(
+                    "\nScan INCOMPLETE: {} directories could not be read ({} vanished during the scan).",
+                    stats.errors, stats.vanished
+                );
+                for f in failures.iter().take(20) {
+                    eprintln!("  {:<18} {}  ({}; {} attempts)", f.kind, f.path, f.error, f.attempts);
+                }
+                if failures.len() > 20 {
+                    eprintln!("  ... {} more", failures.len() - 20);
+                }
+                if let Some(p) = failure_log {
+                    eprintln!("  full list: {}", p.display());
+                }
+            }
+            return Err(e);
+        }
+    };
 
     // Get on-disk scan output size (recursive — handles scans/<id>/*.parquet)
     let db_size = get_scan_size(&output_path);

@@ -122,7 +122,7 @@ fn nfs3_status_to_string(status: i32) -> String {
 }
 
 /// Convert a negated NFS3 status code to a typed NfsError with a path context.
-fn nfs3_status_to_nfs_error(status: i32, path: &str) -> NfsError {
+pub(crate) fn nfs3_status_to_nfs_error(status: i32, path: &str) -> NfsError {
     match status {
         s if s == -(ffi::nfsstat3_NFS3ERR_PERM as i32) || s == -(ffi::nfsstat3_NFS3ERR_ACCES as i32) => {
             NfsError::PermissionDenied { path: path.into() }

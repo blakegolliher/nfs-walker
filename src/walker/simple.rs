@@ -18,7 +18,8 @@
 
 use crate::config::WalkConfig;
 use crate::content::{checksum::compute_gxhash, filetype::detect_file_type as detect_mime_type};
-use crate::error::{Result, WalkerError};
+use crate::error::{DirFailure, FailureKind, Result, WalkerError};
+use crate::walker::retry::{self, DirError, FailureLog, RetryPolicy};
 use crate::nfs::types::{DbEntry, EntryType};
 use crate::nfs::{resolve_dns, NfsConnection, NfsConnectionBuilder};
 use crate::parquet::direct_writer::{
@@ -28,6 +29,7 @@ use crate::parquet::direct_writer::{
 use crate::walker::sharding::path_to_shard;
 use crossbeam_channel::Sender;
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -142,7 +144,15 @@ pub struct WalkStats {
     pub dirs: u64,
     pub files: u64,
     pub bytes: u64,
+    /// Directories that could not be read after the retry policy was
+    /// exhausted. Any nonzero value makes the scan
+    /// [`WalkerError::ScanIncomplete`]; a caller never sees a
+    /// successful `WalkStats` with `errors > 0`.
     pub errors: u64,
+    /// Directories that disappeared between their parent's listing and
+    /// their own read (confirmed by LOOKUP). A race on a live tree, not
+    /// a hole: their own entry rows were already emitted.
+    pub vanished: u64,
     pub duration: Duration,
     pub completed: bool,
 }
@@ -179,6 +189,7 @@ pub struct SimpleWalker {
     files_count: Arc<AtomicU64>,
     bytes_count: Arc<AtomicU64>,
     errors_count: Arc<AtomicU64>,
+    vanished_count: Arc<AtomicU64>,
 }
 
 impl SimpleWalker {
@@ -190,6 +201,7 @@ impl SimpleWalker {
             files_count: Arc::new(AtomicU64::new(0)),
             bytes_count: Arc::new(AtomicU64::new(0)),
             errors_count: Arc::new(AtomicU64::new(0)),
+            vanished_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -261,7 +273,14 @@ impl SimpleWalker {
             }
 
             let scan_dir = pool.scan_dir.clone();
-            let workers_result = self.run_workers(pool.senders, metrics.clone());
+            // Every directory failure and vanished directory of this
+            // scan, beside the part files it belongs with.
+            let failures = Arc::new(
+                FailureLog::open(&scan_dir.join(retry::FAILURE_LOG_NAME))
+                    .map_err(WalkerError::Io)?,
+            );
+            let workers_result =
+                self.run_workers(pool.senders, metrics.clone(), Arc::clone(&failures));
 
             // ALWAYS release the observability clones and join the
             // writer threads, regardless of whether the workers
@@ -316,6 +335,8 @@ impl SimpleWalker {
             let files = self.files_count.load(Ordering::Relaxed);
             let bytes = self.bytes_count.load(Ordering::Relaxed);
             let errors = self.errors_count.load(Ordering::Relaxed);
+            let vanished = self.vanished_count.load(Ordering::Relaxed);
+            failures.flush();
 
             // Walker counters and parquet row count measure different
             // things and can't be compared directly:
@@ -352,14 +373,25 @@ impl SimpleWalker {
                 summaries.iter().map(|s| s.part_files.len()).sum::<usize>()
             );
 
-            Ok(WalkStats {
+            let stats = WalkStats {
                 dirs,
                 files,
                 bytes,
                 errors,
+                vanished,
                 duration: start.elapsed(),
                 completed: !self.shutdown.load(Ordering::Relaxed),
-            })
+            };
+            if errors > 0 {
+                // The part files are intact for diagnosis, but a tree
+                // with unread directories is not an index of the tree.
+                return Err(WalkerError::ScanIncomplete {
+                    stats,
+                    failures: failures.samples(),
+                    failure_log: failures.path().map(Path::to_path_buf),
+                });
+            }
+            Ok(stats)
         })();
 
         // ALWAYS stop the logger and join its thread — must run on both
@@ -419,6 +451,7 @@ impl SimpleWalker {
         &self,
         entry_txs: Vec<Sender<Vec<DbEntry>>>,
         metrics: Arc<crate::scanlog::ScanMetrics>,
+        failures: Arc<FailureLog>,
     ) -> Result<()> {
         // Pipelined mode currently does not support per-file content
         // analysis (checksum / file-type detection). Warn loudly if the
@@ -599,6 +632,9 @@ impl SimpleWalker {
             let files_count = Arc::clone(&self.files_count);
             let bytes_count = Arc::clone(&self.bytes_count);
             let errors_count = Arc::clone(&self.errors_count);
+            let failures = Arc::clone(&failures);
+            let vanished_count = Arc::clone(&self.vanished_count);
+            let retry_policy = RetryPolicy::from_retries(self.config.retry_count);
             let active_workers = Arc::clone(&active_workers);
             let pending_work = Arc::clone(&pending_work);
             let metrics = Arc::clone(&metrics);
@@ -628,6 +664,9 @@ impl SimpleWalker {
                             files_count,
                             bytes_count,
                             errors_count,
+                            failures,
+                            vanished_count,
+                            retry_policy,
                             active_workers,
                             pending_work,
                             max_depth,
@@ -650,6 +689,9 @@ impl SimpleWalker {
                             files_count,
                             bytes_count,
                             errors_count,
+                            failures,
+                            vanished_count,
+                            retry_policy,
                             active_workers,
                             pending_work,
                             max_depth,
@@ -758,6 +800,9 @@ fn worker_loop(
     files_count: Arc<AtomicU64>,
     bytes_count: Arc<AtomicU64>,
     errors_count: Arc<AtomicU64>,
+    failures: Arc<FailureLog>,
+    vanished_count: Arc<AtomicU64>,
+    retry_policy: RetryPolicy,
     active_workers: Arc<AtomicUsize>,
     pending_work: Arc<AtomicU64>,
     max_depth: Option<usize>,
@@ -895,7 +940,13 @@ fn worker_loop(
         // Define the callback that processes directory entries
         // This is used by both readdir_plus_by_fh and readdir_plus_with_fh
         let metrics_for_chunks = Arc::clone(&metrics);
+        // Once any page of this directory has reached the writers a
+        // retry would duplicate rows; the retry loop checks this.
+        let emitted = std::cell::Cell::new(false);
         let mut process_entries = |chunk: Vec<crate::nfs::types::NfsDirEntry>| -> bool {
+            if !chunk.is_empty() {
+                emitted.set(true);
+            }
             metrics_for_chunks.record_entries(id, 0, chunk.len() as u64);
             for nfs_entry in chunk {
                 // Skip . and ..
@@ -998,11 +1049,18 @@ fn worker_loop(
         // Use cached file handle if available, otherwise resolve path.
         // Time the RPC for the per-scan progress logfile.
         let rpc_start = Instant::now();
-        let result = if let Some(ref fh) = work.file_handle {
-            nfs.readdir_plus_by_fh(fh, batch_size, &mut process_entries)
-        } else {
-            nfs.readdir_plus_with_fh(&work.path, batch_size, &mut process_entries)
-        };
+        let result = retry::read_dir_with_retry(
+            &work.path,
+            work.file_handle.clone(),
+            &retry_policy,
+            |fh| match fh {
+                Some(fh) => nfs.readdir_plus_by_fh(fh, batch_size, &mut process_entries),
+                None => nfs.readdir_plus_with_fh(&work.path, batch_size, &mut process_entries),
+            },
+            || nfs.resolve_path_to_fh(&work.path),
+            || emitted.get(),
+            thread::sleep,
+        );
         metrics.record_nfs_latency(id, rpc_start.elapsed());
 
         match result {
@@ -1079,16 +1137,23 @@ fn worker_loop(
                     }
                 }
             }
-            Err(e) => {
+            Err(DirError::Vanished { attempts }) => {
+                // Deleted or renamed between its parent's listing and
+                // now: a race on a live tree, recorded, not an error.
+                vanished_count.fetch_add(1, Ordering::Relaxed);
+                failures.record_vanished(&work.path, attempts);
+                debug!(
+                    "Worker {} directory vanished during the scan: {} (after {} attempts)",
+                    id, work.path, attempts
+                );
+            }
+            Err(DirError::Failed(f)) => {
                 errors_count.fetch_add(1, Ordering::Relaxed);
-                // Not found errors are common on active filesystems (race condition)
-                // Log them at debug level to reduce noise
-                if e.to_string().contains("not found") || e.to_string().contains("No such file")
-                    || e.to_string().contains("Permission denied") {
-                    debug!("Worker {} READDIRPLUS error: {} -> {}", id, work.path, e);
-                } else {
-                    warn!("Worker {} READDIRPLUS failed: {} -> {}", id, work.path, e);
-                }
+                warn!(
+                    "Worker {} could not read {}: {} ({}, {} attempts) — the scan will be reported incomplete",
+                    id, f.path, f.error, f.kind, f.attempts
+                );
+                failures.record(&f);
             }
         }
 
@@ -1149,6 +1214,15 @@ struct DirState {
     /// (across cookie-chain re-submits). Compared against
     /// `--big-dir-split-after` to decide when to push a continuation.
     entries_seen: u64,
+    /// Attempts made on this directory so far (first-page retries).
+    attempts: u32,
+}
+
+/// What to do with a pipelined directory whose page errored.
+enum Redo {
+    Resubmit(Vec<u8>),
+    Vanished,
+    Fail,
 }
 
 /// Should the current dir bail at the next page boundary and push a
@@ -1207,6 +1281,9 @@ fn worker_loop_pipelined(
     files_count: Arc<AtomicU64>,
     bytes_count: Arc<AtomicU64>,
     errors_count: Arc<AtomicU64>,
+    failures: Arc<FailureLog>,
+    vanished_count: Arc<AtomicU64>,
+    retry_policy: RetryPolicy,
     active_workers: Arc<AtomicUsize>,
     pending_work: Arc<AtomicU64>,
     max_depth: Option<usize>,
@@ -1258,18 +1335,40 @@ fn worker_loop_pipelined(
             // injected dirs without a cached fh).
             let fh = match work.file_handle.clone() {
                 Some(fh) => fh,
-                None => match nfs.resolve_path_to_fh(&work.path) {
-                    Ok(fh) => fh,
-                    Err(e) => {
-                        errors_count.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            "Worker {} pipelined LOOKUP failed: {} -> {}",
-                            id, work.path, e
-                        );
-                        pending_work.fetch_sub(1, Ordering::SeqCst);
-                        continue;
+                None => {
+                    // Bounded retry on the LOOKUP; a short cap on the
+                    // backoff keeps in-flight slots serviced.
+                    let path = work.path.clone();
+                    let resolved = retry::read_dir_with_retry(
+                        &path,
+                        None,
+                        &retry_policy,
+                        |_| nfs.resolve_path_to_fh(&path),
+                        || nfs.resolve_path_to_fh(&path),
+                        || false,
+                        |d| thread::sleep(d.min(Duration::from_millis(250))),
+                    );
+                    match resolved {
+                        Ok(fh) => fh,
+                        Err(DirError::Vanished { attempts }) => {
+                            vanished_count.fetch_add(1, Ordering::Relaxed);
+                            failures.record_vanished(&path, attempts);
+                            debug!("Worker {} directory vanished before LOOKUP: {}", id, path);
+                            pending_work.fetch_sub(1, Ordering::SeqCst);
+                            continue;
+                        }
+                        Err(DirError::Failed(f)) => {
+                            errors_count.fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                "Worker {} pipelined LOOKUP failed: {} -> {} ({}, {} attempts)",
+                                id, f.path, f.error, f.kind, f.attempts
+                            );
+                            failures.record(&f);
+                            pending_work.fetch_sub(1, Ordering::SeqCst);
+                            continue;
+                        }
                     }
-                },
+                }
             };
 
             let tag = next_tag;
@@ -1312,6 +1411,7 @@ fn worker_loop_pipelined(
                         submitted_at: Instant::now(),
                         tag,
                         entries_seen: 0,
+                        attempts: 1,
                     });
                 }
                 Err(e) => {
@@ -1320,6 +1420,12 @@ fn worker_loop_pipelined(
                         "Worker {} pipelined submit failed: {} -> {}",
                         id, work.path, e
                     );
+                    failures.record(&DirFailure {
+                        path: work.path.clone(),
+                        kind: e.failure_kind(),
+                        error: e.to_string(),
+                        attempts: 1,
+                    });
                     pending_work.fetch_sub(1, Ordering::SeqCst);
                 }
             }
@@ -1370,6 +1476,12 @@ fn worker_loop_pipelined(
                 pending_work.fetch_sub(n, Ordering::SeqCst);
                 for s in &states {
                     metrics.exit_dir(id, s.tag);
+                    failures.record(&DirFailure {
+                        path: s.work.path.clone(),
+                        kind: FailureKind::Connection,
+                        error: format!("pipelined pump failed: {}", e),
+                        attempts: s.attempts.max(1),
+                    });
                 }
                 slots.clear();
                 states.clear();
@@ -1599,32 +1711,113 @@ fn worker_loop_pipelined(
                                 "Worker {} pipelined re-submit failed: {} -> {}",
                                 id, state.work.path, e
                             );
+                            failures.record(&DirFailure {
+                                path: state.work.path.clone(),
+                                kind: e.failure_kind(),
+                                error: e.to_string(),
+                                attempts: state.attempts.max(1),
+                            });
                             pending_work.fetch_sub(1, Ordering::SeqCst);
                             metrics.exit_dir(id, state.tag);
                         }
                     }
                 }
             } else {
-                // RPC- or NFS3-level error. Drop the slot, count it,
-                // resolve the work item. (No retry — matches the
-                // legacy worker.)
-                errors_count.fetch_add(1, Ordering::Relaxed);
+                // RPC- or NFS3-level error on this page. Same policy
+                // as the legacy worker, re-submitted immediately (the
+                // round trip is the spacing): retry only while no page
+                // of this directory has been emitted.
                 let s = result.status;
-                if s == 0 {
-                    // Should not happen — completed slot with status 0
-                    // and not SUCCESS — but guard anyway.
-                    debug!(
-                        "Worker {} pipelined unexpected zero status: {}",
-                        id, state.work.path
-                    );
-                } else {
-                    debug!(
-                        "Worker {} pipelined READDIRPLUS error status={} path={}",
-                        id, s, state.work.path
-                    );
+                let err = crate::nfs::connection::nfs3_status_to_nfs_error(s, &state.work.path);
+                let first_page = state.cookie == 0 && state.entries_seen == 0;
+                state.attempts = state.attempts.saturating_add(1);
+                let mut redo = Redo::Fail;
+                if first_page {
+                    match retry::plan(&err, state.attempts, &retry_policy) {
+                        retry::Action::Fail(_) => {}
+                        retry::Action::Retry { refresh_fh: false, .. } => {
+                            redo = Redo::Resubmit(state.file_handle.clone());
+                        }
+                        retry::Action::Retry { refresh_fh: true, .. } | retry::Action::CheckGone => {
+                            match nfs.resolve_path_to_fh(&state.work.path) {
+                                Ok(fh) => {
+                                    if state.attempts < retry_policy.max_attempts {
+                                        redo = Redo::Resubmit(fh);
+                                    }
+                                }
+                                Err(e) if e.failure_kind() == FailureKind::NotFound => {
+                                    redo = Redo::Vanished;
+                                }
+                                Err(_) => {
+                                    if state.attempts < retry_policy.max_attempts {
+                                        redo = Redo::Resubmit(state.file_handle.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                pending_work.fetch_sub(1, Ordering::SeqCst);
-                metrics.exit_dir(id, state.tag);
+                match redo {
+                    Redo::Resubmit(fh) => {
+                        let rpc_tag = next_tag;
+                        next_tag = next_tag.wrapping_add(1);
+                        match nfs.submit_readdirplus_by_fh(&fh, 0, [0i8; 8], rpc_tag) {
+                            Ok(new_slot) => {
+                                debug!(
+                                    "Worker {} pipelined retry {} of {}: {} ({})",
+                                    id, state.attempts + 1, retry_policy.max_attempts, state.work.path, err
+                                );
+                                state.file_handle = fh;
+                                state.cookie = 0;
+                                state.cookieverf = [0i8; 8];
+                                state.submitted_at = Instant::now();
+                                slots.push(new_slot);
+                                states.push(state);
+                            }
+                            Err(e) => {
+                                errors_count.fetch_add(1, Ordering::Relaxed);
+                                warn!(
+                                    "Worker {} pipelined retry submit failed: {} -> {}",
+                                    id, state.work.path, e
+                                );
+                                failures.record(&DirFailure {
+                                    path: state.work.path.clone(),
+                                    kind: e.failure_kind(),
+                                    error: e.to_string(),
+                                    attempts: state.attempts,
+                                });
+                                pending_work.fetch_sub(1, Ordering::SeqCst);
+                                metrics.exit_dir(id, state.tag);
+                            }
+                        }
+                    }
+                    Redo::Vanished => {
+                        vanished_count.fetch_add(1, Ordering::Relaxed);
+                        failures.record_vanished(&state.work.path, state.attempts);
+                        debug!(
+                            "Worker {} directory vanished during the scan: {}",
+                            id, state.work.path
+                        );
+                        pending_work.fetch_sub(1, Ordering::SeqCst);
+                        metrics.exit_dir(id, state.tag);
+                    }
+                    Redo::Fail => {
+                        errors_count.fetch_add(1, Ordering::Relaxed);
+                        let f = DirFailure {
+                            path: state.work.path.clone(),
+                            kind: err.failure_kind(),
+                            error: err.to_string(),
+                            attempts: state.attempts,
+                        };
+                        warn!(
+                            "Worker {} could not read {}: {} ({}, {} attempts, status={}) — the scan will be reported incomplete",
+                            id, f.path, f.error, f.kind, f.attempts, s
+                        );
+                        failures.record(&f);
+                        pending_work.fetch_sub(1, Ordering::SeqCst);
+                        metrics.exit_dir(id, state.tag);
+                    }
+                }
             }
         }
     }
