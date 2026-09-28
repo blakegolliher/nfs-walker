@@ -48,8 +48,11 @@ EXAMPLES:
   Scan an NFS export:
     nfs-walker nfs://server/export -o scan.parquet -w 32
 
-  Scan with exclusions and depth limit:
-    nfs-walker nfs://server/data --exclude '.snapshot' --exclude '\\.Trash' -d 10 -o scan.parquet
+  Skip snapshot directories by name (glob), with a depth limit:
+    nfs-walker nfs://server/data --exclude-dir .snapshot --exclude-dir .zfs -d 10 -o scan.parquet
+
+  Exclude by path regex:
+    nfs-walker nfs://server/data --exclude '/\\.Trash(/|$)' -o scan.parquet
 
   Show scan overview (counts, total size, max depth):
     nfs-walker stats scan.parquet
@@ -118,9 +121,20 @@ pub struct CliArgs {
     #[arg(long)]
     pub dirs_only: bool,
 
-    /// Exclude paths matching pattern (can be repeated)
-    #[arg(long = "exclude", value_name = "PATTERN", action = clap::ArgAction::Append)]
+    /// Exclude paths matching a regular expression (can be repeated).
+    /// Matched against the full path; a match is neither emitted nor
+    /// descended into.
+    #[arg(long = "exclude", value_name = "REGEX", action = clap::ArgAction::Append)]
     pub exclude_patterns: Vec<String>,
+
+    /// Skip directories whose NAME matches a glob, and everything under
+    /// them (can be repeated). A glob, not a regex: `*`, `?`, `[...]`,
+    /// matched against the directory's own name only, never its path
+    /// (a pattern containing `/` is rejected). `--exclude-dir .snapshot`
+    /// skips every directory named exactly `.snapshot` and nothing
+    /// else; `--exclude-dir '.*'` skips every dot directory.
+    #[arg(long = "exclude-dir", value_name = "GLOB", action = clap::ArgAction::Append)]
+    pub exclude_dirs: Vec<String>,
 
     /// NFS connection timeout in seconds
     #[arg(long, default_value = "30", value_name = "SECS")]
@@ -451,8 +465,12 @@ pub struct WalkConfig {
     /// Only record directories
     pub dirs_only: bool,
 
-    /// Compiled exclude patterns
+    /// Compiled `--exclude` patterns (regex over the full path).
     pub exclude_patterns: Vec<Regex>,
+
+    /// Compiled `--exclude-dir` globs (anchored regex over a directory
+    /// name; see [`compile_dir_glob`]).
+    pub exclude_dirs: Vec<Regex>,
 
     /// Connection timeout (seconds)
     pub timeout_secs: u32,
@@ -578,6 +596,14 @@ impl WalkConfig {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Compile directory-name globs. Rejected here, before anything
+        // is mounted or written.
+        let exclude_dirs = args
+            .exclude_dirs
+            .iter()
+            .map(|g| compile_dir_glob(g))
+            .collect::<Result<Vec<_>, _>>()?;
+
         // Validate output path
         if let Some(parent) = args.output.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -614,6 +640,7 @@ impl WalkConfig {
             show_progress: !args.quiet,
             dirs_only: args.dirs_only,
             exclude_patterns,
+            exclude_dirs,
             timeout_secs: args.timeout,
             retry_count: args.retries,
             pipeline_depth: args.pipeline_depth,
@@ -629,6 +656,87 @@ impl WalkConfig {
     pub fn is_excluded(&self, path: &str) -> bool {
         self.exclude_patterns.iter().any(|re| re.is_match(path))
     }
+}
+
+/// Compile one `--exclude-dir` glob into an anchored regex over a
+/// directory name.
+///
+/// Glob syntax: `*` matches any run of characters, `?` exactly one,
+/// `[...]` a character class (`[!...]` negated), and `\x` the literal
+/// `x`. Everything else is literal. The pattern is matched against a
+/// directory's name only, so it must not contain `/`; an empty pattern
+/// and an unterminated class are rejected. The contract mongoose
+/// documents as `--exclude GLOB`.
+pub fn compile_dir_glob(glob: &str) -> Result<Regex, ConfigError> {
+    let invalid = |reason: &str| ConfigError::InvalidExcludePattern {
+        pattern: glob.to_string(),
+        reason: reason.to_string(),
+    };
+    if glob.is_empty() {
+        return Err(invalid("empty pattern"));
+    }
+    if glob.contains('/') {
+        return Err(invalid(
+            "a directory-name glob cannot contain '/': it matches one name, not a path",
+        ));
+    }
+    let mut re = String::with_capacity(glob.len() * 2 + 2);
+    re.push('^');
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            '\\' => match chars.next() {
+                Some(escaped) => re.push_str(&regex::escape(&escaped.to_string())),
+                None => return Err(invalid("trailing backslash")),
+            },
+            '[' => {
+                let mut class = String::from("[");
+                let mut first = true;
+                let mut closed = false;
+                for k in chars.by_ref() {
+                    if first && k == '!' {
+                        class.push('^');
+                        first = false;
+                        continue;
+                    }
+                    if k == ']' && !first {
+                        closed = true;
+                        break;
+                    }
+                    first = false;
+                    if k == '\\' || k == '[' {
+                        class.push('\\');
+                    }
+                    class.push(k);
+                }
+                if !closed {
+                    return Err(invalid("unterminated character class '['"));
+                }
+                class.push(']');
+                re.push_str(&class);
+            }
+            other => re.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    re.push('$');
+    Regex::new(&re).map_err(|e| invalid(&e.to_string()))
+}
+
+/// Should this entry be left out of the index? `--exclude` (regex over
+/// the full path) applies to every entry; `--exclude-dir` (glob over
+/// the name) to directories only. A skipped directory is neither
+/// emitted nor descended into, so its whole subtree is absent.
+pub fn excluded_entry(
+    name: &str,
+    is_dir: bool,
+    full_path: &str,
+    path_patterns: &[Regex],
+    dir_globs: &[Regex],
+) -> bool {
+    (!path_patterns.is_empty() && path_patterns.iter().any(|re| re.is_match(full_path)))
+        || (is_dir && !dir_globs.is_empty() && dir_globs.iter().any(|g| g.is_match(name)))
 }
 
 #[cfg(test)]
@@ -682,6 +790,80 @@ mod tests {
     }
 
     #[test]
+    fn dir_glob_matches_names_only() {
+        let m = |g: &str, name: &str| compile_dir_glob(g).unwrap().is_match(name);
+        assert!(m(".snapshot", ".snapshot"));
+        assert!(!m(".snapshot", "mysnapshot"), "a glob is not a regex: '.' is literal");
+        assert!(!m(".snapshot", "xsnapshot"));
+        assert!(!m(".snapshot", ".snapshots"), "anchored");
+        assert!(m("*.bak", "data.bak"));
+        assert!(!m("*.bak", "data.bak.old"));
+        assert!(m(".*", ".zfs") && !m(".*", "zfs"));
+        assert!(m("tmp?", "tmp1") && !m("tmp?", "tmp") && !m("tmp?", "tmp12"));
+        assert!(m("[ab]cd", "acd") && m("[ab]cd", "bcd") && !m("[ab]cd", "ccd"));
+        assert!(m("[!.]*", "plain") && !m("[!.]*", ".hidden"));
+        assert!(m("a[]]b", "a]b"), "']' first in a class is literal");
+        assert!(m(r"star\*", "star*") && !m(r"star\*", "starx"), "escaped glob char");
+        assert!(m("with space", "with space"));
+        assert!(m("(paren)+", "(paren)+"), "regex metacharacters are literal");
+    }
+
+    #[test]
+    fn dir_glob_rejects_bad_patterns_by_name() {
+        for (bad, why) in [
+            ("", "empty"),
+            ("a/b", "cannot contain '/'"),
+            ("[abc", "unterminated"),
+            ("trail\\", "trailing backslash"),
+        ] {
+            let err = compile_dir_glob(bad).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(why), "{bad:?}: {msg}");
+            assert!(msg.contains(&format!("'{bad}'")) || bad.is_empty(), "{bad:?}: {msg}");
+        }
+    }
+
+    /// The fixture from mongoose's acceptance list: `.snapshot/a`,
+    /// `.zfs/b`, and ordinary siblings, with the documented patterns.
+    /// Only the ordinary siblings survive; the excluded directories are
+    /// dropped at the entry (so never emitted, never queued), and
+    /// order of patterns does not matter.
+    #[test]
+    fn excluded_entry_drops_the_snapshot_subtrees_only() {
+        let globs_a: Vec<Regex> = [".snapshot", ".zfs"]
+            .iter()
+            .map(|g| compile_dir_glob(g).unwrap())
+            .collect();
+        let globs_b: Vec<Regex> = [".zfs", ".snapshot"]
+            .iter()
+            .map(|g| compile_dir_glob(g).unwrap())
+            .collect();
+        // (name, is_dir, full_path)
+        let listing = [
+            (".snapshot", true, "/data/.snapshot"),
+            (".zfs", true, "/data/.zfs"),
+            ("docs", true, "/data/docs"),
+            ("notes.txt", false, "/data/notes.txt"),
+            (".snapshot", false, "/data/.snapshot"), // a FILE of that name is data
+            ("snapshot-2026", true, "/data/snapshot-2026"),
+        ];
+        for globs in [&globs_a, &globs_b] {
+            let kept: Vec<&str> = listing
+                .iter()
+                .filter(|(name, is_dir, path)| !excluded_entry(name, *is_dir, path, &[], globs))
+                .map(|(name, _, _)| *name)
+                .collect();
+            assert_eq!(kept, vec!["docs", "notes.txt", ".snapshot", "snapshot-2026"]);
+        }
+        // `.snapshot/a` would only ever be reached by descending into
+        // `.snapshot`, which the filter refused; the path regex still
+        // catches it if someone asks by path.
+        let by_path = vec![Regex::new(r"/\.snapshot(/|$)").unwrap()];
+        assert!(excluded_entry("a", false, "/data/.snapshot/a", &by_path, &[]));
+        assert!(!excluded_entry("a", false, "/data/docs/a", &by_path, &[]));
+    }
+
+    #[test]
     fn test_exclude_pattern() {
         let config = WalkConfig {
             nfs_url: NfsUrl::parse("nfs://s/e").unwrap(),
@@ -692,6 +874,7 @@ mod tests {
             show_progress: false,
             dirs_only: false,
             exclude_patterns: vec![Regex::new(r"\.snapshot").unwrap()],
+            exclude_dirs: vec![],
             timeout_secs: 30,
             retry_count: 3,
             pipeline_depth: 0,

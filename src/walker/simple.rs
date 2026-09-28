@@ -354,6 +354,7 @@ impl SimpleWalker {
             if self.config.max_depth.is_none()
                 && !self.config.dirs_only
                 && self.config.exclude_patterns.is_empty()
+                && self.config.exclude_dirs.is_empty()
             {
                 let expected = files.saturating_add(dirs.saturating_sub(1));
                 if total_entries != expected {
@@ -523,6 +524,9 @@ impl SimpleWalker {
         // Shared compiled --exclude patterns; workers skip matched paths
         // (no emission, no descent). Empty for the common case.
         let exclude: Arc<Vec<Regex>> = Arc::new(self.config.exclude_patterns.clone());
+        // Shared compiled --exclude-dir globs; a matching directory name
+        // is dropped at the entry, so its subtree is never visited.
+        let exclude_dirs: Arc<Vec<Regex>> = Arc::new(self.config.exclude_dirs.clone());
 
         'spawn: for (id, local) in workers_local.into_iter().enumerate() {
             // Pick an IP with failover. The round-robin position is the
@@ -631,6 +635,7 @@ impl SimpleWalker {
             let pipeline_depth = self.config.pipeline_depth;
             let big_dir_split_after = self.config.big_dir_split_after;
             let exclude = Arc::clone(&exclude);
+            let exclude_dirs = Arc::clone(&exclude_dirs);
 
             let handle = thread::Builder::new()
                 .name(format!("walker-{}", id))
@@ -656,6 +661,7 @@ impl SimpleWalker {
                             max_depth,
                             dirs_only,
                             exclude,
+                            exclude_dirs,
                             batch_size,
                             pipeline_depth,
                             big_dir_split_after,
@@ -682,6 +688,7 @@ impl SimpleWalker {
                             max_depth,
                             dirs_only,
                             exclude,
+                            exclude_dirs,
                             batch_size,
                             metrics,
                         );
@@ -788,6 +795,7 @@ fn worker_loop(
     max_depth: Option<usize>,
     dirs_only: bool,
     exclude: Arc<Vec<Regex>>,
+    exclude_dirs: Arc<Vec<Regex>>,
     batch_size: usize,
     metrics: Arc<crate::scanlog::ScanMetrics>,
 ) {
@@ -933,9 +941,17 @@ fn worker_loop(
                     continue;
                 }
 
-                // --exclude: matched paths are neither emitted nor
-                // descended into. Empty in the common case.
-                if !exclude.is_empty() && exclude.iter().any(|re| re.is_match(&full_path)) {
+                // --exclude (path regex) and --exclude-dir (name glob):
+                // a match is neither emitted nor descended into, so an
+                // excluded directory's whole subtree is absent. Empty in
+                // the common case.
+                if crate::config::excluded_entry(
+                    &nfs_entry.name,
+                    is_dir,
+                    &full_path,
+                    &exclude,
+                    &exclude_dirs,
+                ) {
                     continue;
                 }
 
@@ -1196,6 +1212,7 @@ fn worker_loop_pipelined(
     max_depth: Option<usize>,
     dirs_only: bool,
     exclude: Arc<Vec<Regex>>,
+    exclude_dirs: Arc<Vec<Regex>>,
     batch_size: usize,
     pipeline_depth: usize,
     big_dir_split_after: u64,
@@ -1467,11 +1484,16 @@ fn worker_loop_pipelined(
                         continue;
                     }
 
-                    // --exclude: matched paths are neither emitted nor
-                    // descended into (mirrors the legacy worker).
-                    if !exclude.is_empty()
-                        && exclude.iter().any(|re| re.is_match(&full_path))
-                    {
+                    // --exclude / --exclude-dir, mirroring the legacy
+                    // worker: a match is neither emitted nor descended
+                    // into.
+                    if crate::config::excluded_entry(
+                        &nfs_entry.name,
+                        is_dir,
+                        &full_path,
+                        &exclude,
+                        &exclude_dirs,
+                    ) {
                         continue;
                     }
 

@@ -93,7 +93,7 @@ nfs-walker nfs://server/export -o scan.parquet -w 230 --pipeline-depth 16
 nfs-walker nfs://server/export --dirs-only -o dirs.parquet
 
 # With exclusions
-nfs-walker nfs://server/data --exclude ".snapshot" --exclude ".zfs" -o scan.parquet
+nfs-walker nfs://server/data --exclude-dir .snapshot --exclude-dir .zfs -o scan.parquet
 
 # Limit depth
 nfs-walker nfs://server/export -d 3 -o shallow.parquet
@@ -259,7 +259,9 @@ Scan options:
   -q, --quiet             Suppress progress
   -v, --verbose           Show errors
   --dirs-only             Only record directories
-  --exclude <PATTERN>     Exclude paths (repeatable, regex; skips emission and descent)
+  --exclude <REGEX>       Exclude paths (repeatable, regex over the full path; skips emission and descent)
+  --exclude-dir <GLOB>    Skip directories whose name matches a glob, and everything under them
+                          (repeatable; `*`, `?`, `[...]`; name only, never the path)
   --server-ips <IPS>      Comma-separated VIP list (bypasses DNS round-robin)
   --pipeline-depth <N>    READDIRPLUS RPCs in flight per worker
   --big-dir-split-after N Split giant flat dirs into continuations
