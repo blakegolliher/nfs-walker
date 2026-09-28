@@ -4,11 +4,26 @@
 //! and provides the query execution context.
 
 use crate::error::ServerError;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Default query memory limit in GiB (override with NFS_WALKER_SERVE_MEM_GB)
+const DEFAULT_MEM_GB: f64 = 4.0;
+
+/// Query memory limit in bytes, from the environment or the default.
+/// Parses leniently: anything non-numeric or non-positive falls back.
+fn memory_limit_bytes() -> usize {
+    let gb = std::env::var("NFS_WALKER_SERVE_MEM_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(DEFAULT_MEM_GB);
+    (gb * 1024.0 * 1024.0 * 1024.0) as usize
+}
 
 /// Metadata about a discovered scan
 #[derive(Debug, Clone, serde::Serialize)]
@@ -34,7 +49,11 @@ pub struct AnalyticsContext {
 impl AnalyticsContext {
     /// Build a new AnalyticsContext by discovering scans in `data_dir`
     pub async fn build(data_dir: &Path) -> Result<Self, ServerError> {
-        let ctx = SessionContext::new();
+        // Bound query memory so a runaway aggregation can't OOM the host
+        let runtime_env = RuntimeEnvBuilder::new()
+            .with_memory_limit(memory_limit_bytes(), 1.0)
+            .build_arc()?;
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime_env);
         let scans_dir = data_dir.join("scans");
 
         if !scans_dir.exists() {
@@ -116,6 +135,16 @@ impl AnalyticsContext {
             };
 
             scans.insert(scan_id, info);
+        }
+
+        // If no scan carried scan_timestamp_us metadata, fall back to the
+        // lexically-last scan so default_scan (and `entries`) still resolve
+        if latest_id.is_none() && !scans.is_empty() {
+            latest_id = scans.keys().max().cloned();
+            eprintln!(
+                "Warning: no scan has scan_timestamp_us metadata; using lexically-last scan {} as default",
+                latest_id.as_deref().unwrap_or("?")
+            );
         }
 
         // Register `entries` alias pointing to the most recent scan

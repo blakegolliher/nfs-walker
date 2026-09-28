@@ -1,15 +1,9 @@
 //! Error types for nfs-walker
 //!
-//! This module defines a comprehensive error hierarchy that covers:
-//! - NFS connection and protocol errors
-//! - Parquet writer errors
-//! - Configuration and CLI errors
-//! - Worker thread errors
-//!
-//! Design philosophy:
-//! - Use thiserror for structured error types in library code
-//! - Errors should be actionable - include context about what to do
-//! - Preserve error chains for debugging
+//! Structured error types (thiserror) for the NFS layer, the Parquet
+//! writers, configuration, and the optional analytics server. Every
+//! variant here has at least one construction site — resist the urge to
+//! add speculative ones.
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -34,21 +28,9 @@ pub enum WalkerError {
     #[error("Configuration error: {0}")]
     Config(#[from] ConfigError),
 
-    /// Worker/concurrency errors
-    #[error("Worker error: {0}")]
-    Worker(#[from] WorkerError),
-
     /// I/O errors (file operations, etc.)
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    /// Interrupted by signal
-    #[error("Operation interrupted by signal")]
-    Interrupted,
-
-    /// Channel closed unexpectedly
-    #[error("Channel closed unexpectedly")]
-    ChannelClosed,
 
     /// The scan ran to the end but at least one directory could not
     /// be read after the retry policy was exhausted. The Parquet
@@ -87,6 +69,10 @@ pub enum FailureKind {
     Timeout,
     /// Connection, mount, or RPC-transport trouble: retried.
     Connection,
+    /// The connection is poisoned (a timed-out RPC) and will never be
+    /// serviced again: not retried; the worker exits and its queue is
+    /// stolen by workers with live connections.
+    ConnectionLost,
     /// The server asked for a retry (JUKEBOX, IO, SERVERFAULT, EAGAIN).
     Transient,
     /// Any other NFS3 status: not retried.
@@ -102,6 +88,7 @@ impl FailureKind {
             Self::StaleHandle => "stale_handle",
             Self::Timeout => "timeout",
             Self::Connection => "connection",
+            Self::ConnectionLost => "connection_lost",
             Self::Transient => "transient",
             Self::Protocol => "protocol",
             Self::Other => "other",
@@ -153,14 +140,6 @@ pub enum NfsError {
     #[error("Failed to read directory '{path}': {reason}")]
     ReadDirFailed { path: String, reason: String },
 
-    /// Stat operation failed
-    #[error("Failed to stat '{path}': {reason}")]
-    StatFailed { path: String, reason: String },
-
-    /// File read operation failed
-    #[error("Failed to read file '{path}': {reason}")]
-    ReadFailed { path: String, reason: String },
-
     /// Permission denied
     #[error("Permission denied: '{path}'")]
     PermissionDenied { path: String },
@@ -172,14 +151,6 @@ pub enum NfsError {
     /// Stale file handle (server-side change detected)
     #[error("Stale file handle for '{path}' - filesystem changed during scan")]
     StaleHandle { path: String },
-
-    /// Operation timed out
-    #[error("Operation timed out after {attempts} attempts: '{path}'")]
-    Timeout { path: String, attempts: u32 },
-
-    /// Generic NFS error with error code
-    #[error("NFS error {code}: {message}")]
-    Protocol { code: i32, message: String },
 }
 
 impl NfsError {
@@ -189,40 +160,12 @@ impl NfsError {
             NfsError::PermissionDenied { .. } => FailureKind::PermissionDenied,
             NfsError::NotFound { .. } => FailureKind::NotFound,
             NfsError::StaleHandle { .. } => FailureKind::StaleHandle,
-            NfsError::Timeout { .. } => FailureKind::Timeout,
             NfsError::ConnectionFailed { .. }
             | NfsError::MountFailed { .. }
             | NfsError::InitFailed(_) => FailureKind::Connection,
-            NfsError::Protocol { code, .. } => match -code {
-                // EIO, EAGAIN, ETIMEDOUT, and EINTR (libnfs's per-RPC
-                // timeout) are worth another try.
-                5 | 11 | 110 | 4 => FailureKind::Transient,
-                _ => FailureKind::Protocol,
-            },
             NfsError::ReadDirFailed { reason, .. } => classify_reason(reason),
-            NfsError::StatFailed { .. } | NfsError::ReadFailed { .. } | NfsError::InvalidUrl { .. } => {
-                FailureKind::Other
-            }
+            NfsError::InvalidUrl { .. } => FailureKind::Other,
         }
-    }
-
-    /// Check if this error is recoverable (can retry or skip)
-    pub fn is_recoverable(&self) -> bool {
-        matches!(
-            self,
-            NfsError::PermissionDenied { .. }
-                | NfsError::NotFound { .. }
-                | NfsError::StaleHandle { .. }
-                | NfsError::Timeout { .. }
-        )
-    }
-
-    /// Check if this error should trigger a reconnection attempt
-    pub fn should_reconnect(&self) -> bool {
-        matches!(
-            self,
-            NfsError::StaleHandle { .. } | NfsError::ConnectionFailed { .. }
-        )
     }
 }
 
@@ -230,7 +173,12 @@ impl NfsError {
 /// message) in its reason; classify from that text.
 fn classify_reason(reason: &str) -> FailureKind {
     let r = reason;
-    if r.contains("timed out") || r.contains("timeout") || r.contains("Timeout") {
+    if r.contains("poisoned") {
+        // NfsConnection::poison: a timed-out RPC leaves the context
+        // unusable for good. Nothing on it can succeed; the worker
+        // exits and its queue is stolen.
+        FailureKind::ConnectionLost
+    } else if r.contains("timed out") || r.contains("timeout") || r.contains("Timeout") {
         FailureKind::Timeout
     } else if r.contains("NFS3ERR_STALE") || r.contains("NFS3ERR_BADHANDLE") {
         FailureKind::StaleHandle
@@ -258,19 +206,14 @@ fn classify_reason(reason: &str) -> FailureKind {
 }
 
 /// Configuration and CLI errors
+///
+/// Numeric range checks live in clap `value_parser` ranges on the CLI
+/// definition; this enum only covers validation clap can't express.
 #[derive(Error, Debug)]
 pub enum ConfigError {
-    /// Invalid worker count
-    #[error("Invalid worker count {count}: must be between 1 and {max}")]
-    InvalidWorkerCount { count: usize, max: usize },
-
-    /// Invalid queue size
-    #[error("Invalid queue size {size}: must be at least {min}")]
-    InvalidQueueSize { size: usize, min: usize },
-
-    /// Invalid batch size
-    #[error("Invalid batch size {size}: must be between {min} and {max}")]
-    InvalidBatchSize { size: usize, min: usize, max: usize },
+    /// NFS URL missing or unparseable
+    #[error("Invalid NFS URL '{url}': {reason}")]
+    InvalidNfsUrl { url: String, reason: String },
 
     /// Invalid exclude pattern
     #[error("Invalid exclude pattern '{pattern}': {reason}")]
@@ -280,45 +223,9 @@ pub enum ConfigError {
     #[error("Invalid output path '{path}': {reason}")]
     InvalidOutputPath { path: PathBuf, reason: String },
 
-    /// Pipeline depth out of range
-    #[error("Invalid pipeline depth {depth}: must be between 0 and {max}")]
-    InvalidPipelineDepth { depth: usize, max: usize },
-
-    /// Writer-shard count out of range
-    #[error("Invalid writer-shards {shards}: must be between 1 and {max}")]
-    InvalidWriterShards { shards: usize, max: usize },
-
     /// `--server-ips` entry could not be parsed
     #[error("Invalid --server-ips entry '{entry}': {reason}")]
     InvalidServerIps { entry: String, reason: String },
-}
-
-/// Worker thread errors
-#[derive(Error, Debug)]
-pub enum WorkerError {
-    /// Worker panicked
-    #[error("Worker {id} panicked: {message}")]
-    Panicked { id: usize, message: String },
-
-    /// Work queue send failed
-    #[error("Failed to send work item: queue full or closed")]
-    QueueSendFailed,
-
-    /// Result channel closed
-    #[error("Result channel closed unexpectedly")]
-    ResultChannelClosed,
-
-    /// Worker initialization failed
-    #[error("Failed to initialize worker {id}: {reason}")]
-    InitFailed { id: usize, reason: String },
-
-    /// All workers died
-    #[error("All workers have terminated unexpectedly")]
-    AllWorkersDead,
-
-    /// NFS error during worker operation
-    #[error("Worker {id} NFS error: {source}")]
-    NfsError { id: usize, source: NfsError },
 }
 
 /// Parquet writer errors
@@ -344,9 +251,6 @@ pub enum ParquetError {
     #[error("{0}")]
     Other(String),
 }
-
-/// Result type alias for ParquetError
-pub type ParquetResult<T> = std::result::Result<T, ParquetError>;
 
 /// Analytics server errors
 #[cfg(feature = "server")]
@@ -413,75 +317,31 @@ pub type Result<T> = std::result::Result<T, WalkerError>;
 /// Result type alias for NfsError
 pub type NfsResult<T> = std::result::Result<T, NfsError>;
 
-/// Represents the outcome of walking a single directory
-#[derive(Debug)]
-pub enum WalkOutcome {
-    /// Successfully processed the directory
-    Success {
-        path: String,
-        entries: usize,
-        subdirs: usize,
-    },
-
-    /// Skipped due to recoverable error
-    Skipped { path: String, reason: String },
-
-    /// Failed with error
-    Failed { path: String, error: NfsError },
-}
-
-impl WalkOutcome {
-    /// Returns true if this outcome represents success
-    pub fn is_success(&self) -> bool {
-        matches!(self, WalkOutcome::Success { .. })
-    }
-
-    /// Returns the path associated with this outcome
-    pub fn path(&self) -> &str {
-        match self {
-            WalkOutcome::Success { path, .. } => path,
-            WalkOutcome::Skipped { path, .. } => path,
-            WalkOutcome::Failed { path, .. } => path,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_nfs_error_recoverable() {
-        let perm_denied = NfsError::PermissionDenied {
-            path: "/test".into(),
-        };
-        assert!(perm_denied.is_recoverable());
-
-        let conn_failed = NfsError::ConnectionFailed {
-            server: "server".into(),
-            reason: "timeout".into(),
-        };
-        assert!(!conn_failed.is_recoverable());
-    }
-
     #[test]
     fn failure_kind_classification() {
         let k = |e: NfsError| e.failure_kind();
         assert_eq!(k(NfsError::PermissionDenied { path: "/p".into() }), FailureKind::PermissionDenied);
         assert_eq!(k(NfsError::NotFound { path: "/p".into() }), FailureKind::NotFound);
         assert_eq!(k(NfsError::StaleHandle { path: "/p".into() }), FailureKind::StaleHandle);
-        assert_eq!(k(NfsError::Timeout { path: "/p".into(), attempts: 3 }), FailureKind::Timeout);
         assert_eq!(
             k(NfsError::ConnectionFailed { server: "s".into(), reason: "r".into() }),
             FailureKind::Connection
         );
-        assert_eq!(k(NfsError::Protocol { code: -5, message: "EIO".into() }), FailureKind::Transient);
-        assert_eq!(k(NfsError::Protocol { code: -4, message: "timed out".into() }), FailureKind::Transient);
-        assert_eq!(k(NfsError::Protocol { code: -22, message: "EINVAL".into() }), FailureKind::Protocol);
         let rd = |reason: &str| NfsError::ReadDirFailed { path: "/p".into(), reason: reason.into() };
         assert_eq!(k(rd("NFS3ERR_JUKEBOX (jukebox/try again later)")), FailureKind::Transient);
         assert_eq!(k(rd("READDIRPLUS failed: RPC timeout")), FailureKind::Timeout);
         assert_eq!(k(rd("READDIRPLUS failed: poll error")), FailureKind::Connection);
+        assert_eq!(
+            k(rd("READDIRPLUS failed: RPC timeout (connection poisoned)")),
+            FailureKind::ConnectionLost,
+            "a poisoned connection is never retried"
+        );
+        assert_eq!(k(rd("connection poisoned (not mounted)")), FailureKind::ConnectionLost);
         assert_eq!(k(rd("NFS3ERR_BADHANDLE (illegal NFS file handle)")), FailureKind::StaleHandle);
         assert_eq!(k(rd("NFS3ERR_NOENT (no such file or directory)")), FailureKind::NotFound);
         assert_eq!(k(rd("NFS3ERR_NOTDIR (not a directory)")), FailureKind::Protocol);

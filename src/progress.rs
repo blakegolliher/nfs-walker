@@ -5,18 +5,12 @@
 use console::style;
 use humansize::{format_size, BINARY};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Progress reporter that displays walk status
 #[derive(Clone)]
 pub struct ProgressReporter {
-    /// Progress bar
     bar: ProgressBar,
-
-    /// Stop signal
-    stop: Arc<AtomicBool>,
 }
 
 impl ProgressReporter {
@@ -33,10 +27,7 @@ impl ProgressReporter {
 
         bar.enable_steady_tick(Duration::from_millis(100));
 
-        Self {
-            bar,
-            stop: Arc::new(AtomicBool::new(false)),
-        }
+        Self { bar }
     }
 
     /// Set a status message
@@ -46,14 +37,7 @@ impl ProgressReporter {
 
     /// Finish the progress display with a final message
     pub fn finish(&self, message: &str) {
-        self.stop.store(true, Ordering::SeqCst);
         self.bar.finish_with_message(message.to_string());
-    }
-
-    /// Finish and clear the progress display
-    pub fn finish_and_clear(&self) {
-        self.stop.store(true, Ordering::SeqCst);
-        self.bar.finish_and_clear();
     }
 }
 
@@ -76,7 +60,7 @@ pub fn format_elapsed(duration: Duration) -> String {
 }
 
 /// Format a number with thousands separators
-fn format_number(n: u64) -> String {
+pub fn format_number(n: u64) -> String {
     let s = n.to_string();
     let bytes: Vec<_> = s.bytes().rev().collect();
 
@@ -101,8 +85,8 @@ pub fn print_summary(
     bytes: u64,
     errors: u64,
     duration: Duration,
-    db_path: &str,
-    db_size: Option<u64>,
+    output_path: &str,
+    output_size: Option<u64>,
 ) {
     let bytes_str = format_size(bytes, BINARY);
     let duration_secs = duration.as_secs_f64();
@@ -135,12 +119,12 @@ pub fn print_summary(
             format_number(errors)
         );
     }
-    // Show database path with size if available
-    if let Some(size) = db_size {
-        let db_size_str = format_size(size, BINARY);
-        println!("  {} {} ({})", style("Database:").bold(), db_path, db_size_str);
+    // Show output path with size if available
+    if let Some(size) = output_size {
+        let size_str = format_size(size, BINARY);
+        println!("  {} {} ({})", style("Output:").bold(), output_path, size_str);
     } else {
-        println!("  {} {}", style("Database:").bold(), db_path);
+        println!("  {} {}", style("Output:").bold(), output_path);
     }
     println!();
 }

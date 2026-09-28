@@ -10,43 +10,42 @@
 //! │                    NfsConnection                     │
 //! │  - One per worker thread (not thread-safe)          │
 //! │  - RAII cleanup (unmount + destroy on drop)         │
-//! │  - Uses READDIR for names, GETATTR for attributes   │
+//! │  - READDIRPLUS: names + attributes + file handles   │
+//! │    in one RPC (sync loop or pipelined submit/pump)  │
 //! └─────────────────────────────────────────────────────┘
 //!                          │
 //!                          ▼
 //! ┌─────────────────────────────────────────────────────┐
 //! │                   libnfs (C FFI)                     │
 //! │  - Direct NFS protocol implementation               │
-//! │  - NFSv3 and NFSv4 support                          │
+//! │  - NFSv3 only (nfs_set_version(3) at init)          │
 //! └─────────────────────────────────────────────────────┘
 //! ```
 //!
 //! # Example
 //!
 //! ```no_run
-//! use nfs_walker::nfs::{NfsConnection, NfsConnectionBuilder};
+//! use nfs_walker::nfs::NfsConnectionBuilder;
 //! use nfs_walker::config::NfsUrl;
 //! use std::time::Duration;
 //!
 //! let url = NfsUrl::parse("nfs://server/export").unwrap();
-//!
-//! // Simple connection
-//! let conn = NfsConnection::connect_to(&url, Duration::from_secs(30)).unwrap();
-//!
-//! // With retries
 //! let conn = NfsConnectionBuilder::new(url)
 //!     .timeout(Duration::from_secs(30))
 //!     .retries(3)
 //!     .connect()
 //!     .unwrap();
 //!
-//! // Read a directory
-//! let handle = conn.opendir("/data").unwrap();
-//! while let Some(entry) = handle.readdir() {
-//!     if !entry.is_special() {
-//!         println!("{}", entry.name);
-//!     }
-//! }
+//! // Stream a directory with cached-file-handle READDIRPLUS.
+//! let n = conn
+//!     .readdir_plus_with_fh("/data", 5000, |chunk| {
+//!         for entry in &chunk {
+//!             println!("{}", entry.name);
+//!         }
+//!         true // keep reading
+//!     })
+//!     .unwrap();
+//! println!("{n} entries");
 //! ```
 
 // Pre-generated FFI bindings for libnfs
@@ -58,10 +57,8 @@
 pub mod bindings;
 
 pub mod connection;
-pub mod dns_resolver;
 pub mod types;
 
-pub use connection::{resolve_dns, NfsConnection, NfsConnectionBuilder, NfsDirHandle};
 pub use connection::ffi;
-pub use dns_resolver::{DnsResolver, DEFAULT_DNS_REFRESH_SECS};
-pub use types::{DbEntry, DirStats, EntryType, NfsDirEntry, NfsStat, Permissions};
+pub use connection::{resolve_dns, NfsConnection, NfsConnectionBuilder};
+pub use types::{DbEntry, EntryType, NfsDirEntry, NfsStat};

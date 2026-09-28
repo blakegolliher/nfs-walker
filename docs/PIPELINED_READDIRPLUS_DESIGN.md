@@ -1,8 +1,10 @@
 # Pipelined READDIRPLUS Design
 
-Status: design, not yet implemented.
+Status: IMPLEMENTED — shipped behind `--pipeline-depth N` (0 = legacy
+serial worker, the default). This document is the original design
+record; line numbers and some API references (e.g. the content-analysis
+flags, since removed) reflect the codebase at design time.
 Owner: -
-Target: feature-flagged behind `--pipeline-depth N` (0 disables, current behavior).
 
 ## 1. Problem
 

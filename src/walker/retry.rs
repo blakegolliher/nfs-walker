@@ -100,7 +100,9 @@ pub fn plan(err: &NfsError, attempt: u32, policy: &RetryPolicy) -> Action {
             after: policy.backoff(attempt),
             refresh_fh: false,
         },
-        FailureKind::Protocol | FailureKind::Other => Action::Fail(kind),
+        FailureKind::ConnectionLost | FailureKind::Protocol | FailureKind::Other => {
+            Action::Fail(kind)
+        }
     }
 }
 
@@ -302,9 +304,15 @@ mod tests {
         NfsError::StaleHandle { path: "/d".into() }
     }
     fn timeout() -> NfsError {
-        NfsError::Timeout {
+        NfsError::ReadDirFailed {
             path: "/d".into(),
-            attempts: 1,
+            reason: "READDIRPLUS failed: RPC timeout".into(),
+        }
+    }
+    fn poisoned() -> NfsError {
+        NfsError::ReadDirFailed {
+            path: "/d".into(),
+            reason: "READDIRPLUS failed: RPC timeout (connection poisoned)".into(),
         }
     }
     fn jukebox() -> NfsError {
@@ -406,6 +414,11 @@ mod tests {
             "exhausted"
         );
         assert_eq!(plan(&notdir(), 1, &p), Action::Fail(FailureKind::Protocol));
+        assert_eq!(
+            plan(&poisoned(), 1, &p),
+            Action::Fail(FailureKind::ConnectionLost),
+            "nothing on a poisoned connection can succeed"
+        );
     }
 
     #[test]

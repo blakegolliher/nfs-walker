@@ -11,7 +11,8 @@
 
 FROM docker.io/library/rust:1.92.0-alpine as builder
 
-# Install build dependencies for musl + libnfs + parquet codecs.
+# Install build dependencies for musl + libnfs + parquet codecs, plus
+# nodejs/npm to build the embedded React analytics dashboard (server feature).
 RUN apk add --no-cache \
     build-base \
     musl-dev \
@@ -23,7 +24,9 @@ RUN apk add --no-cache \
     zstd-dev \
     zstd-static \
     zlib-dev \
-    zlib-static
+    zlib-static \
+    nodejs \
+    npm
 
 WORKDIR /app
 
@@ -39,9 +42,19 @@ RUN git clone https://github.com/sahlberg/libnfs.git && \
     cd .. && \
     rm -rf libnfs
 
-# Set up for static musl build
+# Set up for static musl build.
+#
+# RUSTFLAGS here (an env var) OVERRIDES the per-target rustflags in
+# .cargo/config.toml rather than merging, so every flag the musl build needs
+# must be listed here:
+#   +crt-static  static C runtime (the whole point of the musl build)
+#   +aes,+sse2   gxhash needs AES + SSE2 intrinsics at compile time and has no
+#                portable fallback. sse2 is baseline on x86-64; aes (AES-NI) is
+#                present on essentially all server CPUs since ~2010. Using the
+#                explicit features (not target-cpu=native) keeps the binary
+#                portable instead of pinning it to the build host's exact CPU.
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
-ENV RUSTFLAGS="-C target-feature=+crt-static"
+ENV RUSTFLAGS="-C target-feature=+crt-static,+aes,+sse2"
 
 # Add musl target
 RUN rustup target add x86_64-unknown-linux-musl
@@ -52,10 +65,19 @@ COPY . .
 # Clean any stale Cargo.lock
 RUN rm -f Cargo.lock
 
-# Build static musl binary with debug info (release-debug profile).
-# Keeps line tables + symtab for crash-symbolication during the prod-segfault
-# investigation. No -C strip=symbols pass.
-RUN cargo build --profile release-debug --target x86_64-unknown-linux-musl
+# Build the React analytics dashboard so rust-embed can bake web/dist/ into the
+# binary (the `server` default feature). web/dist/ is gitignored, so it is
+# absent on a clean checkout and must be generated here before cargo build.
+RUN cd web && npm install && npm run build
 
-# The final binary is at:
-# /app/target/x86_64-unknown-linux-musl/release-debug/nfs-walker
+# Build the static musl binary. The profile is parameterized:
+#   PROFILE=release        -> stripped, LTO'd binary for distribution (GH releases)
+#   PROFILE=release-debug  -> keeps line tables + symtab for crash-symbolication
+#                             during the prod-segfault investigation (default,
+#                             preserves the `make docker-musl` extraction path).
+ARG PROFILE=release-debug
+RUN cargo build --profile ${PROFILE} --target x86_64-unknown-linux-musl
+
+# The final binary is at (output dir tracks the profile name):
+#   PROFILE=release       -> /app/target/x86_64-unknown-linux-musl/release/nfs-walker
+#   PROFILE=release-debug -> /app/target/x86_64-unknown-linux-musl/release-debug/nfs-walker

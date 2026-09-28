@@ -165,8 +165,10 @@ impl ScanMetrics {
         if let Some(buf) = self.nfs_latency_us.get(worker_id) {
             if let Ok(mut g) = buf.lock() {
                 if g.len() >= RESERVOIR_CAP {
-                    // drop-oldest ring without an actual VecDeque to keep
-                    // sampling cheap; statistical loss is acceptable.
+                    // Cheap eviction: swap_remove(0) drops slot 0 and
+                    // moves the newest sample into it, so under
+                    // sustained overflow the retained set skews recent-
+                    // but-unordered. Fine for avg/p99 summaries.
                     g.swap_remove(0);
                 }
                 g.push(dur.as_micros() as u64);
@@ -252,7 +254,7 @@ impl ScanMetrics {
                 }
             }
         }
-        hot_dirs.sort_by(|a, b| b.1.entries_seen.cmp(&a.1.entries_seen));
+        hot_dirs.sort_by_key(|(_, hd)| std::cmp::Reverse(hd.entries_seen));
         hot_dirs.truncate(top_n);
 
         let queue_depths: Vec<usize> = match self.write_senders.lock() {
@@ -386,8 +388,8 @@ pub fn start_logger(
                 }
 
                 if metrics.shutdown.load(Ordering::SeqCst) {
-                    let snap = metrics.collect_snapshot(cfg.top_hot_dirs);
-                    if let Err(e) = emit(&mut writer, &cfg, &snap, started_at, true) {
+                    let mut snap = metrics.collect_snapshot(cfg.top_hot_dirs);
+                    if let Err(e) = emit(&mut writer, &cfg, &mut snap, started_at, true) {
                         warn!("scanlog: final write failed: {}", e);
                     }
                     let _ = writer.flush();
@@ -398,8 +400,8 @@ pub fn start_logger(
                     continue;
                 }
 
-                let snap = metrics.collect_snapshot(cfg.top_hot_dirs);
-                if let Err(e) = emit(&mut writer, &cfg, &snap, started_at, false) {
+                let mut snap = metrics.collect_snapshot(cfg.top_hot_dirs);
+                if let Err(e) = emit(&mut writer, &cfg, &mut snap, started_at, false) {
                     warn!("scanlog: write failed: {}", e);
                 }
                 let _ = writer.flush();
@@ -413,14 +415,13 @@ pub fn start_logger(
 fn emit(
     writer: &mut BufWriter<File>,
     cfg: &LogConfig,
-    snap: &Snapshot,
+    snap: &mut Snapshot,
     started_at: Instant,
     is_final: bool,
 ) -> std::io::Result<()> {
-    let mut nfs_samples = snap.nfs_samples.clone();
-    let mut write_samples = snap.write_samples.clone();
-    let nfs = summarise(&mut nfs_samples);
-    let writes = summarise(&mut write_samples);
+    // summarise sorts in place; the snapshot is ours to consume.
+    let nfs = summarise(&mut snap.nfs_samples);
+    let writes = summarise(&mut snap.write_samples);
     let elapsed = started_at.elapsed();
 
     match cfg.format {
@@ -515,10 +516,14 @@ fn emit_json(
         if i > 0 {
             hot_json.push(',');
         }
+        // serde_json escaping, NOT `{:?}` — Rust Debug emits `\u{7f}`
+        // style escapes that are invalid JSON.
+        let path_json = serde_json::to_string(&hd.path)
+            .unwrap_or_else(|_| "\"<unencodable>\"".to_string());
         hot_json.push_str(&format!(
-            r#"{{"worker":{},"path":{:?},"age_secs":{},"entries":{}}}"#,
+            r#"{{"worker":{},"path":{},"age_secs":{},"entries":{}}}"#,
             worker_id,
-            hd.path,
+            path_json,
             hd.started_at.elapsed().as_secs(),
             hd.entries_seen,
         ));

@@ -14,6 +14,7 @@ export interface ScansResponse {
   scans: ScanInfo[];
   count: number;
   default_scan: string | null;
+  data_dir: string;
 }
 
 export interface ParamDef {

@@ -12,34 +12,17 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-/// Maximum reasonable worker count.
-/// Past ~1000-2000 the work-stealing loop scans every other worker's
-/// stealer on each idle tick, so returns diminish sharply. 4096 is a
-/// hard cap to catch fat-finger typos, not a recommended setting.
-const MAX_WORKERS: usize = 4096;
-
-/// Minimum queue size
-const MIN_QUEUE_SIZE: usize = 100;
-
-/// Batch size limits
-const MIN_BATCH_SIZE: usize = 100;
-const MAX_BATCH_SIZE: usize = 100_000;
-
-/// Maximum READDIRPLUS pipeline depth per worker. Above ~64 libnfs's
-/// internal queue sizing isn't tuned for hundreds of in-flight PDUs
-/// per context and we'd risk hitting per-context server-side caps.
-const MAX_PIPELINE_DEPTH: usize = 64;
-
-/// Maximum writer-shard count. The real per-shard cost is one Arrow
-/// builder + ZSTD encoder; 32 has been more than enough on every prod
-/// scan we've run. Raising this is plausible on fat hosts but unproven.
-const MAX_WRITER_SHARDS: usize = 32;
-
-/// Default writer-shard count when `--writer-shards` is not passed. 32
-/// matches the customer tuning that motivated this code path
-/// (libnfs+DuckDB → 3 M files/sec) and is the production recommendation
-/// after the 810 M-file bench (see tasks/parquet-experiment-review.md).
-const DEFAULT_WRITER_SHARDS: usize = 32;
+// Numeric CLI ranges are enforced declaratively via clap value_parser
+// ranges on the args below:
+//   --workers        1..=4096   (past ~1000-2000 the work-stealing loop
+//                                scans every peer's stealer per idle tick;
+//                                the cap catches fat-finger typos)
+//   --batch-size     100..=100_000
+//   --pipeline-depth 0..=64     (libnfs isn't tuned for hundreds of
+//                                in-flight PDUs per context)
+//   --writer-shards  1..=32     (per-shard cost is one Arrow builder +
+//                                ZSTD encoder; 32 is the prod sweet spot
+//                                from the 810 M-file bench)
 
 /// Regex for parsing NFS URLs
 static NFS_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -95,25 +78,28 @@ pub struct CliArgs {
     #[arg(short, long, default_value = "walk.parquet", value_name = "PATH")]
     pub output: PathBuf,
 
-    /// Number of worker threads for parallel GETATTR
+    /// Number of worker threads (each owns one NFS mount)
     #[arg(
         short = 'w',
         long,
         default_value_t = default_workers(),
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=4096),
         value_name = "NUM"
     )]
     pub workers: usize,
-
-    /// Work queue size (controls memory usage)
-    #[arg(long, default_value = "10000", value_name = "NUM")]
-    pub queue_size: usize,
 
     /// Batch size sent from each worker to the writer threads. Larger
     /// batches mean fewer cross-thread sends and larger Arrow row groups,
     /// which reduces contention from ≥hundreds of producers. 5000 is a
     /// good default for billion-entry scans on multi-core hosts; drop to
     /// 1000 for tiny exports or low-memory environments.
-    #[arg(short = 'b', long, default_value = "5000", value_name = "NUM")]
+    #[arg(
+        short = 'b',
+        long,
+        default_value = "5000",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(100..=100_000),
+        value_name = "NUM"
+    )]
     pub batch_size: usize,
 
     /// Maximum directory depth (unlimited if not set)
@@ -131,10 +117,6 @@ pub struct CliArgs {
     /// Only record directories (creates smaller database)
     #[arg(long)]
     pub dirs_only: bool,
-
-    /// Skip atime attribute (for NFS servers that don't support it)
-    #[arg(long)]
-    pub no_atime: bool,
 
     /// Exclude paths matching pattern (can be repeated)
     #[arg(long = "exclude", value_name = "PATTERN", action = clap::ArgAction::Append)]
@@ -160,23 +142,15 @@ pub struct CliArgs {
     #[arg(long, value_name = "PATH")]
     pub export: Option<String>,
 
-    /// Calculate gxhash checksum for each file (reads full file content)
-    #[arg(long, short = 'c')]
-    pub checksum: bool,
-
-    /// Detect file type using magic bytes (reads first 8KB of each file)
-    #[arg(long, short = 't')]
-    pub file_type: bool,
-
-    /// Maximum file size for checksum calculation (default: 1GB)
-    /// Files larger than this will have checksum set to None
-    #[arg(long, default_value = "1073741824", value_name = "BYTES")]
-    pub max_checksum_size: u64,
-
     /// Number of READDIRPLUS RPCs to keep in flight per worker.
     /// 0 disables pipelining (uses the legacy serial worker loop, current
     /// behavior). 8 is the recommended setting once validated.
-    #[arg(long, default_value = "0", value_name = "N")]
+    #[arg(
+        long,
+        default_value = "0",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=64),
+        value_name = "N"
+    )]
     pub pipeline_depth: usize,
 
     /// Stop reading any one directory at the next page boundary once
@@ -196,8 +170,13 @@ pub struct CliArgs {
     /// default) is the typical sweet spot and matches the customer
     /// baseline this code path was designed to chase. The hard cap is
     /// 32; raising it on a fat host is plausible but unproven.
-    #[arg(long, value_name = "N")]
-    pub writer_shards: Option<usize>,
+    #[arg(
+        long,
+        default_value = "32",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=32),
+        value_name = "N"
+    )]
+    pub writer_shards: usize,
 
     /// Parquet compression algorithm. `zstd3` (the default) is the
     /// production recommendation after the 810 M-file bench: 49 GiB
@@ -207,28 +186,6 @@ pub struct CliArgs {
     /// bottleneck on a given host.
     #[arg(long, value_enum, default_value_t = ParquetCompression::Zstd3, value_name = "ALG")]
     pub parquet_compression: ParquetCompression,
-
-    /// Parquet row-group size in rows. Default 256_000 spreads the
-    /// encoding/IO work across the scan instead of dumping it at end.
-    /// Smaller groups reduce tail-flush time; larger groups improve
-    /// downstream query predicate pushdown.
-    #[arg(long, default_value = "256000", value_name = "N")]
-    pub parquet_row_group_size: usize,
-
-    /// Parquet part-file rotation threshold in MiB. Once a shard's
-    /// current file exceeds this, the writer closes it and starts a
-    /// fresh `part-rNN-SSSSS+1.parquet`.
-    #[arg(long, default_value = "512", value_name = "MB")]
-    pub parquet_file_size_mb: usize,
-
-    /// Per-shard parquet channel depth, in batches. Caps the worst-case
-    /// in-flight memory at roughly
-    /// `channel_depth × writer_shards × batch_size × ~200B`. Default 64
-    /// keeps the ceiling near 2 GiB; lower on tight-memory hosts, raise
-    /// on big production hosts (1.4 TiB transfer hosts can use 1024
-    /// with no risk).
-    #[arg(long, default_value = "64", value_name = "N")]
-    pub parquet_channel_depth: usize,
 
     /// Override the per-scan progress logfile path. Default is
     /// `<output>.log` (sidecar next to the scan output directory).
@@ -311,8 +268,9 @@ pub enum Command {
         #[arg(long, default_value = "8080")]
         port: u16,
 
-        /// Bind address
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Bind address. Defaults to loopback because the server has no
+        /// auth; pass 0.0.0.0 explicitly to expose it on the LAN.
+        #[arg(long, default_value = "127.0.0.1")]
         bind: String,
     },
 
@@ -348,12 +306,11 @@ pub struct NfsUrl {
 impl NfsUrl {
     /// Parse an NFS URL string
     ///
-    /// Accepts formats:
-    /// - nfs://server/export
-    /// - nfs://server/export/subpath
-    /// - nfs://server:port/export
-    /// - server:/export
-    /// - server:/export/subpath
+    /// Accepts `nfs://server[:port]/path` and legacy `server:/path`.
+    /// The entire path becomes the export (multi-component exports like
+    /// `/volumes/uuid` are common and the export boundary can't be
+    /// auto-detected); `subpath` is only ever set when `--export`
+    /// overrides the boundary in `WalkConfig::from_args`.
     pub fn parse(url: &str) -> Result<Self, NfsError> {
         let url = url.trim();
 
@@ -482,9 +439,6 @@ pub struct WalkConfig {
     /// Number of worker threads
     pub worker_count: usize,
 
-    /// Work queue capacity
-    pub queue_size: usize,
-
     /// Writer batch size
     pub batch_size: usize,
 
@@ -494,14 +448,8 @@ pub struct WalkConfig {
     /// Show progress indicator
     pub show_progress: bool,
 
-    /// Verbose logging
-    pub verbose: bool,
-
     /// Only record directories
     pub dirs_only: bool,
-
-    /// Skip atime
-    pub skip_atime: bool,
 
     /// Compiled exclude patterns
     pub exclude_patterns: Vec<Regex>,
@@ -512,34 +460,15 @@ pub struct WalkConfig {
     /// Retry count for transient errors
     pub retry_count: u32,
 
-    /// Calculate gxhash checksum for files
-    pub compute_checksum: bool,
-
-    /// Detect file type using magic bytes
-    pub detect_file_type: bool,
-
-    /// Maximum file size for checksum calculation
-    pub max_checksum_size: u64,
-
     /// Number of READDIRPLUS RPCs to keep in flight per worker.
     /// 0 = legacy serial worker loop. >0 selects the pipelined worker.
     pub pipeline_depth: usize,
 
-    /// Number of writer shards. Validated to 1..=MAX_WRITER_SHARDS in
-    /// `from_args`.
+    /// Number of writer shards (clap-validated to 1..=32).
     pub writer_shards: usize,
 
     /// Compression algorithm for parquet output.
     pub parquet_compression: ParquetCompression,
-
-    /// Row-group size for parquet output.
-    pub parquet_row_group_size: usize,
-
-    /// File-rotation threshold (bytes) for parquet output.
-    pub parquet_file_size_bytes: usize,
-
-    /// Per-shard channel depth for parquet output.
-    pub parquet_channel_depth: usize,
 
     /// Explicit server VIPs to use, bypassing DNS resolution. Empty
     /// means use DNS as normal.
@@ -565,13 +494,13 @@ impl WalkConfig {
     /// Create and validate configuration from CLI arguments
     pub fn from_args(args: CliArgs) -> Result<Self, ConfigError> {
         // Parse NFS URL (required for scan command)
-        let nfs_url_str = args.nfs_url.as_ref().ok_or_else(|| ConfigError::InvalidOutputPath {
-            path: PathBuf::from(""),
+        let nfs_url_str = args.nfs_url.as_ref().ok_or_else(|| ConfigError::InvalidNfsUrl {
+            url: String::new(),
             reason: "NFS URL is required for scan".to_string(),
         })?;
 
-        let mut nfs_url = NfsUrl::parse(nfs_url_str).map_err(|e| ConfigError::InvalidOutputPath {
-            path: PathBuf::from(nfs_url_str),
+        let mut nfs_url = NfsUrl::parse(nfs_url_str).map_err(|e| ConfigError::InvalidNfsUrl {
+            url: nfs_url_str.clone(),
             reason: e.to_string(),
         })?;
 
@@ -602,50 +531,8 @@ impl WalkConfig {
             }
         }
 
-        // Validate worker count
-        if args.workers == 0 || args.workers > MAX_WORKERS {
-            return Err(ConfigError::InvalidWorkerCount {
-                count: args.workers,
-                max: MAX_WORKERS,
-            });
-        }
-
-        // Validate queue size
-        if args.queue_size < MIN_QUEUE_SIZE {
-            return Err(ConfigError::InvalidQueueSize {
-                size: args.queue_size,
-                min: MIN_QUEUE_SIZE,
-            });
-        }
-
-        // Validate batch size
-        if args.batch_size < MIN_BATCH_SIZE || args.batch_size > MAX_BATCH_SIZE {
-            return Err(ConfigError::InvalidBatchSize {
-                size: args.batch_size,
-                min: MIN_BATCH_SIZE,
-                max: MAX_BATCH_SIZE,
-            });
-        }
-
-        // Validate pipeline depth (0 disables, MAX_PIPELINE_DEPTH cap)
-        if args.pipeline_depth > MAX_PIPELINE_DEPTH {
-            return Err(ConfigError::InvalidPipelineDepth {
-                depth: args.pipeline_depth,
-                max: MAX_PIPELINE_DEPTH,
-            });
-        }
-
-        // Resolve writer-shard count. The default (32) matches the
-        // production recommendation from the 810 M-file bench; explicit
-        // `--writer-shards N` always wins. Validate after applying the
-        // default so the cap applies uniformly.
-        let writer_shards = args.writer_shards.unwrap_or(DEFAULT_WRITER_SHARDS);
-        if writer_shards == 0 || writer_shards > MAX_WRITER_SHARDS {
-            return Err(ConfigError::InvalidWriterShards {
-                shards: writer_shards,
-                max: MAX_WRITER_SHARDS,
-            });
-        }
+        // Numeric ranges (workers, batch size, pipeline depth, writer
+        // shards) are enforced by clap value_parser ranges on CliArgs.
 
         // Validate --server-ips: trim each entry, drop empties, parse as
         // IpAddr, dedupe while preserving first-seen order. If the flag
@@ -722,26 +609,17 @@ impl WalkConfig {
             nfs_url,
             output_path: args.output,
             worker_count: args.workers,
-            queue_size: args.queue_size,
             batch_size: args.batch_size,
             max_depth: args.max_depth,
             show_progress: !args.quiet,
-            verbose: args.verbose,
             dirs_only: args.dirs_only,
-            skip_atime: args.no_atime,
             exclude_patterns,
             timeout_secs: args.timeout,
             retry_count: args.retries,
-            compute_checksum: args.checksum,
-            detect_file_type: args.file_type,
-            max_checksum_size: args.max_checksum_size,
             pipeline_depth: args.pipeline_depth,
-            writer_shards,
+            writer_shards: args.writer_shards,
             big_dir_split_after: args.big_dir_split_after,
             parquet_compression: args.parquet_compression,
-            parquet_row_group_size: args.parquet_row_group_size.max(1),
-            parquet_file_size_bytes: args.parquet_file_size_mb.max(1).saturating_mul(1024 * 1024),
-            parquet_channel_depth: args.parquet_channel_depth.max(1),
             server_ips,
             log,
         })
@@ -809,26 +687,17 @@ mod tests {
             nfs_url: NfsUrl::parse("nfs://s/e").unwrap(),
             output_path: PathBuf::from("test.parquet"),
             worker_count: 4,
-            queue_size: 1000,
             batch_size: 1000,
             max_depth: None,
             show_progress: false,
-            verbose: false,
             dirs_only: false,
-            skip_atime: false,
             exclude_patterns: vec![Regex::new(r"\.snapshot").unwrap()],
             timeout_secs: 30,
             retry_count: 3,
-            compute_checksum: false,
-            detect_file_type: false,
-            max_checksum_size: 1_073_741_824,
             pipeline_depth: 0,
             writer_shards: 1,
             big_dir_split_after: 0,
             parquet_compression: ParquetCompression::Zstd3,
-            parquet_row_group_size: 256_000,
-            parquet_file_size_bytes: 512 * 1024 * 1024,
-            parquet_channel_depth: 64,
             server_ips: vec![],
             log: None,
         };

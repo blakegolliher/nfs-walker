@@ -87,8 +87,7 @@ impl ParquetCompression {
 }
 
 /// Per-shard summary returned to the spawning thread after the channel
-/// closes. Aggregated into the run-wide `metadata.json` so the layout
-/// matches the post-hoc converter (parallel_convert.rs).
+/// closes. Aggregated into the run-wide `metadata.json`.
 #[derive(Debug, Default, Clone)]
 pub struct ShardSummary {
     pub shard_index: usize,
@@ -109,10 +108,17 @@ pub struct ShardSummary {
 /// batch_size 5000, ~200 B/entry); large enough to absorb short
 /// writer hiccups, small enough that a 23 GiB host doesn't OOM when
 /// the writer drains slower than walkers produce.
-///
-/// Larger hosts (production transfer hosts at 1.4 TiB+) can override
-/// via `--parquet-channel-depth`.
 pub const DEFAULT_CHANNEL_DEPTH: usize = 64;
+
+/// Rows per row-group flush. 256K spreads the encoding/IO work across
+/// the scan instead of dumping it at the end: each tail flush is
+/// ~25-50 MB per shard post-compression (vs 200 MB+ at 1M), while
+/// row-group statistics stay useful for downstream predicate pushdown.
+pub const DEFAULT_ROW_GROUP_SIZE: usize = 256_000;
+
+/// Part-file rotation threshold. Once a shard's current file crosses
+/// this, the writer closes it and starts `part-rNN-SSSSS+1.parquet`.
+pub const DEFAULT_TARGET_FILE_SIZE: usize = 512 * 1024 * 1024;
 
 /// Configuration shared across the per-shard writer threads.
 #[derive(Clone)]
@@ -128,13 +134,7 @@ pub struct DirectWriteConfig {
     pub scan_timestamp_us: i64,
     /// Number of writer shards (== channel count).
     pub shards: usize,
-    /// Rows per row-group flush. Default is 256K — small enough that
-    /// each end-of-scan tail flush is fast (~25-50 MB per shard
-    /// post-compression vs 200 MB+ at 1M), large enough that downstream
-    /// analytical queries still benefit from row-group statistics for
-    /// predicate pushdown. The post-hoc converters use 1M because
-    /// they're not concurrent with a hot walker and can afford to
-    /// accumulate.
+    /// Rows per row-group flush. See [`DEFAULT_ROW_GROUP_SIZE`].
     pub row_group_size: usize,
     /// File rotation threshold in bytes. The writer closes the current
     /// part once `bytes_written` crosses this value.
@@ -153,14 +153,12 @@ impl Default for DirectWriteConfig {
             scan_id: String::new(),
             scan_timestamp_us: 0,
             shards: 1,
-            row_group_size: 256_000,
-            target_file_size: 512 * 1024 * 1024,
+            row_group_size: DEFAULT_ROW_GROUP_SIZE,
+            target_file_size: DEFAULT_TARGET_FILE_SIZE,
             // Snappy matches the streaming-Parquet default in DuckDB,
-            // PyArrow, and Polars. Faster encoder than ZSTD with the
-            // trade-off of ~30% larger files. The post-hoc converters
-            // keep ZSTD-3 because they're not concurrent with a hot
-            // walker and can afford the slower encoder for smaller
-            // archived output.
+            // PyArrow, and Polars: faster encoder than ZSTD, ~30%
+            // larger files. The CLI defaults to ZSTD-3 instead (config
+            // .rs) — this Default only backs test fixtures.
             compression: ParquetCompression::Snappy,
             channel_depth: DEFAULT_CHANNEL_DEPTH,
         }
@@ -239,12 +237,12 @@ pub fn spawn_direct_parquet_writers(
         Vec::with_capacity(config.shards);
 
     // Filename widths (`part-r{:02}-{:05}.parquet`) are wired into the
-    // lexicographic-sort guarantee in `write_metadata_json`. If anyone
-    // bumps MAX_WRITER_SHARDS above 99 or row_group_size below ~4 KiB
-    // (so part_seq exceeds 100K per shard on a billion-row scan), the
-    // widths need to grow too — otherwise sorts mis-order at the
-    // boundary. Caught here at spawn time, not silently at sort time.
-    debug_assert!(
+    // lexicographic-sort guarantee in `write_metadata_json`. If the
+    // shard cap ever exceeds 99 (or part_seq exceeds 100K per shard),
+    // the widths must grow too — otherwise sorts mis-order at the
+    // boundary. Hard assert (spawn-time, once per scan — free) so a
+    // future cap bump can't mis-sort silently in release builds.
+    assert!(
         config.shards <= 99,
         "part-r{{:02}} width overflows at shards={} (>99); widen the format",
         config.shards
@@ -270,9 +268,6 @@ pub fn spawn_direct_parquet_writers(
         let row_ctx = RowContext {
             scan_id: config.scan_id.clone(),
             scan_timestamp_us: config.scan_timestamp_us,
-            // DbEntry mtime/atime/ctime are already microseconds (see
-            // nfs/types.rs), so no rescale.
-            mtime_scale: 1,
         };
 
         let join = thread::Builder::new()
@@ -308,10 +303,11 @@ pub fn spawn_direct_parquet_writers(
 }
 
 /// RAII guard for an in-flight `part-rNN-SSSSS.parquet`. Removes the
-/// file on `Drop` unless `commit()` has been called. Catches the Err
-/// paths of P0-5 fully and panic-unwind paths of P0-4 on `dev` /
-/// `panic = "unwind"` builds — see the module-level note on
-/// `panic = "abort"` for the release-build gap.
+/// file on `Drop` unless `commit()` has been called, so an error exit
+/// from the writer loop never strands a footer-less part file. Panic
+/// unwinding also triggers the cleanup on `dev` / `panic = "unwind"`
+/// builds — see the module-level note on `panic = "abort"` for the
+/// release-build gap.
 struct InProgressPart {
     path: PathBuf,
     filename: String,
@@ -378,7 +374,7 @@ fn writer_loop(
         shard_idx, row_group_size, target_file_size
     );
 
-    let mut row_builder = RowBuilder::new(row_ctx);
+    let mut row_builder = RowBuilder::new(row_ctx, row_group_size.max(1));
     let mut part_seq: u32 = 0;
     let mut inprogress = InProgressPart::new(&scan_dir, shard_idx, part_seq);
     let mut writer = open_part_writer(inprogress.path(), &schema, &props)?;
@@ -418,7 +414,7 @@ fn writer_loop(
                 // valid footer. Close + commit the current part before
                 // opening the next; if close() errors, `?` propagates
                 // out and `inprogress`'s Drop removes the partial.
-                if writer.bytes_written() as usize >= target_file_size {
+                if writer.bytes_written() >= target_file_size {
                     // bytes_written() is captured before close() because
                     // close() consumes the writer. The footer adds a few
                     // KB that bytes_written doesn't see, so we prefer
@@ -523,12 +519,9 @@ fn writer_properties(
         .build())
 }
 
-/// Merge per-shard summaries and write `<scan_dir>/metadata.json`.
-///
-/// Layout is intentionally identical to what the post-hoc converters
-/// emit (`convert.rs`, `parallel_convert.rs`) so downstream
-/// DuckDB / DataFusion / Polars readers don't care which path produced
-/// the scan.
+/// Merge per-shard summaries and write `<scan_dir>/metadata.json` — the
+/// canonical part-file list that DuckDB / DataFusion / Polars consumers
+/// (and `nfs-walker stats` / `serve`) read.
 pub fn write_metadata_json(
     scan_dir: &Path,
     scan_id: &str,
@@ -590,7 +583,8 @@ mod tests {
             path: format!("/data/file-{:08}.bin", i),
             entry_type: EntryType::File,
             size: i,
-            mtime: Some(1_700_000_000_000_000 + i as i64),
+            mtime_sec: Some(1_700_000_000 + i as i64),
+            mtime_nsec: Some(0),
             mode: Some(0o644),
             uid: Some(1000),
             gid: Some(1000),

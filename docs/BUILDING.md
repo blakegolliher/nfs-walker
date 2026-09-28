@@ -1,13 +1,13 @@
 # Building nfs-walker
 
-The binary streams scan output directly to sharded Parquet — there is
-no RocksDB dependency anymore, so build prerequisites are lean: libnfs
-and a Rust toolchain.
+The binary streams scan output directly to sharded Parquet — build
+prerequisites are lean: libnfs, a Rust toolchain, and (for the embedded
+web dashboard) Node.js.
 
 ## Quick Start
 
 ```bash
-# Native build
+# Native build (builds the web dashboard first automatically)
 make build
 
 # Static musl binary (works on any Linux ≥ glibc-anything)
@@ -15,6 +15,19 @@ make release
 ```
 
 Output lands in `./build/`.
+
+## The embedded web dashboard
+
+The default `server` feature embeds the React dashboard into the binary
+via rust-embed, which requires `web/dist/` to exist **at compile time**.
+`web/dist` is gitignored, so on a fresh clone:
+
+- `make build` / `make release` / `make debug` run the `make web` target
+  first (npm install + build, skipped when `web/dist` is current);
+- a bare `cargo build` fails with an actionable error from `build.rs`
+  telling you to run `make web`;
+- to build a scanner-only binary with no dashboard and no Node.js
+  requirement: `cargo build --release --no-default-features`.
 
 ---
 
@@ -72,6 +85,7 @@ make docker-rocky
 | `make release`      | Static musl build via cargo-zigbuild |
 | `make docker-rocky` | Rocky-9-based container build        |
 | `make debug`        | Native debug build                   |
+| `make web`          | Build the React dashboard (`web/dist`, embedded by cargo) |
 
 ---
 
@@ -82,6 +96,8 @@ make docker-rocky
 - **Rust 1.82+** — install via [rustup](https://rustup.rs/)
 - **libnfs** (development headers) — see "libnfs version" below
 - **pkg-config**
+- **Node.js + npm** — only for the embedded dashboard (default build);
+  not needed with `--no-default-features`
 
 ### Run-time
 

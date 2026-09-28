@@ -25,6 +25,8 @@ export const api = {
 
   scans: () => request<ScansResponse>('/scans'),
 
+  reloadScans: () => request<ScansResponse>('/scans/reload', { method: 'POST' }),
+
   queries: () => request<QueriesResponse>('/queries'),
 
   execute: (queryId: string, params?: Record<string, string>, scanId?: string) =>
