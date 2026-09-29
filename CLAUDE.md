@@ -40,3 +40,11 @@
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+
+## No AI attribution
+
+Commits, pull request titles and descriptions, and review comments must not
+credit an AI assistant. That means no co-author or other trailer naming one,
+no "generated with" line, no assistant session link, and no AI author or
+committer identity. The `attribution` check (`scripts/check-attribution.sh`)
+enforces this on every pull request and every push to `main`.
