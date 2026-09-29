@@ -1,6 +1,6 @@
 //! Canonical Arrow schema for Parquet export
 //!
-//! Single source of truth for the 27-column schema used in Parquet files.
+//! Single source of truth for the 28-column schema used in Parquet files.
 //! Designed for efficient DataFusion queries with predicate pushdown.
 
 use arrow::datatypes::{DataType, Field, Schema};
@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 /// Build the canonical Arrow schema for filesystem entries.
 ///
-/// The original 24 analytics columns remain stable. Three additive Binary
-/// columns preserve authoritative POSIX path bytes for migration consumers.
+/// The original 24 analytics columns remain stable. Additive columns preserve
+/// authoritative POSIX path bytes and filesystem identity for migration
+/// consumers.
 pub fn parquet_schema() -> Schema {
     Schema::new(vec![
         Field::new("path", DataType::Utf8, false),
@@ -48,6 +49,7 @@ pub fn parquet_schema() -> Schema {
         Field::new("path_bytes", DataType::Binary, false),
         Field::new("filename_bytes", DataType::Binary, false),
         Field::new("parent_path_bytes", DataType::Binary, false),
+        Field::new("fsid", DataType::UInt64, true),
     ])
 }
 
@@ -91,9 +93,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_schema_has_27_fields() {
+    fn test_schema_has_28_fields() {
         let schema = parquet_schema();
-        assert_eq!(schema.fields().len(), 27);
+        assert_eq!(schema.fields().len(), 28);
     }
 
     #[test]
@@ -130,6 +132,7 @@ mod tests {
                 "path_bytes",
                 "filename_bytes",
                 "parent_path_bytes",
+                "fsid",
             ]
         );
     }
@@ -142,12 +145,13 @@ mod tests {
             .iter()
             .map(|f| (f.name().as_str(), f.is_nullable()))
             .collect();
-        // Nullable: extension plus every timestamp column (the three
-        // legacy *_us columns and the six sec/nsec pairs).
+        // Nullable: extension, filesystem identity, and every timestamp
+        // column (the three legacy *_us columns and the six sec/nsec pairs).
         for (name, is_nullable) in &nullable {
             let expected = matches!(
                 *name,
                 "extension"
+                    | "fsid"
                     | "mtime_us"
                     | "atime_us"
                     | "ctime_us"

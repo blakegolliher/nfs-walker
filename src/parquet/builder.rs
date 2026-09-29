@@ -90,6 +90,7 @@ pub struct RowBuilder {
     b_path_bytes: BinaryBuilder,
     b_filename_bytes: BinaryBuilder,
     b_parent_path_bytes: BinaryBuilder,
+    b_fsid: UInt64Builder,
 }
 
 impl RowBuilder {
@@ -131,6 +132,7 @@ impl RowBuilder {
                 capacity,
                 capacity * PATH_BYTES_PER_ROW,
             ),
+            b_fsid: UInt64Builder::with_capacity(capacity),
         }
     }
 
@@ -197,6 +199,7 @@ impl RowBuilder {
         self.b_path_bytes.append_value(&entry.path);
         self.b_filename_bytes.append_value(&entry.name);
         self.b_parent_path_bytes.append_value(parent);
+        self.b_fsid.append_option(entry.fsid);
 
         self.rows += 1;
     }
@@ -238,6 +241,7 @@ impl RowBuilder {
             mut b_path_bytes,
             mut b_filename_bytes,
             mut b_parent_path_bytes,
+            mut b_fsid,
             ..
         } = full;
 
@@ -269,6 +273,7 @@ impl RowBuilder {
             Arc::new(b_path_bytes.finish()),
             Arc::new(b_filename_bytes.finish()),
             Arc::new(b_parent_path_bytes.finish()),
+            Arc::new(b_fsid.finish()),
         ];
 
         RecordBatch::try_new(schema, columns)
@@ -379,5 +384,33 @@ mod tests {
             .unwrap();
         assert_eq!(paths.value(0), b"/data/bad-\xff.txt");
         assert_eq!(display.value(0), r"/data/bad-\xff.txt");
+    }
+
+    #[test]
+    fn fsid_is_written_when_known_and_null_when_unavailable() {
+        use arrow::array::Array;
+
+        let mut rb = RowBuilder::new(RowContext::default(), 2);
+        rb.push_db_entry(&DbEntry {
+            path: b"/data/a".to_vec(),
+            name: b"a".to_vec(),
+            fsid: Some(17),
+            ..DbEntry::default()
+        });
+        rb.push_db_entry(&DbEntry {
+            path: b"/data/b".to_vec(),
+            name: b"b".to_vec(),
+            fsid: None,
+            ..DbEntry::default()
+        });
+        let batch = rb.finish().unwrap();
+        let fsids = batch
+            .column_by_name("fsid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(fsids.value(0), 17);
+        assert!(fsids.is_null(1));
     }
 }

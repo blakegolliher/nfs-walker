@@ -134,6 +134,10 @@ dashboard and ad-hoc query compatibility; invalid UTF-8 bytes are shown there
 as `\xNN` escapes. Consumers that open or migrate files must use the Binary
 columns.
 
+Hardlink identity is filesystem-scoped. The nullable `fsid` column comes from
+NFSv3 post-operation attributes and must be paired with `inode`; consumers must
+not group equal inode numbers when `fsid` is unavailable.
+
 ```bash
 # DuckDB
 duckdb -c "SELECT file_type, COUNT(*), SUM(size)/1e9 AS gb \
