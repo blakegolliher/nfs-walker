@@ -515,7 +515,7 @@ fn writer_properties(
     Ok(WriterProperties::builder()
         .set_compression(compression.to_parquet()?)
         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Chunk)
-        .set_max_row_group_size(row_group_size.max(1))
+        .set_max_row_group_row_count(Some(row_group_size.max(1)))
         .build())
 }
 
