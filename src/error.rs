@@ -31,6 +31,86 @@ pub enum WalkerError {
     /// I/O errors (file operations, etc.)
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The scan ran to the end but at least one directory could not
+    /// be read after the retry policy was exhausted. The Parquet
+    /// output on disk is intact for diagnosis but is **not** a complete
+    /// index of the tree: consumers must not treat it as one.
+    /// `failures` is a bounded sample; `failure_log` has every record.
+    #[error(
+        "scan incomplete: {} director{} could not be read ({} vanished during the scan){}",
+        stats.errors,
+        if stats.errors == 1 { "y" } else { "ies" },
+        stats.vanished,
+        failure_log
+            .as_ref()
+            .map(|p| format!("; see {}", p.display()))
+            .unwrap_or_default()
+    )]
+    ScanIncomplete {
+        stats: crate::walker::WalkStats,
+        failures: Vec<DirFailure>,
+        failure_log: Option<PathBuf>,
+    },
+}
+
+/// Why a directory could not be read. Drives the retry policy
+/// ([`crate::walker::retry::plan`]) and names the failure in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    /// EACCES/EPERM: never retried.
+    PermissionDenied,
+    /// ENOENT/ENOTDIR: verified by a path LOOKUP; a confirmed
+    /// disappearance is "vanished", not a failure.
+    NotFound,
+    /// ESTALE/BADHANDLE: re-resolved by path, then retried.
+    StaleHandle,
+    Timeout,
+    /// Connection, mount, or RPC-transport trouble: retried.
+    Connection,
+    /// The connection is poisoned (a timed-out RPC) and will never be
+    /// serviced again: not retried; the worker exits and its queue is
+    /// stolen by workers with live connections.
+    ConnectionLost,
+    /// The server asked for a retry (JUKEBOX, IO, SERVERFAULT, EAGAIN).
+    Transient,
+    /// Any other NFS3 status: not retried.
+    Protocol,
+    Other,
+}
+
+impl FailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PermissionDenied => "permission_denied",
+            Self::NotFound => "not_found",
+            Self::StaleHandle => "stale_handle",
+            Self::Timeout => "timeout",
+            Self::Connection => "connection",
+            Self::ConnectionLost => "connection_lost",
+            Self::Transient => "transient",
+            Self::Protocol => "protocol",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for FailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One directory the scan could not read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DirFailure {
+    pub path: String,
+    pub kind: FailureKind,
+    /// The last error's message.
+    pub error: String,
+    /// Attempts made, including the first.
+    pub attempts: u32,
 }
 
 /// NFS connection and protocol errors
@@ -71,6 +151,58 @@ pub enum NfsError {
     /// Stale file handle (server-side change detected)
     #[error("Stale file handle for '{path}' - filesystem changed during scan")]
     StaleHandle { path: String },
+}
+
+impl NfsError {
+    /// Classify for the directory retry policy.
+    pub fn failure_kind(&self) -> FailureKind {
+        match self {
+            NfsError::PermissionDenied { .. } => FailureKind::PermissionDenied,
+            NfsError::NotFound { .. } => FailureKind::NotFound,
+            NfsError::StaleHandle { .. } => FailureKind::StaleHandle,
+            NfsError::ConnectionFailed { .. }
+            | NfsError::MountFailed { .. }
+            | NfsError::InitFailed(_) => FailureKind::Connection,
+            NfsError::ReadDirFailed { reason, .. } => classify_reason(reason),
+            NfsError::InvalidUrl { .. } => FailureKind::Other,
+        }
+    }
+}
+
+/// `ReadDirFailed` carries the NFS3 status name (or a transport
+/// message) in its reason; classify from that text.
+fn classify_reason(reason: &str) -> FailureKind {
+    let r = reason;
+    if r.contains("poisoned") {
+        // NfsConnection::poison: a timed-out RPC leaves the context
+        // unusable for good. Nothing on it can succeed; the worker
+        // exits and its queue is stolen.
+        FailureKind::ConnectionLost
+    } else if r.contains("timed out") || r.contains("timeout") || r.contains("Timeout") {
+        FailureKind::Timeout
+    } else if r.contains("NFS3ERR_STALE") || r.contains("NFS3ERR_BADHANDLE") {
+        FailureKind::StaleHandle
+    } else if r.contains("NFS3ERR_NOENT") {
+        FailureKind::NotFound
+    } else if r.contains("NFS3ERR_ACCES") || r.contains("NFS3ERR_PERM") {
+        FailureKind::PermissionDenied
+    } else if r.contains("NFS3ERR_JUKEBOX")
+        || r.contains("NFS3ERR_IO")
+        || r.contains("NFS3ERR_SERVERFAULT")
+    {
+        FailureKind::Transient
+    } else if r.contains("Not mounted")
+        || r.contains("RPC context")
+        || r.contains("Failed to queue")
+        || r.contains("READDIRPLUS failed")
+        || r.contains("Invalid RPC fd")
+    {
+        FailureKind::Connection
+    } else {
+        // NOTDIR (the entry is no longer a directory), BADTYPE, and the
+        // rest: the server answered, and answering again will not help.
+        FailureKind::Protocol
+    }
 }
 
 /// Configuration and CLI errors
@@ -188,6 +320,52 @@ pub type NfsResult<T> = std::result::Result<T, NfsError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[test]
+    fn failure_kind_classification() {
+        let k = |e: NfsError| e.failure_kind();
+        assert_eq!(k(NfsError::PermissionDenied { path: "/p".into() }), FailureKind::PermissionDenied);
+        assert_eq!(k(NfsError::NotFound { path: "/p".into() }), FailureKind::NotFound);
+        assert_eq!(k(NfsError::StaleHandle { path: "/p".into() }), FailureKind::StaleHandle);
+        assert_eq!(
+            k(NfsError::ConnectionFailed { server: "s".into(), reason: "r".into() }),
+            FailureKind::Connection
+        );
+        let rd = |reason: &str| NfsError::ReadDirFailed { path: "/p".into(), reason: reason.into() };
+        assert_eq!(k(rd("NFS3ERR_JUKEBOX (jukebox/try again later)")), FailureKind::Transient);
+        assert_eq!(k(rd("READDIRPLUS failed: RPC timeout")), FailureKind::Timeout);
+        assert_eq!(k(rd("READDIRPLUS failed: poll error")), FailureKind::Connection);
+        assert_eq!(
+            k(rd("READDIRPLUS failed: RPC timeout (connection poisoned)")),
+            FailureKind::ConnectionLost,
+            "a poisoned connection is never retried"
+        );
+        assert_eq!(k(rd("connection poisoned (not mounted)")), FailureKind::ConnectionLost);
+        assert_eq!(k(rd("NFS3ERR_BADHANDLE (illegal NFS file handle)")), FailureKind::StaleHandle);
+        assert_eq!(k(rd("NFS3ERR_NOENT (no such file or directory)")), FailureKind::NotFound);
+        assert_eq!(k(rd("NFS3ERR_NOTDIR (not a directory)")), FailureKind::Protocol);
+        assert_eq!(k(rd("NFS3ERR_BADTYPE (bad type)")), FailureKind::Protocol);
+        assert_eq!(FailureKind::PermissionDenied.to_string(), "permission_denied");
+        assert_eq!(serde_json::to_string(&FailureKind::StaleHandle).unwrap(), "\"stale_handle\"");
+    }
+
+    #[test]
+    fn scan_incomplete_names_counts_and_log() {
+        let e = WalkerError::ScanIncomplete {
+            stats: crate::walker::WalkStats {
+                errors: 2,
+                vanished: 1,
+                ..Default::default()
+            },
+            failures: vec![],
+            failure_log: Some(PathBuf::from("/w/scans/x/errors.jsonl")),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("2 directories could not be read"), "{msg}");
+        assert!(msg.contains("1 vanished"), "{msg}");
+        assert!(msg.contains("/w/scans/x/errors.jsonl"), "{msg}");
+    }
 
     #[test]
     fn test_error_conversion() {

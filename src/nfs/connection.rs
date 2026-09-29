@@ -101,7 +101,7 @@ fn nfs3_status_to_string(status: i32) -> String {
 }
 
 /// Convert a negated NFS3 status code to a typed NfsError with a path context.
-fn nfs3_status_to_nfs_error(status: i32, path: &str) -> NfsError {
+pub(crate) fn nfs3_status_to_nfs_error(status: i32, path: &str) -> NfsError {
     if status >= 0 {
         return NfsError::ReadDirFailed {
             path: path.into(),

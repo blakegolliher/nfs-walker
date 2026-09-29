@@ -6,6 +6,7 @@
 //!
 //! See `docs/ARCHITECTURE.md` for the full architecture diagram.
 
+pub mod retry;
 pub mod sharding;
 pub mod simple;
 
