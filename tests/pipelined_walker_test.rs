@@ -42,6 +42,7 @@ fn make_config(url: NfsUrl, output_path: PathBuf, pipeline_depth: usize) -> Walk
         show_progress: false,
         dirs_only: false,
         exclude_patterns: vec![],
+        exclude_dirs: vec![],
         timeout_secs: 30,
         retry_count: 1,
         pipeline_depth,

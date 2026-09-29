@@ -368,10 +368,10 @@ const Q033: QueryDef = QueryDef {
     description: "File size percentiles (p50, p90, p95, p99)",
     category: QueryCategory::FileSize,
     sql_template: "SELECT \
-        approx_percentile_cont(size, 0.5) as p50, \
-        approx_percentile_cont(size, 0.9) as p90, \
-        approx_percentile_cont(size, 0.95) as p95, \
-        approx_percentile_cont(size, 0.99) as p99, \
+        CAST(approx_percentile_cont(size, 0.5) AS BIGINT) as p50, \
+        CAST(approx_percentile_cont(size, 0.9) AS BIGINT) as p90, \
+        CAST(approx_percentile_cont(size, 0.95) AS BIGINT) as p95, \
+        CAST(approx_percentile_cont(size, 0.99) AS BIGINT) as p99, \
         AVG(size) as mean, \
         MIN(size) as min, \
         MAX(size) as max \
@@ -597,7 +597,7 @@ const Q081: QueryDef = QueryDef {
             MIN(children) as min_children, \
             MAX(children) as max_children, \
             AVG(children) as avg_children, \
-            approx_percentile_cont(children, 0.5) as median_children \
+            CAST(approx_percentile_cont(children, 0.5) AS BIGINT) as median_children \
         FROM fanout",
     params: &[],
 };

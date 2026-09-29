@@ -322,7 +322,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
     fn failure_kind_classification() {
         let k = |e: NfsError| e.failure_kind();
         assert_eq!(k(NfsError::PermissionDenied { path: "/p".into() }), FailureKind::PermissionDenied);
