@@ -3,9 +3,10 @@
 //! These types represent filesystem entries returned from NFS operations
 //! and are shaped for bulk transfer into the sharded Parquet writers.
 
+use std::borrow::Cow;
+
 /// Type of filesystem entry
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
 pub enum EntryType {
     /// Regular file
@@ -44,7 +45,7 @@ impl EntryType {
     }
 }
 
-/// Extract a lowercase extension from a filename.
+/// Extract a lowercase extension from a UTF-8 filename.
 ///
 /// Deliberately conservative: a name with no dot, a leading-dot name
 /// (`.bashrc`), or a trailing-dot name (`file.`) has no extension.
@@ -57,6 +58,40 @@ pub fn extract_extension(name: &str) -> Option<String> {
         return None;
     }
     Some(ext.to_lowercase())
+}
+
+/// Extract a lowercase extension only when the complete filename is UTF-8.
+///
+/// `extension` is an analytics-only UTF-8 column. The authoritative filename
+/// bytes are kept separately, so a non-UTF-8 name must never be made lossy just
+/// to populate this optional value.
+pub fn extract_extension_bytes(name: &[u8]) -> Option<String> {
+    std::str::from_utf8(name).ok().and_then(extract_extension)
+}
+
+/// Render path bytes for logs and the legacy UTF-8 analytics columns.
+///
+/// Valid UTF-8 is unchanged. Invalid paths use a diagnostic byte escape: a
+/// literal backslash becomes `\\`, and non-printable/non-ASCII bytes become
+/// `\xNN`. Migration code must use the Binary columns instead of this display
+/// representation.
+pub fn display_path(path: &[u8]) -> Cow<'_, str> {
+    if let Ok(path) = std::str::from_utf8(path) {
+        return Cow::Borrowed(path);
+    }
+
+    let mut display = String::with_capacity(path.len());
+    for &byte in path {
+        match byte {
+            b'\\' => display.push_str("\\\\"),
+            0x20..=0x7e => display.push(char::from(byte)),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(display, "\\x{byte:02x}");
+            }
+        }
+    }
+    Cow::Owned(display)
 }
 
 /// Statistics for a filesystem entry.
@@ -101,8 +136,9 @@ pub struct NfsStat {
 /// A directory entry returned from readdir operations
 #[derive(Debug, Clone)]
 pub struct NfsDirEntry {
-    /// Entry name (not full path)
-    pub name: String,
+    /// Entry name bytes (not full path). NFS/POSIX names are not required to
+    /// be UTF-8.
+    pub name: Vec<u8>,
 
     /// Entry type
     pub entry_type: EntryType,
@@ -184,14 +220,14 @@ impl NfsDirEntry {
 pub struct DbEntry {
     /// Parent directory path. `None` means "derive from `path`" — the
     /// writer recomputes it zero-copy, so the walker never has to clone
-    /// the parent string per entry.
-    pub parent_path: Option<String>,
+    /// the parent bytes per entry.
+    pub parent_path: Option<Vec<u8>>,
 
     /// Entry name (just the filename, not full path)
-    pub name: String,
+    pub name: Vec<u8>,
 
     /// Full path from mount point
-    pub path: String,
+    pub path: Vec<u8>,
 
     /// Entry type
     pub entry_type: EntryType,
@@ -259,6 +295,18 @@ mod tests {
         assert_eq!(extract_extension("file."), None);
         // Overlong "extensions" are noise, not extensions.
         assert_eq!(extract_extension("blob.0123456789abcdef"), None);
+    }
+
+    #[test]
+    fn byte_extension_requires_utf8_without_losing_name_bytes() {
+        assert_eq!(extract_extension_bytes(b"file.TXT"), Some("txt".into()));
+        assert_eq!(extract_extension_bytes(b"bad-\xff.txt"), None);
+    }
+
+    #[test]
+    fn display_path_is_stable_and_unambiguous_for_invalid_utf8() {
+        assert_eq!(display_path("/d/é.txt".as_bytes()), "/d/é.txt");
+        assert_eq!(display_path(b"/d/bad-\xff\\name"), r"/d/bad-\xff\\name");
     }
 
     #[test]

@@ -28,9 +28,9 @@ fn test_nfs_url_parsing() {
 #[test]
 fn test_db_entry_types() {
     let entry = DbEntry {
-        parent_path: Some("/data".to_string()),
-        name: "file.txt".into(),
-        path: "/data/file.txt".into(),
+        parent_path: Some(b"/data".to_vec()),
+        name: b"file.txt".to_vec(),
+        path: b"/data/file.txt".to_vec(),
         entry_type: EntryType::File,
         size: 1024,
         mtime_sec: Some(1234567890),

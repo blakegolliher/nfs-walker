@@ -1,6 +1,6 @@
 //! Canonical Arrow schema for Parquet export
 //!
-//! Single source of truth for the 24-column schema used in Parquet files.
+//! Single source of truth for the 27-column schema used in Parquet files.
 //! Designed for efficient DataFusion queries with predicate pushdown.
 
 use arrow::datatypes::{DataType, Field, Schema};
@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 /// Build the canonical Arrow schema for filesystem entries.
 ///
-/// 24 columns optimized for DataFusion analytics queries.
+/// The original 24 analytics columns remain stable. Three additive Binary
+/// columns preserve authoritative POSIX path bytes for migration consumers.
 pub fn parquet_schema() -> Schema {
     Schema::new(vec![
         Field::new("path", DataType::Utf8, false),
@@ -44,6 +45,9 @@ pub fn parquet_schema() -> Schema {
             false,
         ),
         Field::new("scan_timestamp_us", DataType::Int64, false),
+        Field::new("path_bytes", DataType::Binary, false),
+        Field::new("filename_bytes", DataType::Binary, false),
+        Field::new("parent_path_bytes", DataType::Binary, false),
     ])
 }
 
@@ -71,14 +75,14 @@ pub fn file_type_string(entry_type: u8) -> &'static str {
 /// Extract the parent path from a full path.
 ///
 /// Returns "/" for root-level entries, and the portion before the last '/' otherwise.
-pub fn compute_parent_path(path: &str) -> &str {
-    if path == "/" || !path.contains('/') {
-        return "/";
+pub fn compute_parent_path(path: &[u8]) -> &[u8] {
+    if path == b"/" || !path.contains(&b'/') {
+        return b"/";
     }
-    match path.rfind('/') {
-        Some(0) => "/",
+    match path.iter().rposition(|byte| *byte == b'/') {
+        Some(0) => b"/",
         Some(pos) => &path[..pos],
-        None => "/",
+        None => b"/",
     }
 }
 
@@ -87,9 +91,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_schema_has_24_fields() {
+    fn test_schema_has_27_fields() {
         let schema = parquet_schema();
-        assert_eq!(schema.fields().len(), 24);
+        assert_eq!(schema.fields().len(), 27);
     }
 
     #[test]
@@ -123,6 +127,9 @@ mod tests {
                 "parent_path",
                 "scan_id",
                 "scan_timestamp_us",
+                "path_bytes",
+                "filename_bytes",
+                "parent_path_bytes",
             ]
         );
     }
@@ -138,7 +145,19 @@ mod tests {
         // Nullable: extension plus every timestamp column (the three
         // legacy *_us columns and the six sec/nsec pairs).
         for (name, is_nullable) in &nullable {
-            let expected = matches!(*name, "extension" | "mtime_us" | "atime_us" | "ctime_us" | "mtime_sec" | "mtime_nsec" | "atime_sec" | "atime_nsec" | "ctime_sec" | "ctime_nsec");
+            let expected = matches!(
+                *name,
+                "extension"
+                    | "mtime_us"
+                    | "atime_us"
+                    | "ctime_us"
+                    | "mtime_sec"
+                    | "mtime_nsec"
+                    | "atime_sec"
+                    | "atime_nsec"
+                    | "ctime_sec"
+                    | "ctime_nsec"
+            );
             assert_eq!(
                 *is_nullable, expected,
                 "Field '{}' nullable={}, expected={}",
@@ -161,10 +180,11 @@ mod tests {
 
     #[test]
     fn test_compute_parent_path() {
-        assert_eq!(compute_parent_path("/"), "/");
-        assert_eq!(compute_parent_path("/file.txt"), "/");
-        assert_eq!(compute_parent_path("/dir/file.txt"), "/dir");
-        assert_eq!(compute_parent_path("/a/b/c/d.txt"), "/a/b/c");
-        assert_eq!(compute_parent_path("noSlash"), "/");
+        assert_eq!(compute_parent_path(b"/"), b"/");
+        assert_eq!(compute_parent_path(b"/file.txt"), b"/");
+        assert_eq!(compute_parent_path(b"/dir/file.txt"), b"/dir");
+        assert_eq!(compute_parent_path(b"/a/b/c/d.txt"), b"/a/b/c");
+        assert_eq!(compute_parent_path(b"noSlash"), b"/");
+        assert_eq!(compute_parent_path(b"/bad-\xff/name"), b"/bad-\xff");
     }
 }

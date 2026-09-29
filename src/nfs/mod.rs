@@ -38,9 +38,9 @@
 //!
 //! // Stream a directory with cached-file-handle READDIRPLUS.
 //! let n = conn
-//!     .readdir_plus_with_fh("/data", 5000, |chunk| {
+//!     .readdir_plus_with_fh(b"/data", 5000, |chunk| {
 //!         for entry in &chunk {
-//!             println!("{}", entry.name);
+//!             println!("{}", nfs_walker::nfs::types::display_path(&entry.name));
 //!         }
 //!         true // keep reading
 //!     })
