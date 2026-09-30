@@ -1018,6 +1018,7 @@ fn worker_loop(
                     gid: nfs_entry.gid(),
                     nlink: nfs_entry.nlink(),
                     inode: nfs_entry.inode,
+                    fsid: nfs_entry.fsid(),
                     depth: work.depth + 1,
                     extension: if nfs_entry.entry_type == EntryType::File {
                         extract_extension_bytes(&nfs_entry.name)
@@ -1568,6 +1569,7 @@ fn worker_loop_pipelined(
                         gid: nfs_entry.gid(),
                         nlink: nfs_entry.nlink(),
                         inode: nfs_entry.inode,
+                        fsid: nfs_entry.fsid(),
                         depth: state.work.depth + 1,
                         extension: if nfs_entry.entry_type == EntryType::File {
                             extract_extension_bytes(&nfs_entry.name)
