@@ -6,7 +6,7 @@
 
 use crate::error::{ParquetError, WalkerError};
 use crate::nfs::types::{display_path, DbEntry};
-use crate::parquet::schema::{compute_parent_path, file_type_string, parquet_schema_ref};
+use crate::parquet::schema::{compute_parent_path, parquet_schema_ref};
 use arrow::array::{
     ArrayRef, BinaryBuilder, Int32Builder, Int64Builder, StringBuilder, StringDictionaryBuilder,
     UInt16Builder, UInt32Builder, UInt64Builder,
@@ -150,7 +150,19 @@ impl RowBuilder {
 
     /// Append a row sourced from a `DbEntry` (the streaming writer fed
     /// from the walker pipeline).
-    pub fn push_db_entry(&mut self, entry: &DbEntry) {
+    ///
+    /// An entry whose type was never established is refused, before any
+    /// column is touched: the walker resolves or drops such entries, so
+    /// one arriving here is a bug upstream, and a row for it would tell
+    /// consumers a type nobody knows.
+    pub fn push_db_entry(&mut self, entry: &DbEntry) -> Result<(), WalkerError> {
+        let file_type = entry.entry_type.file_type_name().ok_or_else(|| {
+            WalkerError::Parquet(ParquetError::Other(format!(
+                "refusing to write a row for '{}': its file type was never established",
+                display_path(&entry.path)
+            )))
+        })?;
+
         // Prefer the walker-supplied parent_path; recompute zero-copy
         // from the path bytes when it's None (the common case — the
         // walker deliberately skips the per-entry clone).
@@ -167,8 +179,7 @@ impl RowBuilder {
             None => self.b_extension.append_null(),
         }
         self.b_inode.append_value(entry.inode);
-        self.b_file_type
-            .append_value(file_type_string(entry.entry_type as u8));
+        self.b_file_type.append_value(file_type);
         self.b_size.append_value(entry.size);
         self.b_alloc_blocks.append_value(entry.blocks);
         self.b_nlink.append_value(entry.nlink.unwrap_or(1) as u32);
@@ -202,6 +213,7 @@ impl RowBuilder {
         self.b_fsid.append_option(entry.fsid);
 
         self.rows += 1;
+        Ok(())
     }
 
     /// Move the column builders into a `RecordBatch` and replace them
@@ -284,6 +296,7 @@ impl RowBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nfs::types::EntryType;
 
     #[test]
     fn pack_micros_combines_seconds_and_nanos() {
@@ -327,7 +340,8 @@ mod tests {
                 name: format!("file-{i}").into_bytes(),
                 inode: i,
                 ..DbEntry::default()
-            });
+            })
+            .unwrap();
         }
         assert_eq!(rb.row_count(), 3);
         let batch = rb.finish().unwrap();
@@ -338,7 +352,8 @@ mod tests {
             path: b"/a/b".to_vec(),
             name: b"b".to_vec(),
             ..DbEntry::default()
-        });
+        })
+        .unwrap();
         assert_eq!(rb.finish().unwrap().num_rows(), 1);
     }
 
@@ -350,7 +365,8 @@ mod tests {
             name: b"file.txt".to_vec(),
             parent_path: None,
             ..DbEntry::default()
-        });
+        })
+        .unwrap();
         let batch = rb.finish().unwrap();
         let parents = batch
             .column_by_name("parent_path")
@@ -368,7 +384,8 @@ mod tests {
             path: b"/data/bad-\xff.txt".to_vec(),
             name: b"bad-\xff.txt".to_vec(),
             ..DbEntry::default()
-        });
+        })
+        .unwrap();
         let batch = rb.finish().unwrap();
         let paths = batch
             .column_by_name("path_bytes")
@@ -396,13 +413,15 @@ mod tests {
             name: b"a".to_vec(),
             fsid: Some(17),
             ..DbEntry::default()
-        });
+        })
+        .unwrap();
         rb.push_db_entry(&DbEntry {
             path: b"/data/b".to_vec(),
             name: b"b".to_vec(),
             fsid: None,
             ..DbEntry::default()
-        });
+        })
+        .unwrap();
         let batch = rb.finish().unwrap();
         let fsids = batch
             .column_by_name("fsid")
@@ -412,5 +431,111 @@ mod tests {
             .unwrap();
         assert_eq!(fsids.value(0), 17);
         assert!(fsids.is_null(1));
+    }
+
+    fn typed(entry_type: EntryType, name: &[u8]) -> DbEntry {
+        DbEntry {
+            path: [b"/t/".as_slice(), name].concat(),
+            name: name.to_vec(),
+            entry_type,
+            ..DbEntry::default()
+        }
+    }
+
+    /// All seven types survive into the shard with their exact strings:
+    /// built by `RowBuilder`, written as Parquet, and decoded again.
+    #[test]
+    fn all_seven_file_types_round_trip_through_parquet() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::arrow::ArrowWriter;
+
+        let expected = [
+            (EntryType::File, "file"),
+            (EntryType::Directory, "directory"),
+            (EntryType::Symlink, "symlink"),
+            (EntryType::Fifo, "fifo"),
+            (EntryType::Socket, "socket"),
+            (EntryType::BlockDevice, "block_device"),
+            (EntryType::CharDevice, "char_device"),
+        ];
+
+        let mut rb = RowBuilder::new(RowContext::default(), 8);
+        for (entry_type, name) in expected {
+            rb.push_db_entry(&typed(entry_type, name.as_bytes()))
+                .unwrap();
+        }
+        let batch = rb.finish().unwrap();
+
+        let file = tempfile::tempfile().unwrap();
+        let mut writer =
+            ArrowWriter::try_new(file.try_clone().unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut decoded = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let names = batch
+                .column_by_name("filename")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap()
+                .clone();
+            let types = batch
+                .column_by_name("file_type")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap()
+                .clone();
+            for i in 0..batch.num_rows() {
+                decoded.push((names.value(i).to_string(), types.value(i).to_string()));
+            }
+        }
+        let want: Vec<(String, String)> = expected
+            .iter()
+            .map(|(_, name)| (name.to_string(), name.to_string()))
+            .collect();
+        assert_eq!(decoded, want);
+    }
+
+    /// `Unknown` never becomes a row, and the refused row leaves the
+    /// builder's columns aligned for the rows around it.
+    #[test]
+    fn unknown_type_is_refused_and_writes_nothing() {
+        use arrow::array::Array;
+
+        let mut rb = RowBuilder::new(RowContext::default(), 4);
+        rb.push_db_entry(&typed(EntryType::File, b"before"))
+            .unwrap();
+
+        let err = rb
+            .push_db_entry(&typed(EntryType::Unknown, b"bad-\xff"))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("file type was never established"), "{msg}");
+        assert!(msg.contains(r"/t/bad-\xff"), "{msg}");
+        assert_eq!(rb.row_count(), 1, "the refused entry is not counted");
+
+        rb.push_db_entry(&typed(EntryType::Fifo, b"after")).unwrap();
+        let batch = rb.finish().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let types = batch
+            .column_by_name("file_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(types.value(0), "file");
+        assert_eq!(types.value(1), "fifo");
+        assert!(
+            (0..types.len()).all(|i| types.value(i) != "unknown"),
+            "the string `unknown` is never written"
+        );
     }
 }

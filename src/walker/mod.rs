@@ -6,6 +6,7 @@
 //!
 //! See `docs/ARCHITECTURE.md` for the full architecture diagram.
 
+pub(crate) mod resolve;
 pub mod retry;
 pub mod sharding;
 pub mod simple;

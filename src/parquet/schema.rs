@@ -58,22 +58,6 @@ pub fn parquet_schema_ref() -> Arc<Schema> {
     Arc::new(parquet_schema())
 }
 
-/// Convert entry_type u8 (see `EntryType`'s repr values) to a
-/// human-readable string. Every variant gets its own name so DuckDB
-/// users can distinguish device nodes, FIFOs, and sockets.
-pub fn file_type_string(entry_type: u8) -> &'static str {
-    match entry_type {
-        0 => "file",
-        1 => "directory",
-        2 => "symlink",
-        3 => "block_device",
-        4 => "char_device",
-        5 => "fifo",
-        6 => "socket",
-        _ => "unknown",
-    }
-}
-
 /// Extract the parent path from a full path.
 ///
 /// Returns "/" for root-level entries, and the portion before the last '/' otherwise.
@@ -168,18 +152,6 @@ mod tests {
                 name, is_nullable, expected
             );
         }
-    }
-
-    #[test]
-    fn test_file_type_string() {
-        assert_eq!(file_type_string(0), "file");
-        assert_eq!(file_type_string(1), "directory");
-        assert_eq!(file_type_string(2), "symlink");
-        assert_eq!(file_type_string(3), "block_device");
-        assert_eq!(file_type_string(4), "char_device");
-        assert_eq!(file_type_string(5), "fifo");
-        assert_eq!(file_type_string(6), "socket");
-        assert_eq!(file_type_string(255), "unknown");
     }
 
     #[test]

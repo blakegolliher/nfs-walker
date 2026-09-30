@@ -10,7 +10,7 @@
 
 use crate::config::NfsUrl;
 use crate::error::{NfsError, NfsResult};
-use crate::nfs::types::{display_path, EntryType, NfsDirEntry, NfsStat};
+use crate::nfs::types::{display_path, EntryAttrs, EntryType, LookupReply, NfsDirEntry, NfsStat};
 use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::ptr;
@@ -120,6 +120,43 @@ pub(crate) fn nfs3_status_to_nfs_error(status: i32, path: &[u8]) -> NfsError {
         _ => NfsError::ReadDirFailed {
             path,
             reason: nfs3_status_to_string(status),
+        },
+    }
+}
+
+/// Like [`nfs3_status_to_nfs_error`], for a GETATTR or LOOKUP of one
+/// entry: the typed variants are the same, everything else is an
+/// `AttrFailed` naming the operation.
+fn nfs3_status_to_attr_error(op: &str, status: i32, path: &[u8]) -> NfsError {
+    match nfs3_status_to_nfs_error(status, path) {
+        NfsError::ReadDirFailed { path, reason } => NfsError::AttrFailed {
+            path,
+            reason: format!("{op}: {reason}"),
+        },
+        typed => typed,
+    }
+}
+
+/// Decode NFSv3 `fattr3` into the walker's type and stat.
+fn attrs_from_fattr3(attrs: &ffi::fattr3) -> EntryAttrs {
+    EntryAttrs {
+        entry_type: EntryType::from_nfs3(attrs.type_),
+        nfs_type: attrs.type_,
+        stat: NfsStat {
+            size: attrs.size,
+            inode: attrs.fileid,
+            fsid: attrs.fsid,
+            nlink: attrs.nlink as u64,
+            uid: attrs.uid,
+            gid: attrs.gid,
+            mode: attrs.mode,
+            mtime_sec: Some(attrs.mtime.seconds as i64),
+            mtime_nsec: Some(attrs.mtime.nseconds as i32),
+            atime_sec: Some(attrs.atime.seconds as i64),
+            atime_nsec: Some(attrs.atime.nseconds as i32),
+            ctime_sec: Some(attrs.ctime.seconds as i64),
+            ctime_nsec: Some(attrs.ctime.nseconds as i32),
+            blocks: attrs.used.div_ceil(512), // Convert used bytes to 512-byte blocks
         },
     }
 }
@@ -313,6 +350,7 @@ impl NfsConnection {
                 status: 0,
                 fh_len: 0,
                 fh_data: [0; 128],
+                attrs: None,
             };
             let cb_ptr: *mut LookupCallbackData = &mut cb_data;
 
@@ -381,7 +419,9 @@ impl NfsConnection {
     /// causes O(n²) LOOKUP RPCs.
     ///
     /// The callback receives chunks of NfsDirEntry which include file handles
-    /// for subdirectories, enabling recursive cached access.
+    /// for subdirectories, enabling recursive cached access. It runs
+    /// between pages, with no RPC of this function in flight, so it may
+    /// issue synchronous RPCs on this connection.
     pub fn readdir_plus_by_fh<F>(
         &self,
         file_handle: &[u8],
@@ -415,6 +455,18 @@ impl NfsConnection {
         let mut cookieverf: [i8; 8] = [0; 8];
 
         loop {
+            // The callback may issue RPCs of its own (GETATTR or LOOKUP
+            // for an entry that came back without attributes), and one
+            // of those timing out poisons the connection. Never submit
+            // or service another page on it: that could fire the
+            // timed-out PDU's callback into a dead stack frame.
+            if !self.mounted.get() {
+                return Err(NfsError::ReadDirFailed {
+                    path: "(by file handle)".into(),
+                    reason: "connection poisoned (not mounted)".into(),
+                });
+            }
+
             let mut cb_data = ReaddirplusFullData {
                 completed: Cell::new(false),
                 status: 0,
@@ -763,6 +815,148 @@ impl NfsConnection {
         self.lookup_path_internal(rpc, &root_fh.1[..root_fh.0], path)
     }
 
+    /// The RPC context for one GETATTR or LOOKUP of `path`.
+    fn rpc_for_attr_op(&self, path: &[u8]) -> NfsResult<*mut ffi::rpc_context> {
+        if !self.mounted.get() {
+            return Err(NfsError::AttrFailed {
+                path: display_path(path).into_owned(),
+                reason: "Not mounted".into(),
+            });
+        }
+        let rpc = unsafe { ffi::nfs_get_rpc_context(self.context) };
+        if rpc.is_null() {
+            return Err(NfsError::AttrFailed {
+                path: display_path(path).into_owned(),
+                reason: "Failed to get RPC context".into(),
+            });
+        }
+        Ok(rpc)
+    }
+
+    /// GETATTR by file handle: the type and attributes of one object.
+    ///
+    /// Used for a READDIRPLUS entry the server returned without
+    /// attributes. `path` only names the object in errors. Synchronous,
+    /// and like [`Self::resolve_path_to_fh`] safe to call while
+    /// pipelined READDIRPLUS slots are in flight on this context: every
+    /// PDU has its own callback data, and nothing is drained here.
+    pub fn getattr_by_fh(&self, file_handle: &[u8], path: &[u8]) -> NfsResult<EntryAttrs> {
+        let rpc = self.rpc_for_attr_op(path)?;
+
+        let mut cb_data = GetattrCallbackData {
+            completed: Cell::new(false),
+            status: 0,
+            attrs: None,
+        };
+        let cb_ptr: *mut GetattrCallbackData = &mut cb_data;
+
+        let mut args: ffi::GETATTR3args = unsafe { std::mem::zeroed() };
+        args.object.data.data_len = file_handle.len() as u32;
+        args.object.data.data_val = file_handle.as_ptr() as *mut i8;
+
+        let pdu = unsafe {
+            ffi::rpc_nfs3_getattr_task(
+                rpc,
+                Some(getattr_callback),
+                &mut args,
+                cb_ptr as *mut std::ffi::c_void,
+            )
+        };
+        if pdu.is_null() {
+            return Err(NfsError::AttrFailed {
+                path: display_path(path).into_owned(),
+                reason: "Failed to queue GETATTR".into(),
+            });
+        }
+
+        let completed = unsafe { std::ptr::addr_of!((*cb_ptr).completed) };
+        if let Err(e) = wait_for_rpc_completion(rpc, completed, self.rpc_timeout_ms) {
+            // Same rationale as the LOOKUP path: the timed-out PDU may
+            // still reference this stack frame.
+            self.poison();
+            return Err(NfsError::AttrFailed {
+                path: display_path(path).into_owned(),
+                reason: format!("GETATTR failed: {} (connection poisoned)", e),
+            });
+        }
+
+        if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
+            return Err(nfs3_status_to_attr_error("GETATTR", cb_data.status, path));
+        }
+        cb_data.attrs.ok_or_else(|| NfsError::AttrFailed {
+            path: display_path(path).into_owned(),
+            reason: "GETATTR returned no attributes".into(),
+        })
+    }
+
+    /// LOOKUP one name in a directory, by the directory's file handle
+    /// and the raw name bytes.
+    ///
+    /// Used for a READDIRPLUS entry the server returned without a file
+    /// handle. `path` only names the object in errors. The reply's
+    /// attributes are optional in the protocol; the caller follows up
+    /// with [`Self::getattr_by_fh`] when they are absent.
+    pub fn lookup_name(&self, dir_fh: &[u8], name: &[u8], path: &[u8]) -> NfsResult<LookupReply> {
+        let rpc = self.rpc_for_attr_op(path)?;
+
+        let name_cstr = CString::new(name).map_err(|_| NfsError::AttrFailed {
+            path: display_path(path).into_owned(),
+            reason: "LOOKUP name contains a NUL byte".into(),
+        })?;
+
+        let mut cb_data = LookupCallbackData {
+            completed: Cell::new(false),
+            status: 0,
+            fh_len: 0,
+            fh_data: [0; 128],
+            attrs: None,
+        };
+        let cb_ptr: *mut LookupCallbackData = &mut cb_data;
+
+        let mut args: ffi::LOOKUP3args = unsafe { std::mem::zeroed() };
+        args.what.dir.data.data_len = dir_fh.len() as u32;
+        args.what.dir.data.data_val = dir_fh.as_ptr() as *mut i8;
+        args.what.name = name_cstr.as_ptr() as *mut i8;
+
+        let pdu = unsafe {
+            ffi::rpc_nfs3_lookup_task(
+                rpc,
+                Some(lookup_callback),
+                &mut args,
+                cb_ptr as *mut std::ffi::c_void,
+            )
+        };
+        if pdu.is_null() {
+            return Err(NfsError::AttrFailed {
+                path: display_path(path).into_owned(),
+                reason: "Failed to queue LOOKUP".into(),
+            });
+        }
+
+        let completed = unsafe { std::ptr::addr_of!((*cb_ptr).completed) };
+        if let Err(e) = wait_for_rpc_completion(rpc, completed, self.rpc_timeout_ms) {
+            self.poison();
+            return Err(NfsError::AttrFailed {
+                path: display_path(path).into_owned(),
+                reason: format!("LOOKUP failed: {} (connection poisoned)", e),
+            });
+        }
+
+        if cb_data.status != ffi::RPC_STATUS_SUCCESS as i32 {
+            return Err(nfs3_status_to_attr_error("LOOKUP", cb_data.status, path));
+        }
+        if cb_data.fh_len == 0 {
+            return Err(NfsError::AttrFailed {
+                path: display_path(path).into_owned(),
+                reason: "LOOKUP returned an empty handle".into(),
+            });
+        }
+        Ok(LookupReply {
+            file_handle: cb_data.fh_data[..cb_data.fh_len].to_vec(),
+            attrs: cb_data.attrs,
+        })
+    }
+
     /// Get the current error message from libnfs
     fn get_error(&self) -> String {
         let err_ptr = unsafe { ffi::nfs_get_error(self.context) };
@@ -823,6 +1017,8 @@ struct LookupCallbackData {
     status: i32,
     fh_len: usize,
     fh_data: [u8; 128], // NFS3 max file handle is 64 bytes, but use 128 for safety
+    /// The looked-up object's attributes, when the server sent them.
+    attrs: Option<EntryAttrs>,
 }
 
 /// Callback for LOOKUP RPC
@@ -840,7 +1036,8 @@ unsafe extern "C" fn lookup_callback(
         let res = &*(data as *const ffi::LOOKUP3res);
         if res.status == 0 {
             // NFS3_OK
-            let fh = &res.LOOKUP3res_u.resok.object;
+            let resok = &res.LOOKUP3res_u.resok;
+            let fh = &resok.object;
             let len = fh.data.data_len as usize;
             if len <= cb_data.fh_data.len() {
                 cb_data.fh_len = len;
@@ -850,6 +1047,66 @@ unsafe extern "C" fn lookup_callback(
                     len,
                 );
             }
+            if resok.obj_attributes.attributes_follow != 0 {
+                cb_data.attrs = Some(attrs_from_fattr3(
+                    &resok.obj_attributes.post_op_attr_u.attributes,
+                ));
+            }
+        } else {
+            cb_data.status = -(res.status as i32);
+        }
+    }
+}
+
+/// `GETATTR3res` from libnfs-raw-nfs.h. The generated bindings stop at
+/// `GETATTR3args`: the raw RPC API hands every result back as a
+/// `void *`, so bindgen never reaches the result types. The layout is
+/// the C one: a status, then a union whose only arm holds the `fattr3`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct Getattr3Resok {
+    obj_attributes: ffi::fattr3,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+union Getattr3ResU {
+    resok: Getattr3Resok,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct Getattr3Res {
+    status: ffi::nfsstat3,
+    res_u: Getattr3ResU,
+}
+
+/// Context passed to the GETATTR callback.
+struct GetattrCallbackData {
+    /// See `LookupCallbackData::completed` for why this is a `Cell`.
+    completed: Cell<bool>,
+    status: i32,
+    attrs: Option<EntryAttrs>,
+}
+
+/// Callback for GETATTR RPC
+unsafe extern "C" fn getattr_callback(
+    _rpc: *mut ffi::rpc_context,
+    status: ::std::os::raw::c_int,
+    data: *mut ::std::os::raw::c_void,
+    private_data: *mut ::std::os::raw::c_void,
+) {
+    let cb_data = &mut *(private_data as *mut GetattrCallbackData);
+    cb_data.completed.set(true);
+    cb_data.status = status;
+
+    if status == ffi::RPC_STATUS_SUCCESS as i32 {
+        // Copied out rather than referenced: `fattr3` holds u64 fields,
+        // and nothing promises libnfs decoded the result 8-byte aligned.
+        let res = std::ptr::read_unaligned(data as *const Getattr3Res);
+        if res.status == 0 {
+            // NFS3_OK
+            cb_data.attrs = Some(attrs_from_fattr3(&res.res_u.resok.obj_attributes));
         } else {
             cb_data.status = -(res.status as i32);
         }
@@ -945,6 +1202,32 @@ impl InflightReaddir {
     }
 }
 
+#[cfg(test)]
+impl InflightReaddir {
+    /// A slot in the state the libnfs callback leaves it in, built
+    /// without libnfs: tests drive the pipelined worker loop with these.
+    pub(crate) fn completed(
+        entries: Vec<NfsDirEntry>,
+        eof: bool,
+        cookie: u64,
+        status: i32,
+        tag: u64,
+    ) -> Self {
+        InflightReaddir {
+            cb_data: Box::new(ReaddirplusFullData {
+                completed: Cell::new(true),
+                status,
+                eof,
+                cookie,
+                cookieverf: [0i8; 8],
+                entries,
+            }),
+            tag,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
 /// Callback for READDIRPLUS RPC (full entry collection with file handles)
 ///
 /// This callback extracts complete NfsDirEntry structs including file handles
@@ -992,36 +1275,12 @@ unsafe extern "C" fn readdirplus_full_callback(
 
                 // Skip . and ..
                 if name != b"." && name != b".." {
-                    // Extract file type and attributes
+                    // Extract file type and attributes. The protocol
+                    // lets the server omit them; the walker then fetches
+                    // them before it classifies the entry.
                     let (entry_type, stat) = if entry.name_attributes.attributes_follow != 0 {
-                        let attrs = &entry.name_attributes.post_op_attr_u.attributes;
-                        let et = match attrs.type_ {
-                            1 => EntryType::File,        // NF3REG
-                            2 => EntryType::Directory,   // NF3DIR
-                            5 => EntryType::Symlink,     // NF3LNK
-                            3 => EntryType::BlockDevice, // NF3BLK
-                            4 => EntryType::CharDevice,  // NF3CHR
-                            6 => EntryType::Socket,      // NF3SOCK
-                            7 => EntryType::Fifo,        // NF3FIFO
-                            _ => EntryType::Unknown,
-                        };
-                        let s = NfsStat {
-                            size: attrs.size,
-                            inode: attrs.fileid,
-                            fsid: attrs.fsid,
-                            nlink: attrs.nlink as u64,
-                            uid: attrs.uid,
-                            gid: attrs.gid,
-                            mode: attrs.mode,
-                            mtime_sec: Some(attrs.mtime.seconds as i64),
-                            mtime_nsec: Some(attrs.mtime.nseconds as i32),
-                            atime_sec: Some(attrs.atime.seconds as i64),
-                            atime_nsec: Some(attrs.atime.nseconds as i32),
-                            ctime_sec: Some(attrs.ctime.seconds as i64),
-                            ctime_nsec: Some(attrs.ctime.nseconds as i32),
-                            blocks: attrs.used.div_ceil(512), // Convert used bytes to 512-byte blocks
-                        };
-                        (et, Some(s))
+                        let a = attrs_from_fattr3(&entry.name_attributes.post_op_attr_u.attributes);
+                        (a.entry_type, Some(a.stat))
                     } else {
                         (EntryType::Unknown, None)
                     };
@@ -1409,18 +1668,7 @@ mod tests {
                 file_handle: None,
             })
             .collect();
-        InflightReaddir {
-            cb_data: Box::new(ReaddirplusFullData {
-                completed: Cell::new(true),
-                status,
-                eof,
-                cookie,
-                cookieverf: [0i8; 8],
-                entries,
-            }),
-            tag: 0xDEAD_BEEF,
-            _not_send: std::marker::PhantomData,
-        }
+        InflightReaddir::completed(entries, eof, cookie, status, 0xDEAD_BEEF)
     }
 
     #[test]
@@ -1579,5 +1827,99 @@ mod tests {
             }
         }
         eprintln!("walked {total} entries in {iters} pages");
+    }
+
+    /// `Getattr3Res` is written by hand (see its definition). These are
+    /// the numbers the C compiler gives `GETATTR3res` in
+    /// libnfs-raw-nfs.h, and `post_op_attr` from the generated bindings
+    /// has the same shape: a 32-bit word, then a union holding `fattr3`.
+    #[test]
+    fn getattr3res_matches_the_c_layout() {
+        assert_eq!(std::mem::size_of::<ffi::fattr3>(), 88);
+        assert_eq!(std::mem::size_of::<Getattr3Res>(), 96);
+        assert_eq!(std::mem::align_of::<Getattr3Res>(), 8);
+        assert_eq!(std::mem::offset_of!(Getattr3Res, res_u), 8);
+        assert_eq!(
+            std::mem::size_of::<Getattr3Res>(),
+            std::mem::size_of::<ffi::post_op_attr>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(Getattr3Res, res_u),
+            std::mem::offset_of!(ffi::post_op_attr, post_op_attr_u)
+        );
+    }
+
+    /// GETATTR and LOOKUP must describe an object exactly as READDIRPLUS
+    /// does: they stand in for it when the server leaves attributes out.
+    #[test]
+    #[ignore = "requires NFS_TEST_URL=nfs://host/export"]
+    fn getattr_and_lookup_agree_with_readdirplus() {
+        let nfs = match connect_test_nfs() {
+            Some(n) => n,
+            None => {
+                eprintln!("skip: NFS_TEST_URL not set or unreachable");
+                return;
+            }
+        };
+
+        let dir = std::env::var("NFS_TEST_DIR").unwrap_or_else(|_| "/".into());
+        let dir_fh = nfs
+            .resolve_path_to_fh(dir.as_bytes())
+            .expect("resolve test dir");
+
+        let mut listed = Vec::new();
+        nfs.readdir_plus_by_fh(&dir_fh, 1000, |chunk| {
+            listed.extend(chunk);
+            listed.len() < 200
+        })
+        .expect("READDIRPLUS");
+        assert!(!listed.is_empty(), "the test directory has no entries");
+
+        let mut compared = 0usize;
+        for entry in listed.iter().take(200) {
+            let (Some(stat), Some(fh)) = (&entry.stat, &entry.file_handle) else {
+                continue;
+            };
+            let path = [dir.as_bytes(), b"/", entry.name.as_slice()].concat();
+
+            let got = nfs.getattr_by_fh(fh, &path).expect("GETATTR");
+            assert_eq!(got.entry_type, entry.entry_type, "{}", display_path(&path));
+            assert_eq!(got.stat.inode, stat.inode, "{}", display_path(&path));
+            assert_eq!(got.stat.fsid, stat.fsid, "{}", display_path(&path));
+            assert_eq!(got.stat.mode, stat.mode, "{}", display_path(&path));
+            assert_eq!(got.stat.uid, stat.uid, "{}", display_path(&path));
+            assert_eq!(got.stat.gid, stat.gid, "{}", display_path(&path));
+            assert_eq!(got.stat.nlink, stat.nlink, "{}", display_path(&path));
+
+            let looked = nfs
+                .lookup_name(&dir_fh, &entry.name, &path)
+                .expect("LOOKUP");
+            let by_lookup = nfs
+                .getattr_by_fh(&looked.file_handle, &path)
+                .expect("GETATTR on the looked-up handle");
+            assert_eq!(by_lookup.stat.inode, stat.inode, "{}", display_path(&path));
+            assert_eq!(by_lookup.entry_type, entry.entry_type);
+            if let Some(attrs) = looked.attrs {
+                assert_eq!(attrs.entry_type, entry.entry_type);
+                assert_eq!(attrs.stat.inode, stat.inode);
+                assert_eq!(attrs.stat.fsid, stat.fsid);
+            }
+            compared += 1;
+        }
+        assert!(
+            compared > 0,
+            "no entry came back with attributes and a handle"
+        );
+
+        let missing = b"nfs-walker-test-no-such-name";
+        let err = nfs
+            .lookup_name(&dir_fh, missing, missing)
+            .expect_err("LOOKUP of a name that does not exist");
+        assert_eq!(
+            err.failure_kind(),
+            crate::error::FailureKind::NotFound,
+            "{err}"
+        );
+        eprintln!("compared {compared} entries");
     }
 }

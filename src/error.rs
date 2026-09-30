@@ -33,25 +33,50 @@ pub enum WalkerError {
     Io(#[from] std::io::Error),
 
     /// The scan ran to the end but at least one directory could not
-    /// be read after the retry policy was exhausted. The Parquet
-    /// output on disk is intact for diagnosis but is **not** a complete
-    /// index of the tree: consumers must not treat it as one.
+    /// be read, or one entry's type could not be established, after the
+    /// retry policy was exhausted. The Parquet output on disk is intact
+    /// for diagnosis but is **not** a complete index of the tree:
+    /// consumers must not treat it as one.
     /// `failures` is a bounded sample; `failure_log` has every record.
-    #[error(
-        "scan incomplete: {} director{} could not be read ({} vanished during the scan){}",
-        stats.errors,
-        if stats.errors == 1 { "y" } else { "ies" },
-        stats.vanished,
-        failure_log
+    #[error("scan incomplete: {}{}", incomplete_reason(stats), failure_log
             .as_ref()
             .map(|p| format!("; see {}", p.display()))
             .unwrap_or_default()
     )]
     ScanIncomplete {
-        stats: crate::walker::WalkStats,
+        /// Boxed to keep `WalkerError` small: it travels through every
+        /// `Result` in the crate.
+        stats: Box<crate::walker::WalkStats>,
         failures: Vec<DirFailure>,
         failure_log: Option<PathBuf>,
     },
+}
+
+/// What an incomplete scan is missing, for its error message and the
+/// CLI summary: unreadable directories, entries without a type, and how
+/// many directories and entries vanished along the way.
+pub fn incomplete_reason(stats: &crate::walker::WalkStats) -> String {
+    let plural = |n: u64, one: &'static str, many: &'static str| if n == 1 { one } else { many };
+    let dirs = stats.errors.saturating_sub(stats.unresolved_entries);
+    let entries = stats.unresolved_entries;
+    let mut parts = Vec::new();
+    if dirs > 0 || entries == 0 {
+        parts.push(format!(
+            "{dirs} director{} could not be read",
+            plural(dirs, "y", "ies")
+        ));
+    }
+    if entries > 0 {
+        parts.push(format!(
+            "the type of {entries} entr{} could not be established",
+            plural(entries, "y", "ies")
+        ));
+    }
+    format!(
+        "{} ({} vanished during the scan)",
+        parts.join(" and "),
+        stats.vanished
+    )
 }
 
 /// Why a directory could not be read. Drives the retry policy
@@ -102,7 +127,8 @@ impl std::fmt::Display for FailureKind {
     }
 }
 
-/// One directory the scan could not read.
+/// One directory the scan could not read, or one entry whose type it
+/// could not establish.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DirFailure {
     pub path: String,
@@ -140,6 +166,10 @@ pub enum NfsError {
     #[error("Failed to read directory '{path}': {reason}")]
     ReadDirFailed { path: String, reason: String },
 
+    /// GETATTR or LOOKUP for one entry failed
+    #[error("Failed to get attributes of '{path}': {reason}")]
+    AttrFailed { path: String, reason: String },
+
     /// Permission denied
     #[error("Permission denied: '{path}'")]
     PermissionDenied { path: String },
@@ -163,7 +193,9 @@ impl NfsError {
             NfsError::ConnectionFailed { .. }
             | NfsError::MountFailed { .. }
             | NfsError::InitFailed(_) => FailureKind::Connection,
-            NfsError::ReadDirFailed { reason, .. } => classify_reason(reason),
+            NfsError::ReadDirFailed { reason, .. } | NfsError::AttrFailed { reason, .. } => {
+                classify_reason(reason)
+            }
             NfsError::InvalidUrl { .. } => FailureKind::Other,
         }
     }
@@ -195,6 +227,8 @@ fn classify_reason(reason: &str) -> FailureKind {
         || r.contains("RPC context")
         || r.contains("Failed to queue")
         || r.contains("READDIRPLUS failed")
+        || r.contains("GETATTR failed")
+        || r.contains("LOOKUP failed")
         || r.contains("Invalid RPC fd")
     {
         FailureKind::Connection
@@ -394,11 +428,11 @@ mod tests {
     #[test]
     fn scan_incomplete_names_counts_and_log() {
         let e = WalkerError::ScanIncomplete {
-            stats: crate::walker::WalkStats {
+            stats: Box::new(crate::walker::WalkStats {
                 errors: 2,
                 vanished: 1,
                 ..Default::default()
-            },
+            }),
             failures: vec![],
             failure_log: Some(PathBuf::from("/w/scans/x/errors.jsonl")),
         };
@@ -406,6 +440,70 @@ mod tests {
         assert!(msg.contains("2 directories could not be read"), "{msg}");
         assert!(msg.contains("1 vanished"), "{msg}");
         assert!(msg.contains("/w/scans/x/errors.jsonl"), "{msg}");
+    }
+
+    #[test]
+    fn scan_incomplete_names_entries_whose_type_is_unknown() {
+        let msg = |errors, unresolved_entries| {
+            WalkerError::ScanIncomplete {
+                stats: Box::new(crate::walker::WalkStats {
+                    errors,
+                    unresolved_entries,
+                    vanished: 3,
+                    ..Default::default()
+                }),
+                failures: vec![],
+                failure_log: None,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            msg(1, 1),
+            "scan incomplete: the type of 1 entry could not be established \
+             (3 vanished during the scan)"
+        );
+        assert_eq!(
+            msg(5, 2),
+            "scan incomplete: 3 directories could not be read and the type of 2 entries \
+             could not be established (3 vanished during the scan)"
+        );
+        assert_eq!(
+            msg(1, 0),
+            "scan incomplete: 1 directory could not be read (3 vanished during the scan)"
+        );
+    }
+
+    /// GETATTR and LOOKUP failures go through the same retry policy as
+    /// a directory read, so they must classify the same way.
+    #[test]
+    fn attr_failures_classify_like_directory_failures() {
+        let k = |reason: &str| {
+            NfsError::AttrFailed {
+                path: "/p".into(),
+                reason: reason.into(),
+            }
+            .failure_kind()
+        };
+        assert_eq!(
+            k("GETATTR: NFS3ERR_JUKEBOX (jukebox/try again later)"),
+            FailureKind::Transient
+        );
+        assert_eq!(k("LOOKUP: NFS3ERR_IO (I/O error)"), FailureKind::Transient);
+        assert_eq!(
+            k("GETATTR: NFS3ERR_BADHANDLE (illegal NFS file handle)"),
+            FailureKind::StaleHandle
+        );
+        assert_eq!(
+            k("GETATTR failed: RPC timeout (connection poisoned)"),
+            FailureKind::ConnectionLost
+        );
+        assert_eq!(k("Failed to queue GETATTR"), FailureKind::Connection);
+        assert_eq!(k("Not mounted"), FailureKind::Connection);
+        assert_eq!(
+            k("LOOKUP: NFS3ERR_NOTDIR (not a directory)"),
+            FailureKind::Protocol
+        );
+        assert_eq!(k("LOOKUP name contains a NUL byte"), FailureKind::Protocol);
     }
 
     #[test]
