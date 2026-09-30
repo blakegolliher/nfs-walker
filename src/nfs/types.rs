@@ -107,6 +107,9 @@ pub struct NfsStat {
     /// Inode number
     pub inode: u64,
 
+    /// Filesystem identifier. Inodes are unique only within this scope.
+    pub fsid: u64,
+
     /// Number of hard links
     pub nlink: u64,
 
@@ -205,6 +208,11 @@ impl NfsDirEntry {
         self.stat.as_ref().map(|s| s.nlink)
     }
 
+    /// Get the filesystem identifier used with inode for hardlink identity.
+    pub fn fsid(&self) -> Option<u64> {
+        self.stat.as_ref().map(|s| s.fsid)
+    }
+
     /// Get blocks (512-byte blocks allocated)
     pub fn blocks(&self) -> u64 {
         self.stat.as_ref().map(|s| s.blocks).unwrap_or(0)
@@ -267,6 +275,9 @@ pub struct DbEntry {
 
     /// Inode number
     pub inode: u64,
+
+    /// Filesystem identifier paired with `inode` for hardlink identity.
+    pub fsid: Option<u64>,
 
     /// Directory depth from root
     pub depth: u32,

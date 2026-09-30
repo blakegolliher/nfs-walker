@@ -114,9 +114,10 @@ See `tasks/parquet-experiment-review.md` for the full bench writeup.
   metadata.json that lies about completeness)
 
 **builder.rs** — shared row builder (`DbEntry` → Arrow columns)
-- 27-column schema, scan_id dictionary-encoded
+- 28-column schema, scan_id dictionary-encoded
 - preserves `path_bytes`, `filename_bytes`, and `parent_path_bytes` as raw
   POSIX bytes while retaining UTF-8 display columns for existing analytics
+- preserves nullable `fsid`, paired with `inode` for hardlink identity
 - derives `parent_path` zero-copy from `path` (the walker never clones
   the parent bytes per entry) and the legacy `*_us` timestamp columns
   from the (sec, nsec) pairs the walker carries

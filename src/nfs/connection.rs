@@ -1008,6 +1008,7 @@ unsafe extern "C" fn readdirplus_full_callback(
                         let s = NfsStat {
                             size: attrs.size,
                             inode: attrs.fileid,
+                            fsid: attrs.fsid,
                             nlink: attrs.nlink as u64,
                             uid: attrs.uid,
                             gid: attrs.gid,
