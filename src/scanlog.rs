@@ -480,7 +480,11 @@ fn emit_text(
         "    write_batch      avg={:>5}us  p99={:>5}us  n={}  queue={}",
         writes.avg_us, writes.p99_us, writes.count, queue_str,
     )?;
-    writeln!(writer, "    output           size={size_h}  errors={}", snap.errors)?;
+    writeln!(
+        writer,
+        "    output           size={size_h}  errors={}",
+        snap.errors
+    )?;
     if !snap.hot_dirs.is_empty() {
         writeln!(writer, "    hot dirs:")?;
         for (worker_id, hd) in &snap.hot_dirs {
@@ -518,8 +522,8 @@ fn emit_json(
         }
         // serde_json escaping, NOT `{:?}` — Rust Debug emits `\u{7f}`
         // style escapes that are invalid JSON.
-        let path_json = serde_json::to_string(&hd.path)
-            .unwrap_or_else(|_| "\"<unencodable>\"".to_string());
+        let path_json =
+            serde_json::to_string(&hd.path).unwrap_or_else(|_| "\"<unencodable>\"".to_string());
         hot_json.push_str(&format!(
             r#"{{"worker":{},"path":{},"age_secs":{},"entries":{}}}"#,
             worker_id,

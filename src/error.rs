@@ -324,29 +324,71 @@ mod tests {
     #[test]
     fn failure_kind_classification() {
         let k = |e: NfsError| e.failure_kind();
-        assert_eq!(k(NfsError::PermissionDenied { path: "/p".into() }), FailureKind::PermissionDenied);
-        assert_eq!(k(NfsError::NotFound { path: "/p".into() }), FailureKind::NotFound);
-        assert_eq!(k(NfsError::StaleHandle { path: "/p".into() }), FailureKind::StaleHandle);
         assert_eq!(
-            k(NfsError::ConnectionFailed { server: "s".into(), reason: "r".into() }),
+            k(NfsError::PermissionDenied { path: "/p".into() }),
+            FailureKind::PermissionDenied
+        );
+        assert_eq!(
+            k(NfsError::NotFound { path: "/p".into() }),
+            FailureKind::NotFound
+        );
+        assert_eq!(
+            k(NfsError::StaleHandle { path: "/p".into() }),
+            FailureKind::StaleHandle
+        );
+        assert_eq!(
+            k(NfsError::ConnectionFailed {
+                server: "s".into(),
+                reason: "r".into()
+            }),
             FailureKind::Connection
         );
-        let rd = |reason: &str| NfsError::ReadDirFailed { path: "/p".into(), reason: reason.into() };
-        assert_eq!(k(rd("NFS3ERR_JUKEBOX (jukebox/try again later)")), FailureKind::Transient);
-        assert_eq!(k(rd("READDIRPLUS failed: RPC timeout")), FailureKind::Timeout);
-        assert_eq!(k(rd("READDIRPLUS failed: poll error")), FailureKind::Connection);
+        let rd = |reason: &str| NfsError::ReadDirFailed {
+            path: "/p".into(),
+            reason: reason.into(),
+        };
+        assert_eq!(
+            k(rd("NFS3ERR_JUKEBOX (jukebox/try again later)")),
+            FailureKind::Transient
+        );
+        assert_eq!(
+            k(rd("READDIRPLUS failed: RPC timeout")),
+            FailureKind::Timeout
+        );
+        assert_eq!(
+            k(rd("READDIRPLUS failed: poll error")),
+            FailureKind::Connection
+        );
         assert_eq!(
             k(rd("READDIRPLUS failed: RPC timeout (connection poisoned)")),
             FailureKind::ConnectionLost,
             "a poisoned connection is never retried"
         );
-        assert_eq!(k(rd("connection poisoned (not mounted)")), FailureKind::ConnectionLost);
-        assert_eq!(k(rd("NFS3ERR_BADHANDLE (illegal NFS file handle)")), FailureKind::StaleHandle);
-        assert_eq!(k(rd("NFS3ERR_NOENT (no such file or directory)")), FailureKind::NotFound);
-        assert_eq!(k(rd("NFS3ERR_NOTDIR (not a directory)")), FailureKind::Protocol);
+        assert_eq!(
+            k(rd("connection poisoned (not mounted)")),
+            FailureKind::ConnectionLost
+        );
+        assert_eq!(
+            k(rd("NFS3ERR_BADHANDLE (illegal NFS file handle)")),
+            FailureKind::StaleHandle
+        );
+        assert_eq!(
+            k(rd("NFS3ERR_NOENT (no such file or directory)")),
+            FailureKind::NotFound
+        );
+        assert_eq!(
+            k(rd("NFS3ERR_NOTDIR (not a directory)")),
+            FailureKind::Protocol
+        );
         assert_eq!(k(rd("NFS3ERR_BADTYPE (bad type)")), FailureKind::Protocol);
-        assert_eq!(FailureKind::PermissionDenied.to_string(), "permission_denied");
-        assert_eq!(serde_json::to_string(&FailureKind::StaleHandle).unwrap(), "\"stale_handle\"");
+        assert_eq!(
+            FailureKind::PermissionDenied.to_string(),
+            "permission_denied"
+        );
+        assert_eq!(
+            serde_json::to_string(&FailureKind::StaleHandle).unwrap(),
+            "\"stale_handle\""
+        );
     }
 
     #[test]

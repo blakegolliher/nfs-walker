@@ -117,9 +117,7 @@ fn scans_json(ctx: &AnalyticsContext) -> serde_json::Value {
     })
 }
 
-async fn list_scans(
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ServerError> {
+async fn list_scans(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ServerError> {
     let ctx = state.context.read().await;
     Ok(Json(scans_json(&ctx)))
 }
@@ -146,7 +144,9 @@ async fn get_scan(
     Path(scan_id): Path<String>,
 ) -> Result<impl IntoResponse, ServerError> {
     let ctx = state.context.read().await;
-    let info = ctx.scans.get(&scan_id)
+    let info = ctx
+        .scans
+        .get(&scan_id)
         .ok_or_else(|| ServerError::ScanNotFound(scan_id.clone()))?;
     Ok(Json(serde_json::json!(info)))
 }
@@ -185,13 +185,8 @@ async fn execute_query(
     Json(body): Json<ExecuteRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
     let ctx = state.context.read().await;
-    let result = executor::execute_query(
-        &ctx,
-        &query_id,
-        &body.params,
-        body.scan_id.as_deref(),
-    )
-    .await?;
+    let result =
+        executor::execute_query(&ctx, &query_id, &body.params, body.scan_id.as_deref()).await?;
     Ok(Json(result))
 }
 
@@ -232,21 +227,17 @@ async fn batch_execute(
                 .await
                 .expect("batch semaphore closed");
             let ctx = context.read().await;
-            let result = executor::execute_query(
-                &ctx,
-                &item.query_id,
-                &item.params,
-                scan_id.as_deref(),
-            )
-            .await;
+            let result =
+                executor::execute_query(&ctx, &item.query_id, &item.params, scan_id.as_deref())
+                    .await;
             (idx, item.query_id, result)
         });
     }
 
     let mut results = vec![serde_json::Value::Null; count];
     while let Some(joined) = join_set.join_next().await {
-        let (idx, query_id, result) = joined
-            .map_err(|e| ServerError::Other(format!("Batch query task failed: {}", e)))?;
+        let (idx, query_id, result) =
+            joined.map_err(|e| ServerError::Other(format!("Batch query task failed: {}", e)))?;
         results[idx] = match result {
             Ok(r) => serde_json::json!({
                 "status": "ok",
@@ -269,11 +260,7 @@ async fn batch_execute(
 // ─── Server startup ──────────────────────────────────────────────
 
 /// Start the analytics server
-pub async fn serve(
-    data_dir: &path::Path,
-    bind: &str,
-    port: u16,
-) -> Result<(), ServerError> {
+pub async fn serve(data_dir: &path::Path, bind: &str, port: u16) -> Result<(), ServerError> {
     eprintln!("Loading scan data from {}...", data_dir.display());
 
     let analytics_ctx = AnalyticsContext::build(data_dir).await?;
@@ -281,7 +268,10 @@ pub async fn serve(
 
     if scan_count == 0 {
         eprintln!("Warning: No scans found in {}/scans/", data_dir.display());
-        eprintln!("Run 'nfs-walker nfs://server/export -o {}' first to populate scan data.", data_dir.display());
+        eprintln!(
+            "Run 'nfs-walker nfs://server/export -o {}' first to populate scan data.",
+            data_dir.display()
+        );
     } else {
         eprintln!("Loaded {} scan(s)", scan_count);
         for info in analytics_ctx.scans.values() {

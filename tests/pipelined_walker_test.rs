@@ -110,15 +110,10 @@ fn pipelined_and_legacy_produce_equal_path_sets() {
 
     // Run baseline (legacy serial worker).
     let baseline_cfg = make_config(url.clone(), baseline_root.clone(), 0);
-    let baseline_stats = SimpleWalker::new(baseline_cfg)
-        .run()
-        .expect("baseline run");
+    let baseline_stats = SimpleWalker::new(baseline_cfg).run().expect("baseline run");
     eprintln!(
         "baseline: dirs={} files={} bytes={} dur={:?}",
-        baseline_stats.dirs,
-        baseline_stats.files,
-        baseline_stats.bytes,
-        baseline_stats.duration
+        baseline_stats.dirs, baseline_stats.files, baseline_stats.bytes, baseline_stats.duration
     );
 
     // Run pipelined.

@@ -415,7 +415,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn nfs_fstat(nfs: *mut nfs_context, nfsfh: *mut nfsfh, st: *mut stat)
-    -> ::core::ffi::c_int;
+        -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
     pub fn nfs_fstat64_async(
@@ -717,7 +717,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn nfs_mkdir(nfs: *mut nfs_context, path: *const ::core::ffi::c_char)
-    -> ::core::ffi::c_int;
+        -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
     pub fn nfs_mkdir2_async(
@@ -745,7 +745,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn nfs_rmdir(nfs: *mut nfs_context, path: *const ::core::ffi::c_char)
-    -> ::core::ffi::c_int;
+        -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
     pub fn nfs_creat_async(
@@ -933,7 +933,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn nfs_chdir(nfs: *mut nfs_context, path: *const ::core::ffi::c_char)
-    -> ::core::ffi::c_int;
+        -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
     pub fn nfs_getcwd(nfs: *mut nfs_context, cwd: *mut *const ::core::ffi::c_char);

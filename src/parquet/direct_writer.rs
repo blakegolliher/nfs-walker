@@ -318,7 +318,11 @@ impl InProgressPart {
     fn new(scan_dir: &Path, shard_idx: usize, part_seq: u32) -> Self {
         let filename = format!("part-r{:02}-{:05}.parquet", shard_idx, part_seq);
         let path = scan_dir.join(&filename);
-        Self { path, filename, committed: false }
+        Self {
+            path,
+            filename,
+            committed: false,
+        }
     }
 
     fn path(&self) -> &Path {
@@ -724,7 +728,14 @@ mod tests {
         pool.senders[0].send(batch).unwrap();
         drop(pool.senders);
 
-        let summary = pool.joins.into_iter().next().unwrap().join().unwrap().unwrap();
+        let summary = pool
+            .joins
+            .into_iter()
+            .next()
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
         assert_eq!(summary.entries_written, 50_000);
         assert!(
             summary.part_files.len() >= 2,
@@ -745,7 +756,10 @@ mod tests {
 
         let metrics = build_metrics(1);
         let result = spawn_direct_parquet_writers(cfg, metrics);
-        assert!(result.is_err(), "must refuse to overwrite existing scan_dir");
+        assert!(
+            result.is_err(),
+            "must refuse to overwrite existing scan_dir"
+        );
     }
 
     #[test]

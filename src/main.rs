@@ -15,7 +15,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use humansize::{format_size, BINARY};
 use nfs_walker::config::{CliArgs, Command, WalkConfig};
-use nfs_walker::progress::{format_elapsed, format_number, print_header, print_summary, ProgressReporter};
+use nfs_walker::progress::{
+    format_elapsed, format_number, print_header, print_summary, ProgressReporter,
+};
 use nfs_walker::walker::{SimpleWalker, WalkStats};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
@@ -34,7 +36,10 @@ fn raise_fd_limit() {
 
     // SAFETY: getrlimit/setrlimit are thread-safe and we pass valid pointers.
     unsafe {
-        let mut current = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) != 0 {
             warn!("Failed to read RLIMIT_NOFILE; FD-related crashes possible on large scans");
             return;
@@ -45,7 +50,10 @@ fn raise_fd_limit() {
             return;
         }
 
-        let new = libc::rlimit { rlim_cur: target, rlim_max: current.rlim_max };
+        let new = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: current.rlim_max,
+        };
         if libc::setrlimit(libc::RLIMIT_NOFILE, &new) != 0 {
             warn!(
                 "Failed to raise RLIMIT_NOFILE soft limit (current={}, hard={}, requested={}). \
@@ -101,8 +109,7 @@ fn run() -> Result<()> {
     }
 
     // Validate and create config for scan
-    let config = WalkConfig::from_args(args.clone())
-        .context("Invalid configuration")?;
+    let config = WalkConfig::from_args(args.clone()).context("Invalid configuration")?;
 
     // Print header
     if config.show_progress {
@@ -111,7 +118,10 @@ fn run() -> Result<()> {
             config.worker_count,
             &config.output_path.display().to_string(),
         );
-        eprintln!("Mode: READDIRPLUS (streaming Parquet, {} shards)", config.writer_shards);
+        eprintln!(
+            "Mode: READDIRPLUS (streaming Parquet, {} shards)",
+            config.writer_shards
+        );
     }
 
     // Save output path before moving config
@@ -142,7 +152,10 @@ fn run() -> Result<()> {
                     stats.errors, stats.vanished
                 );
                 for f in failures.iter().take(20) {
-                    eprintln!("  {:<18} {}  ({}; {} attempts)", f.kind, f.path, f.error, f.attempts);
+                    eprintln!(
+                        "  {:<18} {}  ({}; {} attempts)",
+                        f.kind, f.path, f.error, f.attempts
+                    );
                 }
                 if failures.len() > 20 {
                     eprintln!("  ... {} more", failures.len() - 20);
@@ -177,7 +190,11 @@ fn handle_command(cmd: &Command) -> Result<()> {
     match cmd {
         Command::Stats { scan_dir } => run_stats(scan_dir),
         #[cfg(feature = "server")]
-        Command::Serve { data_dir, port, bind } => run_server(data_dir, bind, *port),
+        Command::Serve {
+            data_dir,
+            port,
+            bind,
+        } => run_server(data_dir, bind, *port),
     }
 }
 
@@ -211,8 +228,7 @@ fn run_stats(scan_dir: &std::path::Path) -> Result<()> {
     let mut max_depth: u16 = 0;
 
     for part in &parts {
-        let file = File::open(part)
-            .with_context(|| format!("opening part {}", part.display()))?;
+        let file = File::open(part).with_context(|| format!("opening part {}", part.display()))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .with_context(|| format!("opening Parquet reader for {}", part.display()))?;
         let schema = builder.parquet_schema();
@@ -225,7 +241,9 @@ fn run_stats(scan_dir: &std::path::Path) -> Result<()> {
                     .columns()
                     .iter()
                     .position(|c| c.name() == *name)
-                    .ok_or_else(|| anyhow::anyhow!("column {} missing from {}", name, part.display()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("column {} missing from {}", name, part.display())
+                    })
             })
             .collect::<Result<_, _>>()?;
         let mask = ProjectionMask::leaves(schema, proj_indices);
@@ -239,19 +257,30 @@ fn run_stats(scan_dir: &std::path::Path) -> Result<()> {
             let ft = batch
                 .column_by_name("file_type")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                .ok_or_else(|| anyhow::anyhow!("file_type column type mismatch in {}", part.display()))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("file_type column type mismatch in {}", part.display())
+                })?;
             let size = batch
                 .column_by_name("size")
                 .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-                .ok_or_else(|| anyhow::anyhow!("size column type mismatch in {}", part.display()))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("size column type mismatch in {}", part.display())
+                })?;
             let blocks = batch
                 .column_by_name("allocated_blocks")
                 .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-                .ok_or_else(|| anyhow::anyhow!("allocated_blocks column type mismatch in {}", part.display()))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "allocated_blocks column type mismatch in {}",
+                        part.display()
+                    )
+                })?;
             let depth = batch
                 .column_by_name("depth")
                 .and_then(|c| c.as_any().downcast_ref::<UInt16Array>())
-                .ok_or_else(|| anyhow::anyhow!("depth column type mismatch in {}", part.display()))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("depth column type mismatch in {}", part.display())
+                })?;
             for i in 0..batch.num_rows() {
                 match ft.value(i) {
                     "file" => {
@@ -279,7 +308,10 @@ fn run_stats(scan_dir: &std::path::Path) -> Result<()> {
     println!("  Directories:    {}", format_number(total_dirs));
     println!("  Symlinks:       {}", format_number(total_symlinks));
     println!("  Total size:     {}", format_size(total_bytes, BINARY));
-    println!("  Allocated:      {}", format_size(total_blocks * 512, BINARY));
+    println!(
+        "  Allocated:      {}",
+        format_size(total_blocks * 512, BINARY)
+    );
     println!("  Max depth:      {}", max_depth);
     println!("  Part files:     {}", parts.len());
     println!();
@@ -339,13 +371,8 @@ fn list_parquet_parts(scan_dir: &std::path::Path) -> Result<Vec<std::path::PathB
 
 /// Start the analytics server
 #[cfg(feature = "server")]
-fn run_server(
-    data_dir: &std::path::Path,
-    bind: &str,
-    port: u16,
-) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()
-        .context("Failed to create tokio runtime")?;
+fn run_server(data_dir: &std::path::Path, bind: &str, port: u16) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
     rt.block_on(nfs_walker::server::serve(data_dir, bind, port))
         .context("Server error")?;
     Ok(())
@@ -430,27 +457,28 @@ fn run_simple_walker(config: WalkConfig) -> Result<WalkStats> {
 
     let result = if let Some(ref p) = progress {
         let p_clone = p.clone();
-        walker.run_with_progress(move |prog| {
-            let bytes_str = format_size(prog.bytes, BINARY);
-            let entries = prog.dirs + prog.files;
-            let elapsed_secs = prog.elapsed.as_secs_f64();
-            let rate = if elapsed_secs > 0.0 {
-                entries as f64 / elapsed_secs
-            } else {
-                0.0
-            };
-            let msg = format!(
-                "Dirs: {} | Files: {} | Entries: {} | Size: {} | {} | {:.0} entries/s",
-                format_number(prog.dirs),
-                format_number(prog.files),
-                format_number(entries),
-                bytes_str,
-                format_elapsed(prog.elapsed),
-                rate,
-            );
-            p_clone.set_status(&msg);
-        })
-        .context("Walk failed")?
+        walker
+            .run_with_progress(move |prog| {
+                let bytes_str = format_size(prog.bytes, BINARY);
+                let entries = prog.dirs + prog.files;
+                let elapsed_secs = prog.elapsed.as_secs_f64();
+                let rate = if elapsed_secs > 0.0 {
+                    entries as f64 / elapsed_secs
+                } else {
+                    0.0
+                };
+                let msg = format!(
+                    "Dirs: {} | Files: {} | Entries: {} | Size: {} | {} | {:.0} entries/s",
+                    format_number(prog.dirs),
+                    format_number(prog.files),
+                    format_number(entries),
+                    bytes_str,
+                    format_elapsed(prog.elapsed),
+                    rate,
+                );
+                p_clone.set_status(&msg);
+            })
+            .context("Walk failed")?
     } else {
         walker.run().context("Walk failed")?
     };
