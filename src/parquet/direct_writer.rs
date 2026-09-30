@@ -398,7 +398,7 @@ fn writer_loop(
         }
 
         for entry in &batch {
-            row_builder.push_db_entry(entry);
+            row_builder.push_db_entry(entry)?;
 
             // Row-group flush by count. Flushing here (inside the
             // per-batch loop) keeps memory bounded on a giant batch

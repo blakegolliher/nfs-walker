@@ -43,6 +43,41 @@ impl EntryType {
     pub fn as_db_int(&self) -> i32 {
         *self as i32
     }
+
+    /// Classify an NFSv3 `ftype3` value. Anything outside the seven
+    /// protocol types is `Unknown`, which is never written to a scan.
+    pub fn from_nfs3(ftype: u32) -> Self {
+        match ftype {
+            1 => EntryType::File,        // NF3REG
+            2 => EntryType::Directory,   // NF3DIR
+            3 => EntryType::BlockDevice, // NF3BLK
+            4 => EntryType::CharDevice,  // NF3CHR
+            5 => EntryType::Symlink,     // NF3LNK
+            6 => EntryType::Socket,      // NF3SOCK
+            7 => EntryType::Fifo,        // NF3FIFO
+            _ => EntryType::Unknown,
+        }
+    }
+
+    /// The stable `file_type` string of the Parquet output, and the
+    /// only place a type is turned into one. Consumers (the mongoose
+    /// rewrite, the dashboard queries) match on these exact values.
+    ///
+    /// `Unknown` has no name: a scan never contains an entry whose
+    /// type could not be established, so the builder rejects it
+    /// rather than write a row that claims to describe something.
+    pub fn file_type_name(self) -> Option<&'static str> {
+        match self {
+            EntryType::File => Some("file"),
+            EntryType::Directory => Some("directory"),
+            EntryType::Symlink => Some("symlink"),
+            EntryType::BlockDevice => Some("block_device"),
+            EntryType::CharDevice => Some("char_device"),
+            EntryType::Fifo => Some("fifo"),
+            EntryType::Socket => Some("socket"),
+            EntryType::Unknown => None,
+        }
+    }
 }
 
 /// Extract a lowercase extension from a UTF-8 filename.
@@ -136,6 +171,26 @@ pub struct NfsStat {
     pub blocks: u64,
 }
 
+/// An object's type and attributes as one NFS reply reported them:
+/// READDIRPLUS entry attributes, a GETATTR, or a LOOKUP's
+/// `obj_attributes`.
+#[derive(Debug, Clone)]
+pub struct EntryAttrs {
+    pub entry_type: EntryType,
+    /// The raw `ftype3` value, kept for the error message when it is
+    /// not one of the seven protocol types.
+    pub nfs_type: u32,
+    pub stat: NfsStat,
+}
+
+/// What a LOOKUP of one name in a directory returned.
+#[derive(Debug, Clone)]
+pub struct LookupReply {
+    pub file_handle: Vec<u8>,
+    /// `obj_attributes` is optional in the protocol.
+    pub attrs: Option<EntryAttrs>,
+}
+
 /// A directory entry returned from readdir operations
 #[derive(Debug, Clone)]
 pub struct NfsDirEntry {
@@ -146,7 +201,9 @@ pub struct NfsDirEntry {
     /// Entry type
     pub entry_type: EntryType,
 
-    /// File statistics (if available from READDIRPLUS)
+    /// File statistics. READDIRPLUS may omit an entry's attributes;
+    /// the walker then fetches them (see `walker::resolve`) before
+    /// the entry is classified, emitted, or descended into.
     pub stat: Option<NfsStat>,
 
     /// Inode number (always available)
@@ -158,6 +215,22 @@ pub struct NfsDirEntry {
 }
 
 impl NfsDirEntry {
+    /// Replace everything READDIRPLUS would have supplied with
+    /// attributes fetched afterwards. The identity (`inode`, and the
+    /// `fsid` inside `stat`) comes from those attributes too, so the
+    /// row describes one object: the one the name refers to now. That
+    /// matters when the name is a mountpoint, where the listing carries
+    /// the mounted-on directory's number and the attributes the root of
+    /// the mounted filesystem.
+    pub fn apply_attrs(&mut self, attrs: EntryAttrs, file_handle: Option<Vec<u8>>) {
+        self.entry_type = attrs.entry_type;
+        self.inode = attrs.stat.inode;
+        self.stat = Some(attrs.stat);
+        if file_handle.is_some() {
+            self.file_handle = file_handle;
+        }
+    }
+
     /// Get file size (0 if stat not available)
     pub fn size(&self) -> u64 {
         self.stat.as_ref().map(|s| s.size).unwrap_or(0)
@@ -318,6 +391,74 @@ mod tests {
     fn display_path_is_stable_and_unambiguous_for_invalid_utf8() {
         assert_eq!(display_path("/d/é.txt".as_bytes()), "/d/é.txt");
         assert_eq!(display_path(b"/d/bad-\xff\\name"), r"/d/bad-\xff\\name");
+    }
+
+    /// The exact `file_type` strings of the Parquet output. The mongoose
+    /// rewrite translates these seven and rejects everything else.
+    #[test]
+    fn file_type_name_is_exact_for_all_seven_types() {
+        let table = [
+            (EntryType::File, "file"),
+            (EntryType::Directory, "directory"),
+            (EntryType::Symlink, "symlink"),
+            (EntryType::BlockDevice, "block_device"),
+            (EntryType::CharDevice, "char_device"),
+            (EntryType::Fifo, "fifo"),
+            (EntryType::Socket, "socket"),
+        ];
+        for (entry_type, name) in table {
+            assert_eq!(entry_type.file_type_name(), Some(name), "{entry_type:?}");
+        }
+        let names: std::collections::BTreeSet<_> = table.iter().map(|(_, n)| *n).collect();
+        assert_eq!(names.len(), 7, "every type has its own name");
+    }
+
+    #[test]
+    fn unknown_type_has_no_file_type_name() {
+        assert_eq!(EntryType::Unknown.file_type_name(), None);
+    }
+
+    #[test]
+    fn from_nfs3_maps_the_seven_protocol_types_and_nothing_else() {
+        assert_eq!(EntryType::from_nfs3(1), EntryType::File);
+        assert_eq!(EntryType::from_nfs3(2), EntryType::Directory);
+        assert_eq!(EntryType::from_nfs3(3), EntryType::BlockDevice);
+        assert_eq!(EntryType::from_nfs3(4), EntryType::CharDevice);
+        assert_eq!(EntryType::from_nfs3(5), EntryType::Symlink);
+        assert_eq!(EntryType::from_nfs3(6), EntryType::Socket);
+        assert_eq!(EntryType::from_nfs3(7), EntryType::Fifo);
+        for other in [0, 8, 255, u32::MAX] {
+            assert_eq!(EntryType::from_nfs3(other), EntryType::Unknown, "{other}");
+        }
+    }
+
+    #[test]
+    fn apply_attrs_takes_identity_from_the_resolved_object() {
+        let mut entry = NfsDirEntry {
+            name: b"mnt".to_vec(),
+            entry_type: EntryType::Unknown,
+            stat: None,
+            inode: 11, // the mounted-on directory, as listed
+            file_handle: None,
+        };
+        entry.apply_attrs(
+            EntryAttrs {
+                entry_type: EntryType::Directory,
+                nfs_type: 2,
+                stat: NfsStat {
+                    inode: 2, // the root of the mounted filesystem
+                    fsid: 99,
+                    mode: 0o755,
+                    ..NfsStat::default()
+                },
+            },
+            Some(vec![7, 7]),
+        );
+        assert_eq!(entry.entry_type, EntryType::Directory);
+        assert_eq!(entry.inode, 2);
+        assert_eq!(entry.fsid(), Some(99));
+        assert_eq!(entry.mode(), Some(0o755));
+        assert_eq!(entry.file_handle.as_deref(), Some(&[7u8, 7][..]));
     }
 
     #[test]

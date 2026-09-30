@@ -76,6 +76,9 @@ See `tasks/parquet-experiment-review.md` for the full bench writeup.
 - `NfsConnection` — manages NFS context lifecycle
 - `NfsConnectionBuilder` — fluent API for connection setup
 - READDIRPLUS support — returns names + attributes in single RPC
+- `getattr_by_fh` / `lookup_name` — GETATTR by handle and LOOKUP of one
+  raw name in a directory, for entries READDIRPLUS returns without
+  attributes (see `walker/resolve.rs`)
 - `resolve_dns` — repeated `host` queries collect rotating A records;
   workers round-robin the pool with a per-VIP failure-count blacklist
   (3 consecutive flakes), implemented in `walker/simple.rs`
@@ -83,7 +86,10 @@ See `tasks/parquet-experiment-review.md` for the full bench writeup.
   resolver caches a single A record from a multi-VIP pool.
 
 **types.rs** — data structures
-- `EntryType` — File, Directory, Symlink, etc.
+- `EntryType` — the seven NFSv3 types. `file_type_name()` is the one
+  place a type becomes the Parquet `file_type` string: `file`,
+  `directory`, `symlink`, `block_device`, `char_device`, `fifo`,
+  `socket`. `Unknown` has no string and is never written
 - `NfsDirEntry` — directory entry with attributes
 - `DbEntry` — writer-side record fed into Arrow builders
 
@@ -97,6 +103,23 @@ See `tasks/parquet-experiment-review.md` for the full bench writeup.
 - Big-directory continuation: any one worker that crosses
   `--big-dir-split-after` hands its continuation cookie back to the
   deque so other workers can resume in parallel
+
+**resolve.rs** — attributes for entries READDIRPLUS returns without them
+- NFSv3 lets a server omit an entry's attributes and file handle; the
+  Linux server does so for every mountpoint. Such an entry has no type,
+  so it is resolved before it is classified, emitted, or descended into:
+  READDIRPLUS attributes when present, else GETATTR on the entry's
+  handle, else LOOKUP of the raw name in the parent (then GETATTR if the
+  reply carries no attributes)
+- Transient errors follow the scan's retry policy, as for a directory
+- An entry confirmed gone by a path LOOKUP is *vanished*: logged, no
+  row, not a failure
+- An entry that stays unresolved is logged to `errors.jsonl`, gets no
+  row, is not descended into, and makes the scan `ScanIncomplete`
+- A resolved row takes every attribute, its inode included, from the
+  reply that resolved it
+- `NfsOps` abstracts the calls the worker loops make so tests can run
+  both loops against a scripted tree
 
 **sharding.rs** — `path_to_shard(path, N) = gxhash(path) % N`
 - Deterministic across processes (seed pinned to 0)
@@ -118,6 +141,8 @@ See `tasks/parquet-experiment-review.md` for the full bench writeup.
 - preserves `path_bytes`, `filename_bytes`, and `parent_path_bytes` as raw
   POSIX bytes while retaining UTF-8 display columns for existing analytics
 - preserves nullable `fsid`, paired with `inode` for hardlink identity
+- returns an error for an entry of `Unknown` type instead of writing a
+  row for it
 - derives `parent_path` zero-copy from `path` (the walker never clones
   the parent bytes per entry) and the legacy `*_us` timestamp columns
   from the (sec, nsec) pairs the walker carries
@@ -191,7 +216,9 @@ READDIR  → get names
 GETATTR  → stat each file (N separate RPCs!)
 ```
 READDIRPLUS returns names AND attributes in one RPC, eliminating
-nearly all of the round-trip cost.
+nearly all of the round-trip cost. The protocol allows a server to leave
+an entry's attributes out; only those entries cost a GETATTR or LOOKUP
+(`walker/resolve.rs`), and the scan summary reports how many there were.
 
 ### Why work-stealing?
 

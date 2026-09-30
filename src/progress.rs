@@ -124,6 +124,23 @@ pub fn print_summary(
     println!();
 }
 
+/// Say how many entries READDIRPLUS returned without attributes, when
+/// any: they cost an extra RPC each, and a server that does it for
+/// many entries is worth knowing about.
+pub fn print_attribute_fallbacks(by_getattr: u64, by_lookup: u64) {
+    if by_getattr + by_lookup == 0 {
+        return;
+    }
+    println!(
+        "  {} {} entries came back from READDIRPLUS without attributes ({} resolved by GETATTR, {} by LOOKUP)",
+        style("Note:").bold(),
+        format_number(by_getattr + by_lookup),
+        format_number(by_getattr),
+        format_number(by_lookup)
+    );
+    println!();
+}
+
 /// Print a header at the start of the walk
 pub fn print_header(url: &str, workers: usize, output: &str) {
     println!();

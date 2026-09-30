@@ -24,6 +24,7 @@ use crate::parquet::direct_writer::{
     spawn_direct_parquet_writers, write_metadata_json as write_direct_metadata_json,
     DirectWriteConfig,
 };
+use crate::walker::resolve::{EntryResolver, NfsOps, ResolveStats};
 use crate::walker::retry::{self, DirError, FailureLog, RetryPolicy};
 use crate::walker::sharding::path_to_shard;
 use crossbeam_channel::Sender;
@@ -160,15 +161,30 @@ pub struct WalkStats {
     pub dirs: u64,
     pub files: u64,
     pub bytes: u64,
-    /// Directories that could not be read after the retry policy was
-    /// exhausted. Any nonzero value makes the scan
+    /// Directories that could not be read, plus entries whose type
+    /// could not be established (`unresolved_entries`), after the retry
+    /// policy was exhausted. Any nonzero value makes the scan
     /// [`WalkerError::ScanIncomplete`]; a caller never sees a
     /// successful `WalkStats` with `errors > 0`.
     pub errors: u64,
     /// Directories that disappeared between their parent's listing and
-    /// their own read (confirmed by LOOKUP). A race on a live tree, not
-    /// a hole: their own entry rows were already emitted.
+    /// their own read, plus entries that disappeared before their
+    /// attributes could be read (`vanished_entries`). Confirmed by
+    /// LOOKUP. A race on a live tree, not a hole.
     pub vanished: u64,
+    /// Entries READDIRPLUS returned without attributes that a GETATTR
+    /// on their file handle resolved.
+    pub resolved_by_getattr: u64,
+    /// Entries READDIRPLUS returned without attributes or a usable
+    /// handle that a LOOKUP resolved. The Linux server lists every
+    /// mountpoint this way.
+    pub resolved_by_lookup: u64,
+    /// The part of `errors` that is entries whose type could not be
+    /// established. They have no row and were not descended into.
+    pub unresolved_entries: u64,
+    /// The part of `vanished` that is entries, which have no row
+    /// (a vanished directory's row was emitted by its parent).
+    pub vanished_entries: u64,
     pub duration: Duration,
     pub completed: bool,
 }
@@ -204,6 +220,7 @@ pub struct SimpleWalker {
     bytes_count: Arc<AtomicU64>,
     errors_count: Arc<AtomicU64>,
     vanished_count: Arc<AtomicU64>,
+    resolve_stats: ResolveStats,
 }
 
 impl SimpleWalker {
@@ -216,6 +233,7 @@ impl SimpleWalker {
             bytes_count: Arc::new(AtomicU64::new(0)),
             errors_count: Arc::new(AtomicU64::new(0)),
             vanished_count: Arc::new(AtomicU64::new(0)),
+            resolve_stats: ResolveStats::default(),
         }
     }
 
@@ -386,12 +404,28 @@ impl SimpleWalker {
                 summaries.iter().map(|s| s.part_files.len()).sum::<usize>()
             );
 
+            let resolved_by_getattr = self.resolve_stats.by_getattr.load(Ordering::Relaxed);
+            let resolved_by_lookup = self.resolve_stats.by_lookup.load(Ordering::Relaxed);
+            if resolved_by_getattr + resolved_by_lookup > 0 {
+                info!(
+                    "READDIRPLUS returned {} entries without attributes: {} resolved by GETATTR, \
+                     {} by LOOKUP",
+                    resolved_by_getattr + resolved_by_lookup,
+                    resolved_by_getattr,
+                    resolved_by_lookup
+                );
+            }
+
             let stats = WalkStats {
                 dirs,
                 files,
                 bytes,
                 errors,
                 vanished,
+                resolved_by_getattr,
+                resolved_by_lookup,
+                unresolved_entries: self.resolve_stats.unresolved.load(Ordering::Relaxed),
+                vanished_entries: self.resolve_stats.vanished.load(Ordering::Relaxed),
                 duration: start.elapsed(),
                 completed: !self.shutdown.load(Ordering::Relaxed),
             };
@@ -399,7 +433,7 @@ impl SimpleWalker {
                 // The part files are intact for diagnosis, but a tree
                 // with unread directories is not an index of the tree.
                 return Err(WalkerError::ScanIncomplete {
-                    stats,
+                    stats: Box::new(stats),
                     failures: failures.samples(),
                     failure_log: failures.path().map(Path::to_path_buf),
                 });
@@ -642,6 +676,7 @@ impl SimpleWalker {
             let errors_count = Arc::clone(&self.errors_count);
             let failures = Arc::clone(&failures);
             let vanished_count = Arc::clone(&self.vanished_count);
+            let resolve_stats = self.resolve_stats.clone();
             let retry_policy = RetryPolicy::from_retries(self.config.retry_count);
             let active_workers = Arc::clone(&active_workers);
             let pending_work = Arc::clone(&pending_work);
@@ -672,6 +707,7 @@ impl SimpleWalker {
                             errors_count,
                             failures,
                             vanished_count,
+                            resolve_stats,
                             retry_policy,
                             active_workers,
                             pending_work,
@@ -699,6 +735,7 @@ impl SimpleWalker {
                             errors_count,
                             failures,
                             vanished_count,
+                            resolve_stats,
                             retry_policy,
                             active_workers,
                             pending_work,
@@ -791,9 +828,9 @@ impl SimpleWalker {
 /// route per-path via `gxhash % shards`. With shards == 1 this collapses
 /// to one batch + one channel — bit-identical to the legacy worker.
 #[allow(clippy::too_many_arguments)]
-fn worker_loop(
+fn worker_loop<N: NfsOps>(
     id: usize,
-    nfs: NfsConnection,
+    nfs: N,
     local: DequeWorker<DirWork>,
     injector: Arc<Injector<DirWork>>,
     stealers: Arc<Vec<Stealer<DirWork>>>,
@@ -805,6 +842,7 @@ fn worker_loop(
     errors_count: Arc<AtomicU64>,
     failures: Arc<FailureLog>,
     vanished_count: Arc<AtomicU64>,
+    resolve_stats: ResolveStats,
     retry_policy: RetryPolicy,
     active_workers: Arc<AtomicUsize>,
     pending_work: Arc<AtomicU64>,
@@ -817,6 +855,15 @@ fn worker_loop(
 ) {
     debug!("Worker {} started", id);
 
+    let resolver = EntryResolver {
+        worker: id,
+        policy: &retry_policy,
+        max_sleep: Duration::MAX,
+        failures: &failures,
+        errors: &errors_count,
+        vanished: &vanished_count,
+        stats: &resolve_stats,
+    };
     let mut sender = ShardedSender::new(entry_txs, batch_size);
     let mut idle_spins = 0;
     // Steal-sweep budget before yielding. Each idle spin scans the
@@ -949,6 +996,11 @@ fn worker_loop(
         // Once any page of this directory has reached the writers a
         // retry would duplicate rows; the retry loop checks this.
         let emitted = std::cell::Cell::new(false);
+        // The handle this directory is being read through: the parent
+        // for a LOOKUP of an entry READDIRPLUS returned without one.
+        // `None` while the directory is read by path; resolved on
+        // first use.
+        let dir_fh = std::cell::RefCell::new(work.file_handle.clone());
         let mut process_entries = |chunk: Vec<crate::nfs::types::NfsDirEntry>| -> bool {
             if !chunk.is_empty() {
                 emitted.set(true);
@@ -956,6 +1008,28 @@ fn worker_loop(
             metrics_for_chunks.record_entries(id, 0, chunk.len() as u64);
             for mut nfs_entry in chunk {
                 let full_path = join_nfs_path(&work.path, &nfs_entry.name);
+
+                // READDIRPLUS may leave out an entry's attributes. Fetch
+                // them before the entry is classified: without a type it
+                // can be neither emitted nor descended into. A path
+                // exclusion applies to every type, so it needs none.
+                if nfs_entry.entry_type == EntryType::Unknown
+                    && (crate::config::excluded_entry_bytes(
+                        &nfs_entry.name,
+                        false,
+                        &full_path,
+                        &exclude,
+                        &[],
+                    ) || !resolver.settle(
+                        &nfs,
+                        &mut nfs_entry,
+                        &full_path,
+                        &work.path,
+                        &dir_fh,
+                    ))
+                {
+                    continue;
+                }
 
                 let is_dir = nfs_entry.entry_type == EntryType::Directory;
 
@@ -1055,7 +1129,13 @@ fn worker_loop(
             work.file_handle.clone(),
             &retry_policy,
             |fh| match fh {
-                Some(fh) => nfs.readdir_plus_by_fh(fh, batch_size, &mut process_entries),
+                Some(fh) => {
+                    // A retry may come with a re-resolved handle.
+                    if dir_fh.borrow().as_deref() != Some(fh) {
+                        *dir_fh.borrow_mut() = Some(fh.to_vec());
+                    }
+                    nfs.readdir_plus_by_fh(fh, batch_size, &mut process_entries)
+                }
                 None => nfs.readdir_plus_with_fh(&work.path, batch_size, &mut process_entries),
             },
             || nfs.resolve_path_to_fh(&work.path),
@@ -1221,9 +1301,9 @@ fn try_get_work(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn worker_loop_pipelined(
+fn worker_loop_pipelined<N: NfsOps>(
     id: usize,
-    nfs: crate::nfs::NfsConnection,
+    nfs: N,
     local: DequeWorker<DirWork>,
     injector: Arc<Injector<DirWork>>,
     stealers: Arc<Vec<Stealer<DirWork>>>,
@@ -1235,6 +1315,7 @@ fn worker_loop_pipelined(
     errors_count: Arc<AtomicU64>,
     failures: Arc<FailureLog>,
     vanished_count: Arc<AtomicU64>,
+    resolve_stats: ResolveStats,
     retry_policy: RetryPolicy,
     active_workers: Arc<AtomicUsize>,
     pending_work: Arc<AtomicU64>,
@@ -1248,6 +1329,17 @@ fn worker_loop_pipelined(
     metrics: Arc<crate::scanlog::ScanMetrics>,
 ) {
     debug!("Worker {} (pipelined depth={}) started", id, pipeline_depth);
+
+    let resolver = EntryResolver {
+        worker: id,
+        policy: &retry_policy,
+        // Short, so the in-flight READDIRPLUS slots stay serviced.
+        max_sleep: Duration::from_millis(250),
+        failures: &failures,
+        errors: &errors_count,
+        vanished: &vanished_count,
+        stats: &resolve_stats,
+    };
 
     // Window the libnfs poll relatively tightly so a worker holding a
     // few slow in-flight slots can still return promptly to refill
@@ -1513,9 +1605,41 @@ fn worker_loop_pipelined(
                 // counts exactly the emittable entries of the page.
                 let entries_in_page = result.entries.len() as u64;
                 metrics.record_entries(id, state.tag, entries_in_page);
+                // The parent handle for a LOOKUP of an entry READDIRPLUS
+                // returned without one; filled on first use.
+                let dir_fh = std::cell::RefCell::new(None);
 
                 for mut nfs_entry in result.entries {
                     let full_path = join_nfs_path(&state.work.path, &nfs_entry.name);
+
+                    // Same rule as the legacy worker: an entry without
+                    // attributes is resolved before it is classified.
+                    // The GETATTR/LOOKUP is synchronous and shares the
+                    // context with the in-flight READDIRPLUS slots, like
+                    // the LOOKUP chain above.
+                    if nfs_entry.entry_type == EntryType::Unknown {
+                        if crate::config::excluded_entry_bytes(
+                            &nfs_entry.name,
+                            false,
+                            &full_path,
+                            &exclude,
+                            &[],
+                        ) {
+                            continue;
+                        }
+                        if dir_fh.borrow().is_none() {
+                            *dir_fh.borrow_mut() = Some(state.file_handle.clone());
+                        }
+                        if !resolver.settle(
+                            &nfs,
+                            &mut nfs_entry,
+                            &full_path,
+                            &state.work.path,
+                            &dir_fh,
+                        ) {
+                            continue;
+                        }
+                    }
 
                     let is_dir = nfs_entry.entry_type == EntryType::Directory;
 
@@ -2086,5 +2210,630 @@ mod tests {
         let dw = DirWork::fresh(b"/a".to_vec(), 0, None);
         assert!(dw.resume.is_none());
         assert!(dw.file_handle.is_none());
+    }
+
+    // ============================================================
+    // The real worker loops against a scripted tree
+    // ============================================================
+    //
+    // `FakeNfs` answers the calls a worker makes from tables, so both
+    // loops run end to end without a server. The tests below cover the
+    // entries READDIRPLUS returns without attributes.
+
+    use crate::error::{NfsError, NfsResult};
+    use crate::nfs::connection::InflightReaddir;
+    use crate::nfs::types::{EntryAttrs, LookupReply, NfsDirEntry, NfsStat};
+    use std::cell::RefCell;
+    use std::collections::{HashMap, VecDeque};
+
+    #[derive(Default)]
+    struct FakeNfs {
+        /// Directory handle -> what READDIRPLUS returns for it.
+        dirs: HashMap<Vec<u8>, Vec<NfsDirEntry>>,
+        /// Path -> handle, for path LOOKUPs from the export root.
+        paths: HashMap<Vec<u8>, Vec<u8>>,
+        /// Handle -> GETATTR replies, taken front to back; the last one
+        /// repeats.
+        getattrs: RefCell<HashMap<Vec<u8>, VecDeque<NfsResult<EntryAttrs>>>>,
+        /// (directory handle, name) -> LOOKUP reply.
+        lookups: HashMap<(Vec<u8>, Vec<u8>), NfsResult<LookupReply>>,
+        /// Every call, in order.
+        calls: RefCell<Vec<String>>,
+    }
+
+    fn show(bytes: &[u8]) -> String {
+        display_path(bytes).into_owned()
+    }
+
+    impl FakeNfs {
+        fn log(&self, call: String) {
+            self.calls.borrow_mut().push(call);
+        }
+
+        fn dir(&mut self, path: &[u8], fh: &[u8], entries: Vec<NfsDirEntry>) {
+            self.paths.insert(path.to_vec(), fh.to_vec());
+            self.dirs.insert(fh.to_vec(), entries);
+        }
+
+        fn getattr(&mut self, fh: &[u8], replies: Vec<NfsResult<EntryAttrs>>) {
+            self.getattrs
+                .borrow_mut()
+                .insert(fh.to_vec(), replies.into());
+        }
+
+        fn lookup(&mut self, dir_fh: &[u8], name: &[u8], reply: NfsResult<LookupReply>) {
+            self.lookups.insert((dir_fh.to_vec(), name.to_vec()), reply);
+        }
+
+        fn calls_matching(&self, prefix: &str) -> Vec<String> {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|c| c.starts_with(prefix))
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl NfsOps for &FakeNfs {
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn resolve_path_to_fh(&self, path: &[u8]) -> NfsResult<Vec<u8>> {
+            self.log(format!("PATH {}", show(path)));
+            self.paths
+                .get(path)
+                .cloned()
+                .ok_or(NfsError::NotFound { path: show(path) })
+        }
+
+        fn readdir_plus_by_fh(
+            &self,
+            file_handle: &[u8],
+            chunk_size: usize,
+            callback: &mut dyn FnMut(Vec<NfsDirEntry>) -> bool,
+        ) -> NfsResult<usize> {
+            self.log(format!("READDIRPLUS {}", show(file_handle)));
+            let entries = self.dirs.get(file_handle).ok_or(NfsError::StaleHandle {
+                path: show(file_handle),
+            })?;
+            for chunk in entries.chunks(chunk_size.max(1)) {
+                if !callback(chunk.to_vec()) {
+                    break;
+                }
+            }
+            Ok(entries.len())
+        }
+
+        fn readdir_plus_with_fh(
+            &self,
+            path: &[u8],
+            chunk_size: usize,
+            callback: &mut dyn FnMut(Vec<NfsDirEntry>) -> bool,
+        ) -> NfsResult<usize> {
+            let fh = self.resolve_path_to_fh(path)?;
+            self.readdir_plus_by_fh(&fh, chunk_size, callback)
+        }
+
+        fn submit_readdirplus_by_fh(
+            &self,
+            file_handle: &[u8],
+            _cookie: u64,
+            _cookieverf: [i8; 8],
+            tag: u64,
+        ) -> NfsResult<InflightReaddir> {
+            self.log(format!("READDIRPLUS {}", show(file_handle)));
+            Ok(match self.dirs.get(file_handle) {
+                // One page holds the whole directory.
+                Some(entries) => InflightReaddir::completed(
+                    entries.clone(),
+                    true,
+                    0,
+                    ffi_rpc_status_success(),
+                    tag,
+                ),
+                None => InflightReaddir::completed(
+                    Vec::new(),
+                    false,
+                    0,
+                    -(crate::nfs::connection::ffi::nfsstat3_NFS3ERR_STALE as i32),
+                    tag,
+                ),
+            })
+        }
+
+        fn pump(
+            &self,
+            slots: &[InflightReaddir],
+            _min_completions: usize,
+            _timeout_ms: i32,
+        ) -> NfsResult<usize> {
+            Ok(slots.iter().filter(|s| s.is_completed()).count())
+        }
+
+        fn getattr_by_fh(&self, file_handle: &[u8], path: &[u8]) -> NfsResult<EntryAttrs> {
+            self.log(format!("GETATTR {}", show(file_handle)));
+            let mut scripted = self.getattrs.borrow_mut();
+            let replies = scripted
+                .get_mut(file_handle)
+                .ok_or_else(|| NfsError::AttrFailed {
+                    path: show(path),
+                    reason: "GETATTR: not scripted".into(),
+                })?;
+            if replies.len() > 1 {
+                replies.pop_front().unwrap()
+            } else {
+                replies.front().cloned().unwrap()
+            }
+        }
+
+        fn lookup_name(&self, dir_fh: &[u8], name: &[u8], path: &[u8]) -> NfsResult<LookupReply> {
+            self.log(format!("LOOKUP {} {}", show(dir_fh), show(name)));
+            self.lookups
+                .get(&(dir_fh.to_vec(), name.to_vec()))
+                .cloned()
+                .unwrap_or(Err(NfsError::NotFound { path: show(path) }))
+        }
+    }
+
+    fn stat(inode: u64) -> NfsStat {
+        NfsStat {
+            inode,
+            fsid: 1,
+            size: 100,
+            mode: 0o644,
+            uid: 10,
+            gid: 20,
+            nlink: 1,
+            ..NfsStat::default()
+        }
+    }
+
+    fn attrs_of(entry_type: EntryType, stat: NfsStat) -> EntryAttrs {
+        EntryAttrs {
+            entry_type,
+            nfs_type: 0, // only read for an unrecognized type
+            stat,
+        }
+    }
+
+    /// An entry as READDIRPLUS returns it with attributes.
+    fn listed(name: &[u8], entry_type: EntryType, inode: u64, fh: Option<&[u8]>) -> NfsDirEntry {
+        NfsDirEntry {
+            name: name.to_vec(),
+            entry_type,
+            stat: Some(stat(inode)),
+            inode,
+            file_handle: fh.map(<[u8]>::to_vec),
+        }
+    }
+
+    /// An entry as READDIRPLUS returns it without attributes.
+    fn bare(name: &[u8], inode: u64, fh: Option<&[u8]>) -> NfsDirEntry {
+        NfsDirEntry {
+            name: name.to_vec(),
+            entry_type: EntryType::Unknown,
+            stat: None,
+            inode,
+            file_handle: fh.map(<[u8]>::to_vec),
+        }
+    }
+
+    struct Walked {
+        rows: Vec<DbEntry>,
+        dirs: u64,
+        files: u64,
+        errors: u64,
+        vanished: u64,
+        stats: ResolveStats,
+        failures: Vec<DirFailure>,
+    }
+
+    impl Walked {
+        fn row(&self, path: &[u8]) -> Option<&DbEntry> {
+            self.rows.iter().find(|r| r.path == path)
+        }
+
+        fn paths(&self) -> Vec<String> {
+            let mut paths: Vec<String> = self.rows.iter().map(|r| show(&r.path)).collect();
+            paths.sort();
+            paths
+        }
+
+        fn load(counter: &Arc<AtomicU64>) -> u64 {
+            counter.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Walk the scripted tree from `/` with one worker: the legacy loop
+    /// for `pipeline_depth == 0`, the pipelined loop otherwise.
+    fn walk(nfs: &FakeNfs, pipeline_depth: usize, exclude: Vec<Regex>) -> Walked {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let injector = Arc::new(Injector::new());
+        injector.push(DirWork::fresh(b"/".to_vec(), 0, None));
+        let local = DequeWorker::new_fifo();
+        let stealers = Arc::new(vec![local.stealer()]);
+        let counter = || Arc::new(AtomicU64::new(0));
+        let (dirs, files, bytes, errors, vanished) =
+            (counter(), counter(), counter(), counter(), counter());
+        let failures = Arc::new(FailureLog::in_memory());
+        let stats = ResolveStats::default();
+        // No retries: a scripted transient error would otherwise sleep.
+        let policy = RetryPolicy::from_retries(0);
+        let metrics =
+            crate::scanlog::ScanMetrics::new(1, 1, crate::scanlog::CounterRefs::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicUsize::new(0));
+        let pending = Arc::new(AtomicU64::new(1));
+        let exclude = Arc::new(exclude);
+        let exclude_dirs = Arc::new(Vec::new());
+
+        if pipeline_depth == 0 {
+            worker_loop(
+                0,
+                nfs,
+                local,
+                injector,
+                stealers,
+                vec![tx],
+                shutdown,
+                Arc::clone(&dirs),
+                Arc::clone(&files),
+                bytes,
+                Arc::clone(&errors),
+                Arc::clone(&failures),
+                Arc::clone(&vanished),
+                stats.clone(),
+                policy,
+                active,
+                Arc::clone(&pending),
+                None,
+                false,
+                exclude,
+                exclude_dirs,
+                1000,
+                metrics,
+            );
+        } else {
+            worker_loop_pipelined(
+                0,
+                nfs,
+                local,
+                injector,
+                stealers,
+                vec![tx],
+                shutdown,
+                Arc::clone(&dirs),
+                Arc::clone(&files),
+                bytes,
+                Arc::clone(&errors),
+                Arc::clone(&failures),
+                Arc::clone(&vanished),
+                stats.clone(),
+                policy,
+                active,
+                Arc::clone(&pending),
+                None,
+                false,
+                exclude,
+                exclude_dirs,
+                1000,
+                pipeline_depth,
+                0,
+                metrics,
+            );
+        }
+        assert_eq!(pending.load(Ordering::SeqCst), 0, "every work item settled");
+
+        Walked {
+            rows: rx.try_iter().flatten().collect(),
+            dirs: Walked::load(&dirs),
+            files: Walked::load(&files),
+            errors: Walked::load(&errors),
+            vanished: Walked::load(&vanished),
+            stats,
+            failures: failures.samples(),
+        }
+    }
+
+    /// Both loops must treat every case the same way.
+    const LOOPS: [usize; 2] = [0, 4];
+
+    /// The regression this change exists for. A directory READDIRPLUS
+    /// returns without attributes used to be written as `unknown` and
+    /// never read, so its whole subtree was missing from the scan.
+    #[test]
+    fn directory_without_readdirplus_attributes_is_resolved_and_traversed() {
+        for depth in LOOPS {
+            let mut nfs = FakeNfs::default();
+            nfs.dir(
+                b"/",
+                b"R",
+                vec![
+                    listed(b"plain.txt", EntryType::File, 10, None),
+                    bare(b"nostat", 11, Some(b"H1")),
+                ],
+            );
+            nfs.getattr(b"H1", vec![Ok(attrs_of(EntryType::Directory, stat(11)))]);
+            nfs.dir(
+                b"/nostat",
+                b"H1",
+                vec![
+                    listed(b"inner.txt", EntryType::File, 12, None),
+                    listed(b"deep", EntryType::Directory, 13, Some(b"H3")),
+                ],
+            );
+            nfs.dir(
+                b"/nostat/deep",
+                b"H3",
+                vec![listed(b"leaf", EntryType::File, 14, None)],
+            );
+
+            let w = walk(&nfs, depth, vec![]);
+
+            assert_eq!(
+                w.paths(),
+                [
+                    "/nostat",
+                    "/nostat/deep",
+                    "/nostat/deep/leaf",
+                    "/nostat/inner.txt",
+                    "/plain.txt"
+                ],
+                "depth {depth}: the subtree under the attribute-less directory is in the scan"
+            );
+            let dir = w.row(b"/nostat").unwrap();
+            assert_eq!(dir.entry_type, EntryType::Directory, "depth {depth}");
+            assert_eq!(dir.mode, Some(0o644), "depth {depth}");
+            assert_eq!(dir.fsid, Some(1), "depth {depth}");
+            assert_eq!(w.errors, 0, "depth {depth}");
+            assert_eq!(w.dirs, 3, "depth {depth}: /, /nostat, /nostat/deep");
+            assert_eq!(w.files, 3, "depth {depth}");
+            assert_eq!(Walked::load(&w.stats.by_getattr), 1, "depth {depth}");
+            assert_eq!(Walked::load(&w.stats.by_lookup), 0, "depth {depth}");
+            assert_eq!(
+                nfs.calls_matching("GETATTR"),
+                ["GETATTR H1"],
+                "depth {depth}"
+            );
+            assert_eq!(
+                nfs.calls_matching("READDIRPLUS H1"),
+                ["READDIRPLUS H1"],
+                "depth {depth}: read through the handle READDIRPLUS supplied"
+            );
+        }
+    }
+
+    /// The same directory with the handle missing too, which is how the
+    /// Linux server lists a mountpoint: a LOOKUP of the raw name in the
+    /// parent finds it. Its identity is the resolved object's.
+    #[test]
+    fn directory_without_attributes_or_handle_is_resolved_by_lookup_and_traversed() {
+        for depth in LOOPS {
+            let mut nfs = FakeNfs::default();
+            nfs.dir(b"/", b"R", vec![bare(b"mnt-\xff", 11, None)]);
+            nfs.lookup(
+                b"R",
+                b"mnt-\xff",
+                Ok(LookupReply {
+                    file_handle: b"H2".to_vec(),
+                    attrs: Some(attrs_of(
+                        EntryType::Directory,
+                        NfsStat {
+                            fsid: 99,
+                            mode: 0o755,
+                            ..stat(2)
+                        },
+                    )),
+                }),
+            );
+            nfs.dir(
+                b"/mnt-\xff",
+                b"H2",
+                vec![listed(b"child.txt", EntryType::File, 20, None)],
+            );
+
+            let w = walk(&nfs, depth, vec![]);
+
+            assert_eq!(
+                w.paths(),
+                [r"/mnt-\xff", r"/mnt-\xff/child.txt"],
+                "depth {depth}"
+            );
+            let dir = w.row(b"/mnt-\xff").unwrap();
+            assert_eq!(dir.name, b"mnt-\xff", "depth {depth}: raw name bytes");
+            assert_eq!(dir.entry_type, EntryType::Directory, "depth {depth}");
+            assert_eq!(
+                dir.inode, 2,
+                "depth {depth}: the resolved object, not the listing's 11"
+            );
+            assert_eq!(dir.fsid, Some(99), "depth {depth}");
+            assert_eq!(dir.mode, Some(0o755), "depth {depth}");
+            assert_eq!(w.errors, 0, "depth {depth}");
+            assert_eq!(Walked::load(&w.stats.by_lookup), 1, "depth {depth}");
+            assert_eq!(Walked::load(&w.stats.by_getattr), 0, "depth {depth}");
+            assert_eq!(
+                nfs.calls_matching("LOOKUP"),
+                [r"LOOKUP R mnt-\xff"],
+                "depth {depth}: by the parent's handle and the raw name"
+            );
+            assert_eq!(
+                nfs.calls_matching("READDIRPLUS H2"),
+                ["READDIRPLUS H2"],
+                "depth {depth}: read through the handle the LOOKUP returned"
+            );
+        }
+    }
+
+    /// A non-directory resolved through the fallback carries the
+    /// attributes of the reply that resolved it.
+    #[test]
+    fn special_file_without_attributes_gets_its_type_and_attributes() {
+        for depth in LOOPS {
+            let mut nfs = FakeNfs::default();
+            nfs.dir(b"/", b"R", vec![bare(b"pipe", 30, Some(b"P"))]);
+            nfs.getattr(
+                b"P",
+                vec![Ok(attrs_of(
+                    EntryType::Fifo,
+                    NfsStat {
+                        inode: 30,
+                        fsid: 7,
+                        size: 0,
+                        mode: 0o600,
+                        uid: 1001,
+                        gid: 1002,
+                        nlink: 1,
+                        ..NfsStat::default()
+                    },
+                ))],
+            );
+
+            let w = walk(&nfs, depth, vec![]);
+
+            let pipe = w.row(b"/pipe").expect("emitted");
+            assert_eq!(pipe.entry_type, EntryType::Fifo, "depth {depth}");
+            assert_eq!(pipe.size, 0, "depth {depth}");
+            assert_eq!(pipe.mode, Some(0o600), "depth {depth}");
+            assert_eq!(pipe.uid, Some(1001), "depth {depth}");
+            assert_eq!(pipe.gid, Some(1002), "depth {depth}");
+            assert_eq!(pipe.fsid, Some(7), "depth {depth}");
+            assert_eq!(pipe.inode, 30, "depth {depth}");
+            assert_eq!(w.files, 1, "depth {depth}");
+            assert_eq!(w.errors, 0, "depth {depth}");
+        }
+    }
+
+    /// An entry whose type cannot be established has no row, is not
+    /// descended into, and fails the scan. Its siblings are unaffected.
+    #[test]
+    fn unresolved_entry_has_no_row_is_not_descended_and_fails_the_scan() {
+        for depth in LOOPS {
+            let mut nfs = FakeNfs::default();
+            nfs.dir(
+                b"/",
+                b"R",
+                vec![
+                    bare(b"locked", 40, Some(b"L")),
+                    listed(b"ok.txt", EntryType::File, 41, None),
+                ],
+            );
+            nfs.getattr(
+                b"L",
+                vec![Err(NfsError::PermissionDenied {
+                    path: "/locked".into(),
+                })],
+            );
+            // If the worker descended anyway, it would find this.
+            nfs.dir(
+                b"/locked",
+                b"L",
+                vec![listed(b"secret", EntryType::File, 42, None)],
+            );
+
+            let w = walk(&nfs, depth, vec![]);
+
+            assert_eq!(w.paths(), ["/ok.txt"], "depth {depth}");
+            assert!(
+                w.rows.iter().all(|r| r.entry_type != EntryType::Unknown),
+                "depth {depth}: no row without a type"
+            );
+            assert_eq!(
+                w.errors, 1,
+                "depth {depth}: nonzero errors make the scan incomplete"
+            );
+            assert_eq!(Walked::load(&w.stats.unresolved), 1, "depth {depth}");
+            assert_eq!(w.vanished, 0, "depth {depth}");
+            assert_eq!(w.failures.len(), 1, "depth {depth}");
+            assert_eq!(w.failures[0].path, "/locked", "depth {depth}");
+            assert_eq!(
+                w.failures[0].kind,
+                FailureKind::PermissionDenied,
+                "depth {depth}"
+            );
+            assert!(
+                nfs.calls_matching("READDIRPLUS L").is_empty(),
+                "depth {depth}: never read as a directory"
+            );
+        }
+    }
+
+    /// Deleted between the listing and the resolution, and confirmed
+    /// gone by a path LOOKUP: recorded as vanished, no row, and the
+    /// scan stays complete. The rule for a vanished directory.
+    #[test]
+    fn entry_that_vanishes_before_resolution_is_not_a_failure() {
+        for depth in LOOPS {
+            let mut nfs = FakeNfs::default();
+            nfs.dir(
+                b"/",
+                b"R",
+                vec![
+                    bare(b"gone", 50, None),
+                    listed(b"kept.txt", EntryType::File, 51, None),
+                ],
+            );
+            // No LOOKUP reply and no path for `/gone`: both say NOENT.
+
+            let w = walk(&nfs, depth, vec![]);
+
+            assert_eq!(w.paths(), ["/kept.txt"], "depth {depth}");
+            assert_eq!(w.errors, 0, "depth {depth}: the scan is complete");
+            assert_eq!(w.vanished, 1, "depth {depth}");
+            assert_eq!(Walked::load(&w.stats.vanished), 1, "depth {depth}");
+            assert_eq!(Walked::load(&w.stats.unresolved), 0, "depth {depth}");
+            assert!(w.failures.is_empty(), "depth {depth}");
+            assert_eq!(
+                nfs.calls_matching("PATH /gone"),
+                ["PATH /gone"],
+                "depth {depth}: confirmed by the path LOOKUP"
+            );
+            assert_eq!(w.files, 1, "depth {depth}: a vanished entry is not counted");
+        }
+    }
+
+    /// The server says NOENT for the name, but the path still resolves:
+    /// that is not a disappearance. The entry is unresolved.
+    #[test]
+    fn not_found_contradicted_by_the_path_lookup_fails_the_scan() {
+        for depth in LOOPS {
+            let mut nfs = FakeNfs::default();
+            nfs.dir(b"/", b"R", vec![bare(b"odd", 60, None)]);
+            nfs.paths.insert(b"/odd".to_vec(), b"O".to_vec());
+            // LOOKUP(R, "odd") is unscripted: NOENT.
+
+            let w = walk(&nfs, depth, vec![]);
+
+            assert!(w.rows.is_empty(), "depth {depth}");
+            assert_eq!(w.errors, 1, "depth {depth}");
+            assert_eq!(w.vanished, 0, "depth {depth}");
+            assert_eq!(w.failures[0].kind, FailureKind::NotFound, "depth {depth}");
+        }
+    }
+
+    /// `--exclude` drops a path whatever its type, so an excluded entry
+    /// costs no RPC and cannot fail the scan.
+    #[test]
+    fn path_excluded_entry_without_attributes_is_not_resolved() {
+        let skipme = Regex::new("^/skipme$").unwrap();
+        for depth in LOOPS {
+            let mut nfs = FakeNfs::default();
+            nfs.dir(
+                b"/",
+                b"R",
+                vec![
+                    bare(b"skipme", 70, Some(b"S")),
+                    listed(b"kept.txt", EntryType::File, 71, None),
+                ],
+            );
+            // GETATTR for S is unscripted: asking would fail the scan.
+
+            let w = walk(&nfs, depth, vec![skipme.clone()]);
+
+            assert_eq!(w.paths(), ["/kept.txt"], "depth {depth}");
+            assert_eq!(w.errors, 0, "depth {depth}");
+            assert!(nfs.calls_matching("GETATTR").is_empty(), "depth {depth}");
+        }
     }
 }

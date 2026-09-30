@@ -16,7 +16,8 @@ use clap::Parser;
 use humansize::{format_size, BINARY};
 use nfs_walker::config::{CliArgs, Command, WalkConfig};
 use nfs_walker::progress::{
-    format_elapsed, format_number, print_header, print_summary, ProgressReporter,
+    format_elapsed, format_number, print_attribute_fallbacks, print_header, print_summary,
+    ProgressReporter,
 };
 use nfs_walker::walker::{SimpleWalker, WalkStats};
 use std::process::ExitCode;
@@ -147,9 +148,10 @@ fn run() -> Result<()> {
                     &output_path.display().to_string(),
                     db_size,
                 );
+                print_attribute_fallbacks(stats.resolved_by_getattr, stats.resolved_by_lookup);
                 eprintln!(
-                    "\nScan INCOMPLETE: {} directories could not be read ({} vanished during the scan).",
-                    stats.errors, stats.vanished
+                    "\nScan INCOMPLETE: {}.",
+                    nfs_walker::error::incomplete_reason(stats)
                 );
                 for f in failures.iter().take(20) {
                     eprintln!(
@@ -181,6 +183,7 @@ fn run() -> Result<()> {
         &output_path.display().to_string(),
         db_size,
     );
+    print_attribute_fallbacks(result.resolved_by_getattr, result.resolved_by_lookup);
 
     Ok(())
 }

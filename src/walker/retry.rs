@@ -231,8 +231,9 @@ impl FailureLog {
         self.path.as_deref()
     }
 
-    /// A directory that could not be read after the policy was
-    /// exhausted. Counted by the caller; sampled and logged here.
+    /// A directory that could not be read, or an entry whose type
+    /// could not be established, after the policy was exhausted.
+    /// Counted by the caller; sampled and logged here.
     pub fn record(&self, f: &DirFailure) {
         {
             let mut samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
@@ -257,6 +258,19 @@ impl FailureLog {
             "path": display_path(path),
             "kind": "vanished",
             "error": "directory disappeared between its parent's listing and its own read",
+            "attempts": attempts,
+        }));
+    }
+
+    /// An entry that disappeared before its attributes could be read
+    /// (READDIRPLUS listed it without any). Logged for the record; not
+    /// a failure. Unlike a vanished directory, it has no row.
+    pub fn record_vanished_entry(&self, path: &[u8], attempts: u32) {
+        self.write_line(&serde_json::json!({
+            "ts": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "path": display_path(path),
+            "kind": "vanished",
+            "error": "entry disappeared between its parent's listing and the read of its attributes",
             "attempts": attempts,
         }));
     }

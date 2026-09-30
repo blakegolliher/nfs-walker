@@ -61,4 +61,4 @@ pub mod types;
 
 pub use connection::ffi;
 pub use connection::{resolve_dns, NfsConnection, NfsConnectionBuilder};
-pub use types::{DbEntry, EntryType, NfsDirEntry, NfsStat};
+pub use types::{DbEntry, EntryAttrs, EntryType, LookupReply, NfsDirEntry, NfsStat};
