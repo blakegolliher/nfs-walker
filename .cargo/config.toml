@@ -6,5 +6,9 @@ linker = "gcc"
 # overrides (does not merge with) these.
 rustflags = ["-C", "target-feature=+crt-static,+aes,+sse2"]
 
+# Explicit features here too, never target-cpu=native: cargo-zigbuild strips
+# the glibc suffix, so the portable x86_64-unknown-linux-gnu.2.34 build
+# resolves to this section. A binary tuned to the build host's CPU does not
+# run on older CPUs and does not reproduce on another machine.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-L/usr/lib/gcc/x86_64-linux-gnu/13", "-C", "target-cpu=native"]
+rustflags = ["-C", "target-feature=+aes,+sse2"]
