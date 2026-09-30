@@ -1,15 +1,15 @@
 //! Shared row builder for Parquet output.
 //!
 //! The streaming writer fed by the walker pipeline accumulates rows into
-//! the 24-column Arrow schema and then flushes them as a `RecordBatch`.
+//! the Arrow schema and then flushes them as a `RecordBatch`.
 //! This module owns the column-builder boilerplate.
 
 use crate::error::{ParquetError, WalkerError};
-use crate::nfs::types::DbEntry;
+use crate::nfs::types::{display_path, DbEntry};
 use crate::parquet::schema::{compute_parent_path, file_type_string, parquet_schema_ref};
 use arrow::array::{
-    ArrayRef, Int32Builder, Int64Builder, StringBuilder, StringDictionaryBuilder, UInt16Builder,
-    UInt32Builder, UInt64Builder,
+    ArrayRef, BinaryBuilder, Int32Builder, Int64Builder, StringBuilder, StringDictionaryBuilder,
+    UInt16Builder, UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::{Schema, UInt32Type};
 use arrow::record_batch::RecordBatch;
@@ -22,8 +22,7 @@ use std::sync::Arc;
 #[inline]
 pub fn pack_micros(sec: i64, nsec: i64) -> i64 {
     let nsec = nsec.clamp(0, 999_999_999);
-    sec.saturating_mul(1_000_000)
-        .saturating_add(nsec / 1_000)
+    sec.saturating_mul(1_000_000).saturating_add(nsec / 1_000)
 }
 
 /// Derive a nullable `*_us` column value from a (sec, nsec) pair.
@@ -88,6 +87,9 @@ pub struct RowBuilder {
     /// ~9 MB of repeated bytes per row group.
     b_scan_id: StringDictionaryBuilder<UInt32Type>,
     b_scan_ts: Int64Builder,
+    b_path_bytes: BinaryBuilder,
+    b_filename_bytes: BinaryBuilder,
+    b_parent_path_bytes: BinaryBuilder,
 }
 
 impl RowBuilder {
@@ -123,6 +125,12 @@ impl RowBuilder {
             b_parent_path: StringBuilder::with_capacity(capacity, capacity * PATH_BYTES_PER_ROW),
             b_scan_id: StringDictionaryBuilder::<UInt32Type>::new(),
             b_scan_ts: Int64Builder::with_capacity(capacity),
+            b_path_bytes: BinaryBuilder::with_capacity(capacity, capacity * PATH_BYTES_PER_ROW),
+            b_filename_bytes: BinaryBuilder::with_capacity(capacity, capacity * NAME_BYTES_PER_ROW),
+            b_parent_path_bytes: BinaryBuilder::with_capacity(
+                capacity,
+                capacity * PATH_BYTES_PER_ROW,
+            ),
         }
     }
 
@@ -142,15 +150,16 @@ impl RowBuilder {
     /// from the walker pipeline).
     pub fn push_db_entry(&mut self, entry: &DbEntry) {
         // Prefer the walker-supplied parent_path; recompute zero-copy
-        // from the path string when it's None (the common case — the
+        // from the path bytes when it's None (the common case — the
         // walker deliberately skips the per-entry clone).
-        let parent: &str = entry
+        let parent: &[u8] = entry
             .parent_path
             .as_deref()
             .unwrap_or_else(|| compute_parent_path(&entry.path));
 
-        self.b_path.append_value(&entry.path);
-        self.b_filename.append_value(&entry.name);
+        self.b_path.append_value(display_path(&entry.path).as_ref());
+        self.b_filename
+            .append_value(display_path(&entry.name).as_ref());
         match entry.extension.as_deref() {
             Some(ext) => self.b_extension.append_value(ext),
             None => self.b_extension.append_null(),
@@ -181,9 +190,13 @@ impl RowBuilder {
         self.b_ctime_nsec.append_option(entry.ctime_nsec);
         self.b_depth
             .append_value(entry.depth.min(u16::MAX as u32) as u16);
-        self.b_parent_path.append_value(parent);
+        self.b_parent_path
+            .append_value(display_path(parent).as_ref());
         self.b_scan_id.append_value(&self.ctx.scan_id);
         self.b_scan_ts.append_value(self.ctx.scan_timestamp_us);
+        self.b_path_bytes.append_value(&entry.path);
+        self.b_filename_bytes.append_value(&entry.name);
+        self.b_parent_path_bytes.append_value(parent);
 
         self.rows += 1;
     }
@@ -222,6 +235,9 @@ impl RowBuilder {
             mut b_parent_path,
             mut b_scan_id,
             mut b_scan_ts,
+            mut b_path_bytes,
+            mut b_filename_bytes,
+            mut b_parent_path_bytes,
             ..
         } = full;
 
@@ -250,6 +266,9 @@ impl RowBuilder {
             Arc::new(b_parent_path.finish()),
             Arc::new(b_scan_id.finish()),
             Arc::new(b_scan_ts.finish()),
+            Arc::new(b_path_bytes.finish()),
+            Arc::new(b_filename_bytes.finish()),
+            Arc::new(b_parent_path_bytes.finish()),
         ];
 
         RecordBatch::try_new(schema, columns)
@@ -299,8 +318,8 @@ mod tests {
         let mut rb = RowBuilder::new(RowContext::default(), 16);
         for i in 0..3 {
             rb.push_db_entry(&DbEntry {
-                path: format!("/a/file-{i}"),
-                name: format!("file-{i}"),
+                path: format!("/a/file-{i}").into_bytes(),
+                name: format!("file-{i}").into_bytes(),
                 inode: i,
                 ..DbEntry::default()
             });
@@ -311,8 +330,8 @@ mod tests {
         assert!(rb.is_empty());
         // Builder is reusable after finish().
         rb.push_db_entry(&DbEntry {
-            path: "/a/b".into(),
-            name: "b".into(),
+            path: b"/a/b".to_vec(),
+            name: b"b".to_vec(),
             ..DbEntry::default()
         });
         assert_eq!(rb.finish().unwrap().num_rows(), 1);
@@ -322,8 +341,8 @@ mod tests {
     fn parent_path_derived_when_none() {
         let mut rb = RowBuilder::new(RowContext::default(), 4);
         rb.push_db_entry(&DbEntry {
-            path: "/data/sub/file.txt".into(),
-            name: "file.txt".into(),
+            path: b"/data/sub/file.txt".to_vec(),
+            name: b"file.txt".to_vec(),
             parent_path: None,
             ..DbEntry::default()
         });
@@ -335,5 +354,30 @@ mod tests {
             .downcast_ref::<arrow::array::StringArray>()
             .unwrap();
         assert_eq!(parents.value(0), "/data/sub");
+    }
+
+    #[test]
+    fn invalid_utf8_is_preserved_in_binary_columns() {
+        let mut rb = RowBuilder::new(RowContext::default(), 1);
+        rb.push_db_entry(&DbEntry {
+            path: b"/data/bad-\xff.txt".to_vec(),
+            name: b"bad-\xff.txt".to_vec(),
+            ..DbEntry::default()
+        });
+        let batch = rb.finish().unwrap();
+        let paths = batch
+            .column_by_name("path_bytes")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .unwrap();
+        let display = batch
+            .column_by_name("path")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(paths.value(0), b"/data/bad-\xff.txt");
+        assert_eq!(display.value(0), r"/data/bad-\xff.txt");
     }
 }

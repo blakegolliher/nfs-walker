@@ -18,17 +18,17 @@
 
 use crate::config::WalkConfig;
 use crate::error::{DirFailure, FailureKind, Result, WalkerError};
-use crate::nfs::types::{extract_extension, DbEntry, EntryType};
-use crate::walker::retry::{self, DirError, FailureLog, RetryPolicy};
+use crate::nfs::types::{display_path, extract_extension_bytes, DbEntry, EntryType};
 use crate::nfs::{resolve_dns, NfsConnection, NfsConnectionBuilder};
-use regex::Regex;
 use crate::parquet::direct_writer::{
     spawn_direct_parquet_writers, write_metadata_json as write_direct_metadata_json,
     DirectWriteConfig,
 };
+use crate::walker::retry::{self, DirError, FailureLog, RetryPolicy};
 use crate::walker::sharding::path_to_shard;
 use crossbeam_channel::Sender;
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
+use regex::Regex;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -39,7 +39,7 @@ use tracing::{debug, error, info, warn};
 /// Directory work item
 #[derive(Debug, Clone)]
 struct DirWork {
-    path: String,
+    path: Vec<u8>,
     depth: u32,
     /// Cached file handle from parent's READDIRPLUS response
     /// When set, we can skip LOOKUP RPCs and use this handle directly
@@ -61,15 +61,20 @@ struct DirResume {
 
 impl DirWork {
     /// Construct a fresh work item — full enumeration from page 0.
-    fn fresh(path: String, depth: u32, file_handle: Option<Vec<u8>>) -> Self {
-        Self { path, depth, file_handle, resume: None }
+    fn fresh(path: Vec<u8>, depth: u32, file_handle: Option<Vec<u8>>) -> Self {
+        Self {
+            path,
+            depth,
+            file_handle,
+            resume: None,
+        }
     }
 
     /// Construct a continuation produced by an in-flight pipelined slot
     /// that bailed at a page boundary. The file handle is mandatory
     /// (mid-dir resume requires it; a path-LOOKUP would not be safe).
     fn continuation(
-        path: String,
+        path: Vec<u8>,
         depth: u32,
         file_handle: Vec<u8>,
         cookie: u64,
@@ -84,6 +89,20 @@ impl DirWork {
     }
 }
 
+/// Join an absolute export path and one NFS directory-entry name without ever
+/// interpreting either as UTF-8.
+fn join_nfs_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut path = Vec::with_capacity(parent.len() + name.len() + 1);
+    if parent == b"/" {
+        path.push(b'/');
+    } else {
+        path.extend_from_slice(parent);
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+    path
+}
+
 /// Per-worker fan-out helper. Each entry is routed to its owning
 /// path-shard channel by `path_to_shard(entry.path, shards)`. Workers
 /// hold N partial batches in parallel; shards == 1 collapses to a
@@ -94,7 +113,6 @@ struct ShardedSender {
     batch_size: usize,
     shards: usize,
 }
-
 
 impl ShardedSender {
     fn new(senders: Vec<Sender<Vec<DbEntry>>>, batch_size: usize) -> Self {
@@ -119,8 +137,7 @@ impl ShardedSender {
         let batch = &mut self.batches[shard];
         batch.push(entry);
         if batch.len() >= self.batch_size {
-            let full =
-                std::mem::replace(batch, Vec::with_capacity(self.batch_size));
+            let full = std::mem::replace(batch, Vec::with_capacity(self.batch_size));
             self.senders[shard].send(full).map_err(|_| ())?;
         }
         Ok(())
@@ -228,8 +245,7 @@ impl SimpleWalker {
         let shards = self.config.writer_shards.max(1);
 
         let scan_id = uuid::Uuid::new_v4().to_string();
-        let scan_timestamp_us =
-            chrono::Utc::now().timestamp_micros();
+        let scan_timestamp_us = chrono::Utc::now().timestamp_micros();
 
         info!(
             "Opening direct-write Parquet output: {} (scan_id={}, shards={})",
@@ -299,12 +315,10 @@ impl SimpleWalker {
                     }
                     Err(_) => {
                         if writer_err.is_none() {
-                            writer_err = Some(WalkerError::Parquet(
-                                crate::error::ParquetError::Other(format!(
-                                    "parquet writer shard {} panicked",
-                                    idx
-                                )),
-                            ));
+                            writer_err =
+                                Some(WalkerError::Parquet(crate::error::ParquetError::Other(
+                                    format!("parquet writer shard {} panicked", idx),
+                                )));
                         }
                     }
                 }
@@ -427,11 +441,7 @@ impl SimpleWalker {
         started_at: Instant,
     ) -> Option<JoinHandle<()>> {
         let cfg = self.config.log.as_ref()?;
-        let log_cfg = crate::scanlog::LogConfig::new(
-            cfg.path.clone(),
-            cfg.format,
-            cfg.interval,
-        );
+        let log_cfg = crate::scanlog::LogConfig::new(cfg.path.clone(), cfg.format, cfg.interval);
         match crate::scanlog::start_logger(metrics, log_cfg, started_at) {
             Ok(h) => Some(h),
             Err(e) => {
@@ -462,7 +472,7 @@ impl SimpleWalker {
         let pending_work = Arc::new(AtomicU64::new(1)); // Start with 1 for root
 
         // Push root directory (no cached file handle - will do path lookup)
-        let start_path = self.config.nfs_url.walk_start_path();
+        let start_path = self.config.nfs_url.walk_start_path().into_bytes();
         injector.push(DirWork::fresh(start_path.clone(), 0, None));
 
         // Create worker local queues and stealers
@@ -482,14 +492,21 @@ impl SimpleWalker {
         // record per query and the local resolver caches it). Otherwise
         // resolve DNS for round-robin load balancing.
         let server_ips = if !self.config.server_ips.is_empty() {
-            info!("Using {} explicit server VIPs (--server-ips), skipping DNS: {:?}",
-                  self.config.server_ips.len(), self.config.server_ips);
+            info!(
+                "Using {} explicit server VIPs (--server-ips), skipping DNS: {:?}",
+                self.config.server_ips.len(),
+                self.config.server_ips
+            );
             self.config.server_ips.clone()
         } else {
             let ips = resolve_dns(&self.config.nfs_url.server);
             if ips.len() > 1 {
-                info!("DNS resolved {} to {} IPs: {:?}",
-                      self.config.nfs_url.server, ips.len(), ips);
+                info!(
+                    "DNS resolved {} to {} IPs: {:?}",
+                    self.config.nfs_url.server,
+                    ips.len(),
+                    ips
+                );
             } else if ips.len() == 1 {
                 info!(
                     "DNS resolved {} to a single IP ({}). If the server actually has more VIPs, \
@@ -765,7 +782,6 @@ impl SimpleWalker {
 
         builder.connect().map_err(WalkerError::Nfs)
     }
-
 }
 
 /// Worker thread - processes directories using READDIRPLUS.
@@ -825,7 +841,9 @@ fn worker_loop(
             }
             // Try stealing from other workers
             for (i, stealer) in stealers.iter().enumerate() {
-                if i == id { continue; }
+                if i == id {
+                    continue;
+                }
                 loop {
                     match stealer.steal() {
                         crossbeam_deque::Steal::Success(w) => return Some(w),
@@ -851,7 +869,8 @@ fn worker_loop(
                     error!(
                         "Worker {} (legacy) refusing continuation work for {} — \
                          continuations require --pipeline-depth > 0",
-                        id, w.path
+                        id,
+                        display_path(&w.path)
                     );
                     pending_work.fetch_sub(1, Ordering::SeqCst);
                     active_workers.fetch_sub(1, Ordering::Relaxed);
@@ -860,7 +879,7 @@ fn worker_loop(
                 }
                 // Legacy worker only has one in-flight at a time, so a
                 // fixed tag uniquely identifies its slot.
-                metrics.enter_dir(id, 0, w.path.clone());
+                metrics.enter_dir(id, 0, display_path(&w.path).into_owned());
                 w
             }
             None => {
@@ -895,9 +914,17 @@ fn worker_loop(
 
         // Log whether we're using cached file handle or path
         if work.file_handle.is_some() {
-            debug!("Worker {} READDIRPLUS (cached FH): {}", id, work.path);
+            debug!(
+                "Worker {} READDIRPLUS (cached FH): {}",
+                id,
+                display_path(&work.path)
+            );
         } else {
-            debug!("Worker {} READDIRPLUS (path lookup): {}", id, work.path);
+            debug!(
+                "Worker {} READDIRPLUS (path lookup): {}",
+                id,
+                display_path(&work.path)
+            );
         }
 
         // Read directory with READDIRPLUS in chunks for immediate processing
@@ -928,11 +955,7 @@ fn worker_loop(
             }
             metrics_for_chunks.record_entries(id, 0, chunk.len() as u64);
             for mut nfs_entry in chunk {
-                let full_path = if work.path == "/" {
-                    format!("/{}", nfs_entry.name)
-                } else {
-                    format!("{}/{}", work.path, nfs_entry.name)
-                };
+                let full_path = join_nfs_path(&work.path, &nfs_entry.name);
 
                 let is_dir = nfs_entry.entry_type == EntryType::Directory;
 
@@ -945,7 +968,7 @@ fn worker_loop(
                 // a match is neither emitted nor descended into, so an
                 // excluded directory's whole subtree is absent. Empty in
                 // the common case.
-                if crate::config::excluded_entry(
+                if crate::config::excluded_entry_bytes(
                     &nfs_entry.name,
                     is_dir,
                     &full_path,
@@ -997,7 +1020,7 @@ fn worker_loop(
                     inode: nfs_entry.inode,
                     depth: work.depth + 1,
                     extension: if nfs_entry.entry_type == EntryType::File {
-                        extract_extension(&nfs_entry.name)
+                        extract_extension_bytes(&nfs_entry.name)
                     } else {
                         None
                     },
@@ -1049,7 +1072,10 @@ fn worker_loop(
 
                 debug!(
                     "Worker {} READDIRPLUS complete: {} -> {} entries ({} subdirs)",
-                    id, work.path, entry_count, subdir_count
+                    id,
+                    display_path(&work.path),
+                    entry_count,
+                    subdir_count
                 );
             }
             Err(DirError::Vanished { attempts }) => {
@@ -1059,7 +1085,9 @@ fn worker_loop(
                 failures.record_vanished(&work.path, attempts);
                 debug!(
                     "Worker {} directory vanished during the scan: {} (after {} attempts)",
-                    id, work.path, attempts
+                    id,
+                    display_path(&work.path),
+                    attempts
                 );
             }
             Err(DirError::Failed(f)) => {
@@ -1299,7 +1327,11 @@ fn worker_loop_pipelined(
                         Err(DirError::Vanished { attempts }) => {
                             vanished_count.fetch_add(1, Ordering::Relaxed);
                             failures.record_vanished(&path, attempts);
-                            debug!("Worker {} directory vanished before LOOKUP: {}", id, path);
+                            debug!(
+                                "Worker {} directory vanished before LOOKUP: {}",
+                                id,
+                                display_path(&path)
+                            );
                             pending_work.fetch_sub(1, Ordering::SeqCst);
                             continue;
                         }
@@ -1331,12 +1363,18 @@ fn worker_loop_pipelined(
                     if start_cookie == 0 {
                         debug!(
                             "Worker {} pipelined submit: tag={:#x} {} (depth={})",
-                            id, tag, work.path, work.depth
+                            id,
+                            tag,
+                            display_path(&work.path),
+                            work.depth
                         );
                     } else {
                         debug!(
                             "Worker {} pipelined submit (resume): tag={:#x} {} cookie={:#x}",
-                            id, tag, work.path, start_cookie
+                            id,
+                            tag,
+                            display_path(&work.path),
+                            start_cookie
                         );
                     }
                     // Track this dir under the initial tag for the
@@ -1347,7 +1385,7 @@ fn worker_loop_pipelined(
                     // as N separate (worker, tag) entries in scanlog,
                     // all pointing at the same path. That's the
                     // diagnostic signal we want.
-                    metrics.enter_dir(id, tag, work.path.clone());
+                    metrics.enter_dir(id, tag, display_path(&work.path).into_owned());
                     slots.push(slot);
                     states.push(DirState {
                         work,
@@ -1364,10 +1402,12 @@ fn worker_loop_pipelined(
                     errors_count.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         "Worker {} pipelined submit failed: {} -> {}",
-                        id, work.path, e
+                        id,
+                        display_path(&work.path),
+                        e
                     );
                     failures.record(&DirFailure {
-                        path: work.path.clone(),
+                        path: display_path(&work.path).into_owned(),
                         kind: e.failure_kind(),
                         error: e.to_string(),
                         attempts: 1,
@@ -1415,7 +1455,9 @@ fn worker_loop_pipelined(
                 // this worker. The connection is likely unrecoverable.
                 error!(
                     "Worker {} pipelined pump failed: {} (dropping {} in-flight slots)",
-                    id, e, slots.len()
+                    id,
+                    e,
+                    slots.len()
                 );
                 let n = slots.len() as u64;
                 errors_count.fetch_add(n, Ordering::Relaxed);
@@ -1423,7 +1465,7 @@ fn worker_loop_pipelined(
                 for s in &states {
                     metrics.exit_dir(id, s.tag);
                     failures.record(&DirFailure {
-                        path: s.work.path.clone(),
+                        path: display_path(&s.work.path).into_owned(),
                         kind: FailureKind::Connection,
                         error: format!("pipelined pump failed: {}", e),
                         attempts: s.attempts.max(1),
@@ -1472,11 +1514,7 @@ fn worker_loop_pipelined(
                 metrics.record_entries(id, state.tag, entries_in_page);
 
                 for mut nfs_entry in result.entries {
-                    let full_path = if state.work.path == "/" {
-                        format!("/{}", nfs_entry.name)
-                    } else {
-                        format!("{}/{}", state.work.path, nfs_entry.name)
-                    };
+                    let full_path = join_nfs_path(&state.work.path, &nfs_entry.name);
 
                     let is_dir = nfs_entry.entry_type == EntryType::Directory;
 
@@ -1487,7 +1525,7 @@ fn worker_loop_pipelined(
                     // --exclude / --exclude-dir, mirroring the legacy
                     // worker: a match is neither emitted nor descended
                     // into.
-                    if crate::config::excluded_entry(
+                    if crate::config::excluded_entry_bytes(
                         &nfs_entry.name,
                         is_dir,
                         &full_path,
@@ -1532,7 +1570,7 @@ fn worker_loop_pipelined(
                         inode: nfs_entry.inode,
                         depth: state.work.depth + 1,
                         extension: if nfs_entry.entry_type == EntryType::File {
-                            extract_extension(&nfs_entry.name)
+                            extract_extension_bytes(&nfs_entry.name)
                         } else {
                             None
                         },
@@ -1577,14 +1615,9 @@ fn worker_loop_pipelined(
                     break 'outer;
                 }
 
-                state.entries_seen =
-                    state.entries_seen.saturating_add(entries_in_page);
+                state.entries_seen = state.entries_seen.saturating_add(entries_in_page);
 
-                if should_split_now(
-                    state.entries_seen,
-                    big_dir_split_after,
-                    result.eof,
-                ) {
+                if should_split_now(state.entries_seen, big_dir_split_after, result.eof) {
                     // SPLIT: hand the rest of this directory to the
                     // deque so another worker (or this worker, later)
                     // can resume from the saved cookie. dirs_count is
@@ -1604,7 +1637,10 @@ fn worker_loop_pipelined(
                     // below (errors_count++, no retry).
                     debug!(
                         "Worker {} pipelined SPLIT: {} entries_seen={} cookie={:#x}",
-                        id, state.work.path, state.entries_seen, result.next_cookie
+                        id,
+                        display_path(&state.work.path),
+                        state.entries_seen,
+                        result.next_cookie
                     );
                     let cont = DirWork::continuation(
                         state.work.path.clone(),
@@ -1621,7 +1657,9 @@ fn worker_loop_pipelined(
                 } else if result.eof {
                     debug!(
                         "Worker {} pipelined EOF: {} ({} subdirs in this page)",
-                        id, state.work.path, subdir_count
+                        id,
+                        display_path(&state.work.path),
+                        subdir_count
                     );
                     // dirs_count is bumped exactly once per directory —
                     // here, by whichever worker hits EOF. Continuations
@@ -1661,10 +1699,12 @@ fn worker_loop_pipelined(
                             errors_count.fetch_add(1, Ordering::Relaxed);
                             warn!(
                                 "Worker {} pipelined re-submit failed: {} -> {}",
-                                id, state.work.path, e
+                                id,
+                                display_path(&state.work.path),
+                                e
                             );
                             failures.record(&DirFailure {
-                                path: state.work.path.clone(),
+                                path: display_path(&state.work.path).into_owned(),
                                 kind: e.failure_kind(),
                                 error: e.to_string(),
                                 attempts: state.attempts.max(1),
@@ -1687,10 +1727,15 @@ fn worker_loop_pipelined(
                 if first_page {
                     match retry::plan(&err, state.attempts, &retry_policy) {
                         retry::Action::Fail(_) => {}
-                        retry::Action::Retry { refresh_fh: false, .. } => {
+                        retry::Action::Retry {
+                            refresh_fh: false, ..
+                        } => {
                             redo = Redo::Resubmit(state.file_handle.clone());
                         }
-                        retry::Action::Retry { refresh_fh: true, .. } | retry::Action::CheckGone => {
+                        retry::Action::Retry {
+                            refresh_fh: true, ..
+                        }
+                        | retry::Action::CheckGone => {
                             match nfs.resolve_path_to_fh(&state.work.path) {
                                 Ok(fh) => {
                                     if state.attempts < retry_policy.max_attempts {
@@ -1717,7 +1762,11 @@ fn worker_loop_pipelined(
                             Ok(new_slot) => {
                                 debug!(
                                     "Worker {} pipelined retry {} of {}: {} ({})",
-                                    id, state.attempts + 1, retry_policy.max_attempts, state.work.path, err
+                                    id,
+                                    state.attempts + 1,
+                                    retry_policy.max_attempts,
+                                    display_path(&state.work.path),
+                                    err
                                 );
                                 state.file_handle = fh;
                                 state.cookie = 0;
@@ -1730,10 +1779,12 @@ fn worker_loop_pipelined(
                                 errors_count.fetch_add(1, Ordering::Relaxed);
                                 warn!(
                                     "Worker {} pipelined retry submit failed: {} -> {}",
-                                    id, state.work.path, e
+                                    id,
+                                    display_path(&state.work.path),
+                                    e
                                 );
                                 failures.record(&DirFailure {
-                                    path: state.work.path.clone(),
+                                    path: display_path(&state.work.path).into_owned(),
                                     kind: e.failure_kind(),
                                     error: e.to_string(),
                                     attempts: state.attempts,
@@ -1748,7 +1799,8 @@ fn worker_loop_pipelined(
                         failures.record_vanished(&state.work.path, state.attempts);
                         debug!(
                             "Worker {} directory vanished during the scan: {}",
-                            id, state.work.path
+                            id,
+                            display_path(&state.work.path)
                         );
                         pending_work.fetch_sub(1, Ordering::SeqCst);
                         metrics.exit_dir(id, state.tag);
@@ -1756,7 +1808,7 @@ fn worker_loop_pipelined(
                     Redo::Fail => {
                         errors_count.fetch_add(1, Ordering::Relaxed);
                         let f = DirFailure {
-                            path: state.work.path.clone(),
+                            path: display_path(&state.work.path).into_owned(),
                             kind: err.failure_kind(),
                             error: err.to_string(),
                             attempts: state.attempts,
@@ -1799,6 +1851,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn join_nfs_path_preserves_raw_name_bytes() {
+        assert_eq!(join_nfs_path(b"/", b"bad-\xff"), b"/bad-\xff");
+        assert_eq!(
+            join_nfs_path(b"/parent-\xfe", b"child-\xff"),
+            b"/parent-\xfe/child-\xff"
+        );
+    }
+
+    #[test]
     fn test_walk_stats_default() {
         let stats = WalkStats::default();
         assert_eq!(stats.dirs, 0);
@@ -1830,15 +1891,15 @@ mod tests {
     fn test_should_split_now_truth_table() {
         // (entries_seen, threshold, eof) -> expected
         let cases = [
-            (0u64,         1_000_000u64, false, false),
-            (999_999,      1_000_000,    false, false),
-            (1_000_000,    1_000_000,    false, true),
-            (5_000_000,    1_000_000,    false, true),
-            (5_000_000,    1_000_000,    true,  false), // EOF wins
-            (5_000_000,    0,            false, false), // disabled
-            (0,            0,            false, false), // disabled, empty
-            (0,            0,            true,  false), // disabled + EOF
-            (1,            1,            false, true),  // exactly at threshold
+            (0u64, 1_000_000u64, false, false),
+            (999_999, 1_000_000, false, false),
+            (1_000_000, 1_000_000, false, true),
+            (5_000_000, 1_000_000, false, true),
+            (5_000_000, 1_000_000, true, false), // EOF wins
+            (5_000_000, 0, false, false),        // disabled
+            (0, 0, false, false),                // disabled, empty
+            (0, 0, true, false),                 // disabled + EOF
+            (1, 1, false, true),                 // exactly at threshold
         ];
         for (entries_seen, threshold, eof, expected) in cases {
             let got = should_split_now(entries_seen, threshold, eof);
@@ -1931,7 +1992,10 @@ mod tests {
 
         // Conservation: every page must have been read exactly once.
         for (i, v) in visited.iter().enumerate() {
-            assert!(*v, "page {i} was never read — split dispatch dropped a page");
+            assert!(
+                *v,
+                "page {i} was never read — split dispatch dropped a page"
+            );
         }
 
         (total_entries, continuations)
@@ -2007,13 +2071,7 @@ mod tests {
 
     #[test]
     fn test_dirwork_continuation_carries_resume() {
-        let dw = DirWork::continuation(
-            "/a/b".into(),
-            3,
-            vec![1, 2, 3, 4],
-            42,
-            [9; 8],
-        );
+        let dw = DirWork::continuation(b"/a/b".to_vec(), 3, vec![1, 2, 3, 4], 42, [9; 8]);
         assert!(dw.resume.is_some());
         let r = dw.resume.unwrap();
         assert_eq!(r.cookie, 42);
@@ -2023,9 +2081,8 @@ mod tests {
 
     #[test]
     fn test_dirwork_fresh_has_no_resume() {
-        let dw = DirWork::fresh("/a".into(), 0, None);
+        let dw = DirWork::fresh(b"/a".to_vec(), 0, None);
         assert!(dw.resume.is_none());
         assert!(dw.file_handle.is_none());
     }
-
 }

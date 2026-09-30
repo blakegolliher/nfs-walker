@@ -339,12 +339,9 @@ impl NfsUrl {
                 .as_str()
                 .to_string();
 
-            let port = caps.get(2).and_then(|m| {
-                m.as_str()
-                    .trim_start_matches(':')
-                    .parse::<u16>()
-                    .ok()
-            });
+            let port = caps
+                .get(2)
+                .and_then(|m| m.as_str().trim_start_matches(':').parse::<u16>().ok());
 
             let full_path = caps
                 .get(3)
@@ -512,10 +509,13 @@ impl WalkConfig {
     /// Create and validate configuration from CLI arguments
     pub fn from_args(args: CliArgs) -> Result<Self, ConfigError> {
         // Parse NFS URL (required for scan command)
-        let nfs_url_str = args.nfs_url.as_ref().ok_or_else(|| ConfigError::InvalidNfsUrl {
-            url: String::new(),
-            reason: "NFS URL is required for scan".to_string(),
-        })?;
+        let nfs_url_str = args
+            .nfs_url
+            .as_ref()
+            .ok_or_else(|| ConfigError::InvalidNfsUrl {
+                url: String::new(),
+                reason: "NFS URL is required for scan".to_string(),
+            })?;
 
         let mut nfs_url = NfsUrl::parse(nfs_url_str).map_err(|e| ConfigError::InvalidNfsUrl {
             url: nfs_url_str.clone(),
@@ -564,12 +564,12 @@ impl WalkConfig {
                 if trimmed.is_empty() {
                     continue;
                 }
-                trimmed.parse::<std::net::IpAddr>().map_err(|e| {
-                    ConfigError::InvalidServerIps {
+                trimmed
+                    .parse::<std::net::IpAddr>()
+                    .map_err(|e| ConfigError::InvalidServerIps {
                         entry: raw.clone(),
                         reason: format!("not a valid IP address: {}", e),
-                    }
-                })?;
+                    })?;
                 if seen.insert(trimmed.to_string()) {
                     out.push(trimmed.to_string());
                 }
@@ -739,6 +739,29 @@ pub fn excluded_entry(
         || (is_dir && !dir_globs.is_empty() && dir_globs.iter().any(|g| g.is_match(name)))
 }
 
+/// Byte-safe variant used by the NFS walker.
+///
+/// Regex and glob flags are Unicode interfaces, so they apply only when the
+/// relevant server-provided bytes are valid UTF-8. An invalid name is retained
+/// rather than matched against a lossy surrogate that could exclude a distinct
+/// path accidentally.
+pub fn excluded_entry_bytes(
+    name: &[u8],
+    is_dir: bool,
+    full_path: &[u8],
+    path_patterns: &[Regex],
+    dir_globs: &[Regex],
+) -> bool {
+    let path_match = std::str::from_utf8(full_path).is_ok_and(|path| {
+        !path_patterns.is_empty() && path_patterns.iter().any(|re| re.is_match(path))
+    });
+    let dir_match = is_dir
+        && std::str::from_utf8(name).is_ok_and(|name| {
+            !dir_globs.is_empty() && dir_globs.iter().any(|glob| glob.is_match(name))
+        });
+    path_match || dir_match
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,7 +816,10 @@ mod tests {
     fn dir_glob_matches_names_only() {
         let m = |g: &str, name: &str| compile_dir_glob(g).unwrap().is_match(name);
         assert!(m(".snapshot", ".snapshot"));
-        assert!(!m(".snapshot", "mysnapshot"), "a glob is not a regex: '.' is literal");
+        assert!(
+            !m(".snapshot", "mysnapshot"),
+            "a glob is not a regex: '.' is literal"
+        );
         assert!(!m(".snapshot", "xsnapshot"));
         assert!(!m(".snapshot", ".snapshots"), "anchored");
         assert!(m("*.bak", "data.bak"));
@@ -803,9 +829,15 @@ mod tests {
         assert!(m("[ab]cd", "acd") && m("[ab]cd", "bcd") && !m("[ab]cd", "ccd"));
         assert!(m("[!.]*", "plain") && !m("[!.]*", ".hidden"));
         assert!(m("a[]]b", "a]b"), "']' first in a class is literal");
-        assert!(m(r"star\*", "star*") && !m(r"star\*", "starx"), "escaped glob char");
+        assert!(
+            m(r"star\*", "star*") && !m(r"star\*", "starx"),
+            "escaped glob char"
+        );
         assert!(m("with space", "with space"));
-        assert!(m("(paren)+", "(paren)+"), "regex metacharacters are literal");
+        assert!(
+            m("(paren)+", "(paren)+"),
+            "regex metacharacters are literal"
+        );
     }
 
     #[test]
@@ -819,7 +851,10 @@ mod tests {
             let err = compile_dir_glob(bad).unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains(why), "{bad:?}: {msg}");
-            assert!(msg.contains(&format!("'{bad}'")) || bad.is_empty(), "{bad:?}: {msg}");
+            assert!(
+                msg.contains(&format!("'{bad}'")) || bad.is_empty(),
+                "{bad:?}: {msg}"
+            );
         }
     }
 
@@ -853,14 +888,43 @@ mod tests {
                 .filter(|(name, is_dir, path)| !excluded_entry(name, *is_dir, path, &[], globs))
                 .map(|(name, _, _)| *name)
                 .collect();
-            assert_eq!(kept, vec!["docs", "notes.txt", ".snapshot", "snapshot-2026"]);
+            assert_eq!(
+                kept,
+                vec!["docs", "notes.txt", ".snapshot", "snapshot-2026"]
+            );
         }
         // `.snapshot/a` would only ever be reached by descending into
         // `.snapshot`, which the filter refused; the path regex still
         // catches it if someone asks by path.
         let by_path = vec![Regex::new(r"/\.snapshot(/|$)").unwrap()];
-        assert!(excluded_entry("a", false, "/data/.snapshot/a", &by_path, &[]));
+        assert!(excluded_entry(
+            "a",
+            false,
+            "/data/.snapshot/a",
+            &by_path,
+            &[]
+        ));
         assert!(!excluded_entry("a", false, "/data/docs/a", &by_path, &[]));
+    }
+
+    #[test]
+    fn byte_filter_never_matches_a_lossy_invalid_name() {
+        let by_path = vec![Regex::new("replacement").unwrap()];
+        let by_name = vec![compile_dir_glob("bad-*").unwrap()];
+        assert!(!excluded_entry_bytes(
+            b"bad-\xff",
+            true,
+            b"/data/replacement-\xff",
+            &by_path,
+            &by_name,
+        ));
+        assert!(excluded_entry_bytes(
+            b"bad-name",
+            true,
+            b"/data/bad-name",
+            &[],
+            &by_name,
+        ));
     }
 
     #[test]
@@ -890,25 +954,29 @@ mod tests {
     }
 
     fn parse_with_server_ips(value: &str) -> Result<WalkConfig, ConfigError> {
-        let args = CliArgs::parse_from([
-            "nfs-walker",
-            "nfs://server/export",
-            "--server-ips",
-            value,
-        ]);
+        let args =
+            CliArgs::parse_from(["nfs-walker", "nfs://server/export", "--server-ips", value]);
         WalkConfig::from_args(args)
     }
 
     #[test]
     fn server_ips_empty_string_rejected() {
         let err = parse_with_server_ips("").expect_err("empty string must reject");
-        assert!(matches!(err, ConfigError::InvalidServerIps { .. }), "got {:?}", err);
+        assert!(
+            matches!(err, ConfigError::InvalidServerIps { .. }),
+            "got {:?}",
+            err
+        );
     }
 
     #[test]
     fn server_ips_only_commas_rejected() {
         let err = parse_with_server_ips(",,").expect_err("commas-only must reject");
-        assert!(matches!(err, ConfigError::InvalidServerIps { .. }), "got {:?}", err);
+        assert!(
+            matches!(err, ConfigError::InvalidServerIps { .. }),
+            "got {:?}",
+            err
+        );
     }
 
     #[test]
@@ -925,8 +993,8 @@ mod tests {
 
     #[test]
     fn server_ips_rejects_malformed() {
-        let err = parse_with_server_ips("10.0.0.1,not-an-ip")
-            .expect_err("malformed entry must reject");
+        let err =
+            parse_with_server_ips("10.0.0.1,not-an-ip").expect_err("malformed entry must reject");
         match err {
             ConfigError::InvalidServerIps { entry, .. } => assert_eq!(entry, "not-an-ip"),
             other => panic!("expected InvalidServerIps, got {:?}", other),

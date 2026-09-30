@@ -578,9 +578,9 @@ mod tests {
 
     fn entry(i: u64) -> DbEntry {
         DbEntry {
-            parent_path: Some("/data".to_string()),
-            name: format!("file-{:08}.bin", i),
-            path: format!("/data/file-{:08}.bin", i),
+            parent_path: Some(b"/data".to_vec()),
+            name: format!("file-{:08}.bin", i).into_bytes(),
+            path: format!("/data/file-{:08}.bin", i).into_bytes(),
             entry_type: EntryType::File,
             size: i,
             mtime_sec: Some(1_700_000_000 + i as i64),
@@ -716,8 +716,8 @@ mod tests {
                 let mut e = entry(i);
                 // Stir in a per-row salt so the path column doesn't
                 // dictionary-encode into a handful of bytes.
-                e.path = format!("/data/shard-{:x}/file-{:08x}.bin", i % 997, i);
-                e.name = format!("file-{:08x}.bin", i);
+                e.path = format!("/data/shard-{:x}/file-{:08x}.bin", i % 997, i).into_bytes();
+                e.name = format!("file-{:08x}.bin", i).into_bytes();
                 e
             })
             .collect();
@@ -797,4 +797,3 @@ mod tests {
         // No assertion needed; we're checking the call doesn't panic.
     }
 }
-

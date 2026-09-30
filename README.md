@@ -127,6 +127,13 @@ production bench validated — they are internals, not tunables.
 
 Output is plain Parquet — point any tool at it:
 
+Path identity is byte-safe. The `path_bytes`, `filename_bytes`, and
+`parent_path_bytes` Binary columns contain the exact NFS/POSIX bytes. The
+original UTF-8 `path`, `filename`, and `parent_path` columns remain for
+dashboard and ad-hoc query compatibility; invalid UTF-8 bytes are shown there
+as `\xNN` escapes. Consumers that open or migrate files must use the Binary
+columns.
+
 ```bash
 # DuckDB
 duckdb -c "SELECT file_type, COUNT(*), SUM(size)/1e9 AS gb \

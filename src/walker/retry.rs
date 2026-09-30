@@ -25,6 +25,7 @@
 //! failure outright.
 
 use crate::error::{DirFailure, FailureKind, NfsError};
+use crate::nfs::types::display_path;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -116,9 +117,9 @@ pub enum DirError {
     Failed(DirFailure),
 }
 
-fn failure(path: &str, err: &NfsError, attempts: u32) -> DirError {
+fn failure(path: &[u8], err: &NfsError, attempts: u32) -> DirError {
     DirError::Failed(DirFailure {
-        path: path.to_string(),
+        path: display_path(path).into_owned(),
         kind: err.failure_kind(),
         error: err.to_string(),
         attempts,
@@ -135,7 +136,7 @@ fn failure(path: &str, err: &NfsError, attempts: u32) -> DirError {
 ///   already been handed to the writers; if so, no retry.
 /// - `sleep(d)` waits out a backoff (injected so tests never sleep).
 pub fn read_dir_with_retry<T>(
-    path: &str,
+    path: &[u8],
     mut fh: Option<Vec<u8>>,
     policy: &RetryPolicy,
     mut attempt: impl FnMut(Option<&[u8]>) -> Result<T, NfsError>,
@@ -250,10 +251,10 @@ impl FailureLog {
 
     /// A directory that disappeared during the scan. Logged for the
     /// record; not a failure.
-    pub fn record_vanished(&self, path: &str, attempts: u32) {
+    pub fn record_vanished(&self, path: &[u8], attempts: u32) {
         self.write_line(&serde_json::json!({
             "ts": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            "path": path,
+            "path": display_path(path),
             "kind": "vanished",
             "error": "directory disappeared between its parent's listing and its own read",
             "attempts": attempts,
@@ -351,7 +352,7 @@ mod tests {
 
         fn run(&self, fh: Option<Vec<u8>>) -> Result<u32, DirError> {
             read_dir_with_retry(
-                "/d",
+                b"/d",
                 fh,
                 &policy(),
                 |fh| {
@@ -542,7 +543,7 @@ mod tests {
                 attempts: 1,
             });
         }
-        log.record_vanished("/gone", 2);
+        log.record_vanished(b"/gone", 2);
         log.flush();
         assert_eq!(log.samples().len(), SAMPLE_CAP, "bounded");
         let body = std::fs::read_to_string(&path).unwrap();

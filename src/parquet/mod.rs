@@ -7,7 +7,7 @@
 //!
 //! # Module structure
 //!
-//! - `schema`: Canonical Arrow schema definition (24 columns)
+//! - `schema`: Arrow schema definition (24 legacy analytics columns plus 3 raw-byte path columns)
 //! - `builder`: Shared row-builder used by the writer
 //! - `direct_writer`: In-process streaming writer fed by the walker
 
