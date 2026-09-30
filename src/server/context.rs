@@ -85,10 +85,7 @@ impl AnalyticsContext {
             let metadata_bytes = std::fs::read(&metadata_path)?;
             let metadata: serde_json::Value = serde_json::from_slice(&metadata_bytes)?;
 
-            let scan_id = metadata["scan_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
+            let scan_id = metadata["scan_id"].as_str().unwrap_or_default().to_string();
 
             if scan_id.is_empty() {
                 continue;
@@ -109,12 +106,8 @@ impl AnalyticsContext {
 
             // Register the scan directory as a Parquet table
             let scan_path = path.to_string_lossy().to_string();
-            ctx.register_parquet(
-                &table_name,
-                &scan_path,
-                ParquetReadOptions::default(),
-            )
-            .await?;
+            ctx.register_parquet(&table_name, &scan_path, ParquetReadOptions::default())
+                .await?;
 
             // Track latest scan
             if let Some(ts) = scan_timestamp_us {
@@ -151,12 +144,8 @@ impl AnalyticsContext {
         if let Some(ref latest) = latest_id {
             if let Some(info) = scans.get(latest) {
                 let scan_path = info.scan_dir.to_string_lossy().to_string();
-                ctx.register_parquet(
-                    "entries",
-                    &scan_path,
-                    ParquetReadOptions::default(),
-                )
-                .await?;
+                ctx.register_parquet("entries", &scan_path, ParquetReadOptions::default())
+                    .await?;
             }
         }
 

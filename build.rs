@@ -30,10 +30,16 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", dir.display());
         if dir.join("libnfs.a").exists() {
             println!("cargo:rustc-link-lib=static=nfs");
-            eprintln!("Using static libnfs from NFS_WALKER_LIBNFS_DIR={}", dir.display());
+            eprintln!(
+                "Using static libnfs from NFS_WALKER_LIBNFS_DIR={}",
+                dir.display()
+            );
         } else if dir.join("libnfs.so").exists() {
             println!("cargo:rustc-link-lib=dylib=nfs");
-            eprintln!("Using dynamic libnfs from NFS_WALKER_LIBNFS_DIR={}", dir.display());
+            eprintln!(
+                "Using dynamic libnfs from NFS_WALKER_LIBNFS_DIR={}",
+                dir.display()
+            );
         } else {
             panic!(
                 "NFS_WALKER_LIBNFS_DIR={} contains neither libnfs.a nor libnfs.so",
@@ -58,10 +64,7 @@ fn main() {
         }
 
         // Fallback: try to use pkg-config with musl sysroot
-        if let Ok(lib) = pkg_config::Config::new()
-            .statik(true)
-            .probe("libnfs")
-        {
+        if let Ok(lib) = pkg_config::Config::new().statik(true).probe("libnfs") {
             for path in &lib.link_paths {
                 println!("cargo:rustc-link-search=native={}", path.display());
             }
@@ -91,7 +94,7 @@ fn main() {
     // For non-musl targets, use pkg-config with dynamic linking
     // (static linking only works when libnfs.a is available)
     let lib = pkg_config::Config::new()
-        .statik(false)  // Use dynamic linking
+        .statik(false) // Use dynamic linking
         .probe("libnfs")
         .expect(
             "libnfs not found. Please install libnfs development package \

@@ -43,8 +43,8 @@ pub async fn execute_query(
     params: &HashMap<String, String>,
     scan_id: Option<&str>,
 ) -> Result<QueryResult, ServerError> {
-    let query = get_query(query_id)
-        .ok_or_else(|| ServerError::QueryNotFound(query_id.to_string()))?;
+    let query =
+        get_query(query_id).ok_or_else(|| ServerError::QueryNotFound(query_id.to_string()))?;
 
     let table = ctx.resolve_table(scan_id)?;
     let sql = bind_params(query, &table, params)?;
@@ -60,7 +60,12 @@ pub async fn execute_query(
     let execution_ms = start.elapsed().as_millis() as u64;
 
     let columns = if let Some(batch) = batches.first() {
-        batch.schema().fields().iter().map(|f| f.name().clone()).collect()
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
     } else {
         vec![]
     };
@@ -132,7 +137,8 @@ mod tests {
                 Arc::new(StringArray::from(vec!["alpha", "beta"])),
                 Arc::new(Int64Array::from(vec![100, 200])),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         let rows = batches_to_json(&[batch]).unwrap();
         assert_eq!(rows.len(), 2);

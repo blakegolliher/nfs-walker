@@ -632,22 +632,14 @@ const PARAM_THRESHOLD: ParamDef = ParamDef {
 
 pub static QUERY_CATALOG: &[QueryDef] = &[
     // Capacity & Volume
-    Q001, Q002, Q003, Q004, Q005, Q006, Q007, Q008,
-    // Ownership & Access
-    Q010, Q011, Q012, Q013, Q015,
-    // Directory Structure
-    Q020, Q021, Q022, Q025, Q027,
-    // File Size
-    Q030, Q031, Q032, Q033, Q034, Q036,
-    // File Type & Extension
-    Q040, Q041, Q044,
-    // Time-Based
-    Q050, Q051, Q052, Q053, Q055,
-    // Storage Efficiency
-    Q064,
-    // Migration & Compliance
-    Q073,
-    // Scan Operations
+    Q001, Q002, Q003, Q004, Q005, Q006, Q007, Q008, // Ownership & Access
+    Q010, Q011, Q012, Q013, Q015, // Directory Structure
+    Q020, Q021, Q022, Q025, Q027, // File Size
+    Q030, Q031, Q032, Q033, Q034, Q036, // File Type & Extension
+    Q040, Q041, Q044, // Time-Based
+    Q050, Q051, Q052, Q053, Q055, // Storage Efficiency
+    Q064, // Migration & Compliance
+    Q073, // Scan Operations
     Q080, Q081,
 ];
 
@@ -739,7 +731,10 @@ fn validate_param(param: &ParamDef, value: &str) -> Result<String, ServerError> 
         }
         ParamType::String => {
             // Only allow alphanumeric + underscore + hyphen + dot
-            if !value.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.') {
+            if !value
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+            {
                 return Err(ServerError::InvalidParameter {
                     name: param.name.to_string(),
                     reason: "string contains disallowed characters".to_string(),
@@ -756,7 +751,11 @@ mod tests {
 
     #[test]
     fn test_catalog_count() {
-        assert!(QUERY_CATALOG.len() >= 25, "Expected at least 25 P0 queries, got {}", QUERY_CATALOG.len());
+        assert!(
+            QUERY_CATALOG.len() >= 25,
+            "Expected at least 25 P0 queries, got {}",
+            QUERY_CATALOG.len()
+        );
     }
 
     #[test]

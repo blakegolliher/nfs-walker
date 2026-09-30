@@ -66,13 +66,7 @@ pub fn format_number(n: u64) -> String {
 
     let chunks: Vec<String> = bytes
         .chunks(3)
-        .map(|chunk| {
-            chunk
-                .iter()
-                .rev()
-                .map(|&b| b as char)
-                .collect::<String>()
-        })
+        .map(|chunk| chunk.iter().rev().map(|&b| b as char).collect::<String>())
         .collect();
 
     chunks.into_iter().rev().collect::<Vec<_>>().join(",")
@@ -99,11 +93,7 @@ pub fn print_summary(
     println!();
     println!("{}", style("Walk Complete").green().bold());
     println!("{}", style("─".repeat(50)).dim());
-    println!(
-        "  {} {}",
-        style("Directories:").bold(),
-        format_number(dirs)
-    );
+    println!("  {} {}", style("Directories:").bold(), format_number(dirs));
     println!("  {} {}", style("Files:").bold(), format_number(files));
     println!("  {} {}", style("Total Size:").bold(), bytes_str);
     println!(
@@ -122,7 +112,12 @@ pub fn print_summary(
     // Show output path with size if available
     if let Some(size) = output_size {
         let size_str = format_size(size, BINARY);
-        println!("  {} {} ({})", style("Output:").bold(), output_path, size_str);
+        println!(
+            "  {} {} ({})",
+            style("Output:").bold(),
+            output_path,
+            size_str
+        );
     } else {
         println!("  {} {}", style("Output:").bold(), output_path);
     }
