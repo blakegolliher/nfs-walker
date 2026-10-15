@@ -121,7 +121,10 @@ nfs-walker nfs://server/export -o scan.parquet \
 
 Row-group size (256 K rows), part-file rotation (512 MiB), and writer
 channel depth (64 batches) are fixed at the values the 810 M-file
-production bench validated — they are internals, not tunables.
+production bench validated. A row group also closes early once its
+shard's share of 64 MiB of buffered column data fills (2 MiB a shard
+at the default 32 shards), so memory stays bounded on a tree of any
+size. These are internals, not tunables.
 
 ### Querying results
 
