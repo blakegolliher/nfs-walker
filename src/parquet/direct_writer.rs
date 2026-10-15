@@ -10,7 +10,9 @@
 //!
 //! Each writer owns one Arrow `RowBuilder`, one `ArrowWriter`, and
 //! rotates to a new part file once the current one crosses
-//! `target_file_size`. Row-group flush is triggered by row count.
+//! `target_file_size`. A row group is flushed once it holds
+//! `row_group_size` rows or `row_group_bytes` of column data, whichever
+//! comes first.
 //!
 //! No incremental rescan / resume capability — a crashed scan starts
 //! over. The throughput win — 690 K files/sec on the 810 M-file prod
@@ -114,7 +116,25 @@ pub const DEFAULT_CHANNEL_DEPTH: usize = 64;
 /// the scan instead of dumping it at the end: each tail flush is
 /// ~25-50 MB per shard post-compression (vs 200 MB+ at 1M), while
 /// row-group statistics stay useful for downstream predicate pushdown.
+/// A shard flushes sooner when its share of
+/// [`DEFAULT_WRITER_BUFFER_BYTES`] fills.
 pub const DEFAULT_ROW_GROUP_SIZE: usize = 256_000;
+
+/// Column data all writer shards may buffer at once, split evenly
+/// between them (see `RowBuilder::buffered_bytes`): a shard closes its
+/// row group when its share fills or at [`DEFAULT_ROW_GROUP_SIZE`]
+/// rows, whichever comes first. At the default 32 shards that is 2 MiB
+/// a shard, about 3,700 rows of 100-byte paths. Without it a shard held
+/// every row until it had 256K, so a scan of fewer than `shards × 256K`
+/// entries kept all of them in memory until it ended: mongoose's peak
+/// on a 2M-entry scan was 2.3 GB, and is 0.6 GB with it.
+pub const DEFAULT_WRITER_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+
+/// Each shard's row-group byte budget when `shards` writers share
+/// [`DEFAULT_WRITER_BUFFER_BYTES`].
+pub fn row_group_bytes_for(shards: usize) -> usize {
+    (DEFAULT_WRITER_BUFFER_BYTES / shards.max(1)).max(1)
+}
 
 /// Part-file rotation threshold. Once a shard's current file crosses
 /// this, the writer closes it and starts `part-rNN-SSSSS+1.parquet`.
@@ -136,6 +156,9 @@ pub struct DirectWriteConfig {
     pub shards: usize,
     /// Rows per row-group flush. See [`DEFAULT_ROW_GROUP_SIZE`].
     pub row_group_size: usize,
+    /// Column-buffer bytes per row-group flush, for one shard. See
+    /// [`row_group_bytes_for`].
+    pub row_group_bytes: usize,
     /// File rotation threshold in bytes. The writer closes the current
     /// part once `bytes_written` crosses this value.
     pub target_file_size: usize,
@@ -154,6 +177,7 @@ impl Default for DirectWriteConfig {
             scan_timestamp_us: 0,
             shards: 1,
             row_group_size: DEFAULT_ROW_GROUP_SIZE,
+            row_group_bytes: row_group_bytes_for(1),
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             // Snappy matches the streaming-Parquet default in DuckDB,
             // PyArrow, and Polars: faster encoder than ZSTD, ~30%
@@ -264,6 +288,7 @@ pub fn spawn_direct_parquet_writers(
         let props = Arc::clone(&props);
         let metrics = Arc::clone(&metrics);
         let row_group_size = config.row_group_size;
+        let row_group_bytes = config.row_group_bytes;
         let target_file_size = config.target_file_size;
         let row_ctx = RowContext {
             scan_id: config.scan_id.clone(),
@@ -281,6 +306,7 @@ pub fn spawn_direct_parquet_writers(
                     props,
                     row_ctx,
                     row_group_size,
+                    row_group_bytes,
                     target_file_size,
                     metrics,
                 )
@@ -370,15 +396,21 @@ fn writer_loop(
     props: Arc<WriterProperties>,
     row_ctx: RowContext,
     row_group_size: usize,
+    row_group_bytes: usize,
     target_file_size: usize,
     metrics: Arc<ScanMetrics>,
 ) -> Result<ShardSummary, WalkerError> {
     debug!(
-        "parquet writer {} started (row_group={}, target_file={}B)",
-        shard_idx, row_group_size, target_file_size
+        "parquet writer {} started (row_group={} rows or {}B, target_file={}B)",
+        shard_idx, row_group_size, row_group_bytes, target_file_size
     );
 
-    let mut row_builder = RowBuilder::new(row_ctx, row_group_size.max(1));
+    // Pre-size for the rows a group can actually reach: the row limit,
+    // or fewer when the byte budget closes the group first.
+    let capacity = row_group_size
+        .min(RowBuilder::rows_reserved_in(row_group_bytes))
+        .max(1);
+    let mut row_builder = RowBuilder::new(row_ctx, capacity);
     let mut part_seq: u32 = 0;
     let mut inprogress = InProgressPart::new(&scan_dir, shard_idx, part_seq);
     let mut writer = open_part_writer(inprogress.path(), &schema, &props)?;
@@ -400,11 +432,14 @@ fn writer_loop(
         for entry in &batch {
             row_builder.push_db_entry(entry)?;
 
-            // Row-group flush by count. Flushing here (inside the
-            // per-batch loop) keeps memory bounded on a giant batch
-            // and avoids accumulating row_group_size × shards entries
-            // before the first write.
-            if row_builder.row_count() >= row_group_size {
+            // Row-group flush by count or by bytes. Flushing here
+            // (inside the per-batch loop) keeps memory bounded on a
+            // giant batch, and the byte budget keeps a shard from
+            // holding up to row_group_size rows of long paths, or
+            // every row of a small scan, before the first write.
+            if row_builder.row_count() >= row_group_size
+                || row_builder.buffered_bytes() >= row_group_bytes
+            {
                 flush_row_group(
                     shard_idx,
                     &mut row_builder,
@@ -484,6 +519,10 @@ fn flush_row_group(
     let batch = row_builder.finish()?;
     let t = Instant::now();
     writer.write(&batch).map_err(ParquetError::Parquet)?;
+    // Close the row group now. The ArrowWriter otherwise keeps encoded
+    // rows in memory until it holds `max_row_group_row_count` of them,
+    // which a byte-budget flush never reaches.
+    writer.flush().map_err(ParquetError::Parquet)?;
     metrics.record_write_latency(shard_idx, t.elapsed());
     summary.entries_written += rows;
     Ok(())
@@ -566,6 +605,7 @@ pub(crate) fn test_config(output_dir: PathBuf, shards: usize) -> DirectWriteConf
         scan_timestamp_us: 0,
         shards,
         row_group_size: 1_000_000,
+        row_group_bytes: row_group_bytes_for(shards),
         target_file_size: 256 * 1024 * 1024,
         compression: ParquetCompression::Zstd(3),
         channel_depth: DEFAULT_CHANNEL_DEPTH,
@@ -701,6 +741,7 @@ mod tests {
             scan_timestamp_us: 0,
             shards: 1,
             row_group_size: 200,
+            row_group_bytes: row_group_bytes_for(1),
             target_file_size: 1024,
             // ZSTD level 1 — cheaper compression so the on-disk size
             // tracks the row count more linearly. The point of the
@@ -743,6 +784,50 @@ mod tests {
             summary.part_files.len(),
             summary.bytes_written
         );
+    }
+
+    #[test]
+    fn shards_split_the_writer_buffer_budget() {
+        assert_eq!(row_group_bytes_for(32), 2 * 1024 * 1024);
+        assert_eq!(row_group_bytes_for(1), DEFAULT_WRITER_BUFFER_BYTES);
+        assert_eq!(row_group_bytes_for(0), DEFAULT_WRITER_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn direct_writer_closes_a_row_group_at_the_byte_budget() {
+        let dir = tempdir().unwrap();
+        // A row-count limit the scan never reaches, and a 64 KiB byte
+        // budget it reaches every few hundred rows.
+        let cfg = DirectWriteConfig {
+            row_group_bytes: 64 * 1024,
+            ..test_config(dir.path().to_path_buf(), 1)
+        };
+        let metrics = build_metrics(1);
+        let pool = spawn_direct_parquet_writers(cfg.clone(), metrics).unwrap();
+        pool.senders[0]
+            .send((0..10_000).map(entry).collect())
+            .unwrap();
+        drop(pool.senders);
+        let summary = pool
+            .joins
+            .into_iter()
+            .next()
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.entries_written, 10_000);
+
+        let scan_dir = cfg.output_dir.join("scans").join(&cfg.scan_id);
+        let file = File::open(scan_dir.join(&summary.part_files[0])).unwrap();
+        let reader = parquet::file::reader::SerializedFileReader::new(file).unwrap();
+        let meta = parquet::file::reader::FileReader::metadata(&reader);
+        let rows: Vec<i64> = meta.row_groups().iter().map(|g| g.num_rows()).collect();
+        assert_eq!(rows.iter().sum::<i64>(), 10_000);
+        assert!(rows.len() > 10, "expected many row groups, got {rows:?}");
+        // Each group closed as soon as its rows reached the budget
+        // (about 250 bytes a row here), not at the 1M-row limit.
+        assert!(rows.iter().all(|&n| n < 1_000), "{rows:?}");
     }
 
     #[test]

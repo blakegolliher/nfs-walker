@@ -106,13 +106,20 @@ fn join_nfs_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
 
 /// Per-worker fan-out helper. Each entry is routed to its owning
 /// path-shard channel by `path_to_shard(entry.path, shards)`. Workers
-/// hold N partial batches in parallel; shards == 1 collapses to a
-/// single channel and matches the legacy behavior bit-for-bit.
+/// hold N partial batches in parallel, but at most `batch_size` entries
+/// across all of them: a batch ships when it fills, and every partial
+/// batch ships once the worker's total reaches `batch_size`. Without
+/// that cap a worker could hold `shards × batch_size` entries, and a
+/// scan smaller than `workers × shards × batch_size` held every entry
+/// until it ended. shards == 1 collapses to a single channel and
+/// matches the legacy behavior bit-for-bit.
 struct ShardedSender {
     senders: Vec<Sender<Vec<DbEntry>>>,
     batches: Vec<Vec<DbEntry>>,
     batch_size: usize,
     shards: usize,
+    /// Entries held across all `batches`.
+    pending: usize,
 }
 
 impl ShardedSender {
@@ -126,25 +133,44 @@ impl ShardedSender {
             batches,
             batch_size,
             shards,
+            pending: 0,
         }
     }
 
     /// Push one entry into its shard's pending batch. If that batch
     /// reaches `batch_size`, it's drained and shipped to its writer's
-    /// channel; returns Err(()) when the channel is closed (writer
-    /// gone, propagate as "shutdown").
+    /// channel; if instead the worker's total reaches `batch_size`,
+    /// every partial batch ships. Returns Err(()) when a channel is
+    /// closed (writer gone, propagate as "shutdown").
     fn push(&mut self, entry: DbEntry) -> std::result::Result<(), ()> {
         let shard = path_to_shard(&entry.path, self.shards);
         let batch = &mut self.batches[shard];
         batch.push(entry);
+        self.pending += 1;
         if batch.len() >= self.batch_size {
             let full = std::mem::replace(batch, Vec::with_capacity(self.batch_size));
+            self.pending -= full.len();
             self.senders[shard].send(full).map_err(|_| ())?;
+        } else if self.pending >= self.batch_size {
+            self.send_partials()?;
         }
         Ok(())
     }
 
-    /// Drain residual partial batches at end-of-walk.
+    /// Ship every non-empty batch, partial or not.
+    fn send_partials(&mut self) -> std::result::Result<(), ()> {
+        for (shard, batch) in self.batches.iter_mut().enumerate() {
+            if !batch.is_empty() {
+                let part = std::mem::take(batch);
+                self.pending -= part.len();
+                self.senders[shard].send(part).map_err(|_| ())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drain residual partial batches at end-of-walk. A closed channel
+    /// does not stop the others from draining.
     fn flush_all(&mut self) {
         for (shard, batch) in self.batches.iter_mut().enumerate() {
             if !batch.is_empty() {
@@ -152,6 +178,7 @@ impl ShardedSender {
                 let _ = self.senders[shard].send(full);
             }
         }
+        self.pending = 0;
     }
 }
 
@@ -288,6 +315,7 @@ impl SimpleWalker {
                 scan_timestamp_us,
                 shards,
                 row_group_size: crate::parquet::direct_writer::DEFAULT_ROW_GROUP_SIZE,
+                row_group_bytes: crate::parquet::direct_writer::row_group_bytes_for(shards),
                 target_file_size: crate::parquet::direct_writer::DEFAULT_TARGET_FILE_SIZE,
                 compression: self.config.parquet_compression.to_direct_writer(),
                 channel_depth: crate::parquet::direct_writer::DEFAULT_CHANNEL_DEPTH,
@@ -1975,6 +2003,77 @@ fn ffi_rpc_status_success() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sharded(
+        shards: usize,
+        batch_size: usize,
+    ) -> (
+        ShardedSender,
+        Vec<crossbeam_channel::Receiver<Vec<DbEntry>>>,
+    ) {
+        let (txs, rxs) = (0..shards).map(|_| crossbeam_channel::unbounded()).unzip();
+        (ShardedSender::new(txs, batch_size), rxs)
+    }
+
+    fn named(i: usize) -> DbEntry {
+        DbEntry {
+            path: format!("/d/f-{i}").into_bytes(),
+            name: format!("f-{i}").into_bytes(),
+            ..DbEntry::default()
+        }
+    }
+
+    /// (batches, entries) received so far on every channel.
+    fn drain(rxs: &[crossbeam_channel::Receiver<Vec<DbEntry>>]) -> (Vec<usize>, usize) {
+        let sizes: Vec<usize> = rxs
+            .iter()
+            .flat_map(|rx| rx.try_iter())
+            .map(|b| b.len())
+            .collect();
+        let total = sizes.iter().sum();
+        (sizes, total)
+    }
+
+    #[test]
+    fn a_worker_never_holds_more_than_batch_size_entries_across_shards() {
+        let (mut sender, rxs) = sharded(32, 100);
+        let mut shipped = 0;
+        for i in 0..10_000 {
+            sender.push(named(i)).unwrap();
+            assert!(
+                sender.pending < 100,
+                "after {} pushes: {}",
+                i + 1,
+                sender.pending
+            );
+            shipped += drain(&rxs).1;
+            assert_eq!(
+                shipped + sender.pending,
+                i + 1,
+                "no entry lost or duplicated"
+            );
+        }
+        // 32 shards x 100 would have held 3,200 entries; 10,000 entries
+        // spread over 32 shards would never have filled one batch.
+        assert!(
+            shipped > 9_900,
+            "only {shipped} of 10,000 shipped before the end"
+        );
+        sender.flush_all();
+        assert_eq!(sender.pending, 0);
+        assert_eq!(shipped + drain(&rxs).1, 10_000);
+    }
+
+    #[test]
+    fn one_shard_still_ships_full_batches_only() {
+        let (mut sender, rxs) = sharded(1, 10);
+        for i in 0..25 {
+            sender.push(named(i)).unwrap();
+        }
+        assert_eq!(drain(&rxs).0, [10, 10]);
+        sender.flush_all();
+        assert_eq!(drain(&rxs).0, [5]);
+    }
 
     #[test]
     fn join_nfs_path_preserves_raw_name_bytes() {

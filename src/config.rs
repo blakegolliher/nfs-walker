@@ -91,11 +91,14 @@ pub struct CliArgs {
     )]
     pub workers: usize,
 
-    /// Batch size sent from each worker to the writer threads. Larger
-    /// batches mean fewer cross-thread sends and larger Arrow row groups,
-    /// which reduces contention from ≥hundreds of producers. 5000 is a
-    /// good default for billion-entry scans on multi-core hosts; drop to
-    /// 1000 for tiny exports or low-memory environments.
+    /// Entries each worker holds before handing them to the writer
+    /// threads, across all writer shards: a shard's batch ships when it
+    /// fills, and every partial batch ships once the worker holds this
+    /// many. Larger batches mean fewer cross-thread sends, which reduces
+    /// contention from ≥hundreds of producers; the workers hold at most
+    /// `workers × this` entries. 5000 is a good default for
+    /// billion-entry scans on multi-core hosts; drop to 1000 for tiny
+    /// exports or low-memory environments.
     #[arg(
         short = 'b',
         long,

@@ -146,8 +146,9 @@ See `tasks/parquet-experiment-review.md` for the full bench writeup.
 - derives `parent_path` zero-copy from `path` (the walker never clones
   the parent bytes per entry) and the legacy `*_us` timestamp columns
   from the (sec, nsec) pairs the walker carries
-- column builders pre-allocated to the row-group size and re-primed on
-  every `finish()`
+- column builders pre-sized to the rows a row group can reach (the row
+  limit, or fewer under the byte budget) and re-primed on every
+  `finish()`; `buffered_bytes()` counts the column data they hold
 
 **schema.rs** — canonical Arrow schema definition
 
@@ -165,7 +166,8 @@ via `value_parser` ranges — no hand-rolled validation):
 - Parquet compression (`--parquet-compression`); row-group size,
   rotation threshold, and channel depth are fixed constants in
   `direct_writer.rs` (`DEFAULT_ROW_GROUP_SIZE` etc.), validated by the
-  810 M-file bench
+  810 M-file bench. The writers' shared byte budget
+  (`DEFAULT_WRITER_BUFFER_BYTES`) is a fixed constant there too.
 - Timeout / retry / `--server-ips` override
 
 ### 5. Error handling (`src/error.rs`)
@@ -189,13 +191,16 @@ Structured `thiserror`-derived enums:
    - Push root directory to the work-stealing queue
    - Workers steal directories, run READDIRPLUS (pipelined when
      `--pipeline-depth > 0`)
-   - Each entry → `ShardedSender` → shard channel → writer
+   - Each entry → `ShardedSender` → shard channel → writer; a worker
+     holds at most `batch_size` entries across all shards
    - Subdirectories pushed back to the deque
 
 3. **Writing**
    - Per-shard writer drains its channel, appends to Arrow builders
-     (pre-sized to the row-group size — no re-growth per group)
-   - Row group flush every 256 K rows (`DEFAULT_ROW_GROUP_SIZE`)
+     (pre-sized to the rows a group can reach)
+   - Row group flush at 256 K rows (`DEFAULT_ROW_GROUP_SIZE`) or when
+     the shard's share of 64 MiB of column data fills
+     (`DEFAULT_WRITER_BUFFER_BYTES`), whichever comes first
    - Part-file rotation at 512 MiB (`DEFAULT_TARGET_FILE_SIZE`)
    - On end-of-channel: tail flush + footer write
 
@@ -266,10 +271,17 @@ Main Thread
 
 ## Memory usage
 
-- **Bounded shard channels** — caps in-flight memory at roughly
-  `channel_depth (64) × writer_shards × batch_size × ~200 B`
-- **Per-shard Arrow builder** — sized to the row-group threshold
-- Typical peak: ~2 GiB on default config (channel-depth 64, 32 shards)
+- **Worker batches** — each worker holds at most `batch_size` (5000)
+  entries across all shards before shipping them
+- **Bounded shard channels** — cap queued memory at roughly
+  `channel_depth (64) × writer_shards × batch_size × ~200 B` in the
+  worst case
+- **Per-shard Arrow builder** — closes its row group when its share of
+  `DEFAULT_WRITER_BUFFER_BYTES` (64 MiB across all shards) fills, so
+  the rows buffered stay bounded however small or large the tree
+- Before the worker cap and byte budget, a scan smaller than
+  `shards × 256 K` entries held every entry until it ended: mongoose's
+  peak RSS on a 2M-entry scan was 2.3 GB; with them it is 0.6 GB
 
 ## Analytics server (`src/server/`, feature `server`)
 

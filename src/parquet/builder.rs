@@ -46,6 +46,12 @@ const PATH_BYTES_PER_ROW: usize = 48;
 const NAME_BYTES_PER_ROW: usize = 16;
 const EXT_BYTES_PER_ROW: usize = 4;
 
+/// Column-buffer bytes every row adds besides its string and binary
+/// values: 120 of fixed-width values (four u64, seven i64, three u32
+/// plus the scan_id dictionary key, three i32, two u16) and the 4-byte
+/// offsets of the eight string and binary columns.
+const FIXED_BYTES_PER_ROW: usize = 120 + 8 * 4;
+
 /// Accumulates rows into Arrow column builders and produces a
 /// `RecordBatch` on demand. Re-usable across batch boundaries -- the
 /// `finish()` method moves out each builder and replaces it with a
@@ -58,6 +64,9 @@ pub struct RowBuilder {
     /// the writer's row-group size).
     capacity: usize,
     rows: usize,
+    /// Bytes the buffered rows occupy in the column buffers, counted as
+    /// they are appended (see [`Self::buffered_bytes`]).
+    bytes: usize,
 
     b_path: StringBuilder,
     b_filename: StringBuilder,
@@ -102,6 +111,7 @@ impl RowBuilder {
             ctx,
             capacity,
             rows: 0,
+            bytes: 0,
             b_path: StringBuilder::with_capacity(capacity, capacity * PATH_BYTES_PER_ROW),
             b_filename: StringBuilder::with_capacity(capacity, capacity * NAME_BYTES_PER_ROW),
             b_extension: StringBuilder::with_capacity(capacity, capacity * EXT_BYTES_PER_ROW),
@@ -148,6 +158,27 @@ impl RowBuilder {
         self.rows == 0
     }
 
+    /// Bytes the buffered rows occupy in the column buffers: every
+    /// string and binary value plus [`FIXED_BYTES_PER_ROW`] per row.
+    /// Spare capacity is not counted. The writer flushes a row group
+    /// when this reaches its byte budget, so long paths cannot make a
+    /// row-count limit hold more memory than intended.
+    pub fn buffered_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Rows whose initial column reservations add up to `bytes`: the
+    /// pre-size for a builder that flushes at a byte budget. Reserving
+    /// for more rows than the budget lets through only strands memory,
+    /// and the reservation is made again after every flush.
+    pub fn rows_reserved_in(bytes: usize) -> usize {
+        bytes
+            / (FIXED_BYTES_PER_ROW
+                + 4 * PATH_BYTES_PER_ROW
+                + 2 * NAME_BYTES_PER_ROW
+                + 2 * EXT_BYTES_PER_ROW)
+    }
+
     /// Append a row sourced from a `DbEntry` (the streaming writer fed
     /// from the walker pipeline).
     ///
@@ -171,9 +202,12 @@ impl RowBuilder {
             .as_deref()
             .unwrap_or_else(|| compute_parent_path(&entry.path));
 
-        self.b_path.append_value(display_path(&entry.path).as_ref());
-        self.b_filename
-            .append_value(display_path(&entry.name).as_ref());
+        let path_text = display_path(&entry.path);
+        let name_text = display_path(&entry.name);
+        let parent_text = display_path(parent);
+
+        self.b_path.append_value(path_text.as_ref());
+        self.b_filename.append_value(name_text.as_ref());
         match entry.extension.as_deref() {
             Some(ext) => self.b_extension.append_value(ext),
             None => self.b_extension.append_null(),
@@ -203,8 +237,7 @@ impl RowBuilder {
         self.b_ctime_nsec.append_option(entry.ctime_nsec);
         self.b_depth
             .append_value(entry.depth.min(u16::MAX as u32) as u16);
-        self.b_parent_path
-            .append_value(display_path(parent).as_ref());
+        self.b_parent_path.append_value(parent_text.as_ref());
         self.b_scan_id.append_value(&self.ctx.scan_id);
         self.b_scan_ts.append_value(self.ctx.scan_timestamp_us);
         self.b_path_bytes.append_value(&entry.path);
@@ -213,6 +246,15 @@ impl RowBuilder {
         self.b_fsid.append_option(entry.fsid);
 
         self.rows += 1;
+        self.bytes += FIXED_BYTES_PER_ROW
+            + path_text.len()
+            + name_text.len()
+            + entry.extension.as_deref().map_or(0, str::len)
+            + file_type.len()
+            + parent_text.len()
+            + entry.path.len()
+            + entry.name.len()
+            + parent.len();
         Ok(())
     }
 
@@ -329,6 +371,26 @@ mod tests {
         );
         // Missing sec: column is null.
         assert_eq!(micros_from_parts(None, Some(5)), None);
+    }
+
+    #[test]
+    fn buffered_bytes_counts_every_value_and_resets_on_finish() {
+        let mut rb = RowBuilder::new(RowContext::default(), 16);
+        assert_eq!(rb.buffered_bytes(), 0);
+        rb.push_db_entry(&DbEntry {
+            path: b"/data/a.txt".to_vec(),
+            name: b"a.txt".to_vec(),
+            extension: Some("txt".to_string()),
+            ..DbEntry::default()
+        })
+        .unwrap();
+        let file_type = DbEntry::default().entry_type.file_type_name().unwrap();
+        // Path, filename and parent ("/data") each as text and as
+        // bytes, the extension, and the file type name.
+        let values = 2 * (11 + 5 + 5) + 3 + file_type.len();
+        assert_eq!(rb.buffered_bytes(), FIXED_BYTES_PER_ROW + values);
+        rb.finish().unwrap();
+        assert_eq!(rb.buffered_bytes(), 0);
     }
 
     #[test]
