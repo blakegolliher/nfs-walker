@@ -96,7 +96,8 @@ See `tasks/parquet-experiment-review.md` for the full bench writeup.
 ### 2. Walker (`src/walker/`)
 
 **simple.rs** — core parallel walker
-- Work-stealing queue using `crossbeam_deque`
+- Work-stealing queue using `crossbeam_deque`: each worker's own
+  queue is LIFO (depth first) and peers steal its oldest entries
 - Each worker owns its own NFS connection
 - Workers pop directories, READDIRPLUS, push subdirs
 - Per-entry routing to writer shards via `ShardedSender`
@@ -282,6 +283,13 @@ Main Thread
 - Before the worker cap and byte budget, a scan smaller than
   `shards × 256 K` entries held every entry until it ended: mongoose's
   peak RSS on a 2M-entry scan was 2.3 GB; with them it is 0.6 GB
+- **Directory queues** — each worker's queue is LIFO, so the scan goes
+  depth first and the directories waiting at once number about the
+  tree's depth × fan-out. FIFO queues went breadth first and held most
+  of the tree's widest level; on a 1M-directory tree, 7 levels deep
+  with up to 20 subdirectories each, peak RSS fell from 727–749 MB to
+  625–675 MB. One directory with millions of subdirectories still
+  queues all of them at once.
 
 ## Analytics server (`src/server/`, feature `server`)
 

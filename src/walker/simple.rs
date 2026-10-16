@@ -90,6 +90,19 @@ impl DirWork {
     }
 }
 
+/// A worker's own queue of directories still to read.
+///
+/// LIFO, so a worker reads the directory it queued last: the scan goes
+/// depth first, and the directories waiting at any moment number about
+/// the tree's depth × its fan-out. A FIFO queue went breadth first and
+/// held every directory of the widest level, which grows with the
+/// tree. Peers steal from the other, oldest end, so a thief takes the
+/// shallowest directory a worker has queued, which is usually the
+/// largest subtree.
+fn dir_queue() -> DequeWorker<DirWork> {
+    DequeWorker::new_lifo()
+}
+
 /// Join an absolute export path and one NFS directory-entry name without ever
 /// interpreting either as UTF-8.
 fn join_nfs_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
@@ -542,7 +555,7 @@ impl SimpleWalker {
         let mut stealers: Vec<Stealer<DirWork>> = Vec::new();
 
         for _ in 0..self.config.worker_count {
-            let w = DequeWorker::new_fifo();
+            let w = dir_queue();
             stealers.push(w.stealer());
             workers_local.push(w);
         }
@@ -2317,12 +2330,13 @@ mod tests {
     //
     // `FakeNfs` answers the calls a worker makes from tables, so both
     // loops run end to end without a server. The tests below cover the
-    // entries READDIRPLUS returns without attributes.
+    // order directories are read in and the entries READDIRPLUS returns
+    // without attributes.
 
     use crate::error::{NfsError, NfsResult};
     use crate::nfs::connection::InflightReaddir;
     use crate::nfs::types::{EntryAttrs, LookupReply, NfsDirEntry, NfsStat};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, VecDeque};
 
     #[derive(Default)]
@@ -2338,6 +2352,10 @@ mod tests {
         lookups: HashMap<(Vec<u8>, Vec<u8>), NfsResult<LookupReply>>,
         /// Every call, in order.
         calls: RefCell<Vec<String>>,
+        /// The walk's count of directories queued or being read, and the
+        /// most it has been when a directory read started.
+        pending: RefCell<Option<Arc<AtomicU64>>>,
+        max_pending: Cell<u64>,
     }
 
     fn show(bytes: &[u8]) -> String {
@@ -2347,6 +2365,13 @@ mod tests {
     impl FakeNfs {
         fn log(&self, call: String) {
             self.calls.borrow_mut().push(call);
+        }
+
+        fn note_pending(&self) {
+            if let Some(pending) = self.pending.borrow().as_ref() {
+                let now = pending.load(Ordering::SeqCst);
+                self.max_pending.set(self.max_pending.get().max(now));
+            }
         }
 
         fn dir(&mut self, path: &[u8], fh: &[u8], entries: Vec<NfsDirEntry>) {
@@ -2394,6 +2419,7 @@ mod tests {
             callback: &mut dyn FnMut(Vec<NfsDirEntry>) -> bool,
         ) -> NfsResult<usize> {
             self.log(format!("READDIRPLUS {}", show(file_handle)));
+            self.note_pending();
             let entries = self.dirs.get(file_handle).ok_or(NfsError::StaleHandle {
                 path: show(file_handle),
             })?;
@@ -2423,6 +2449,7 @@ mod tests {
             tag: u64,
         ) -> NfsResult<InflightReaddir> {
             self.log(format!("READDIRPLUS {}", show(file_handle)));
+            self.note_pending();
             Ok(match self.dirs.get(file_handle) {
                 // One page holds the whole directory.
                 Some(entries) => InflightReaddir::completed(
@@ -2551,7 +2578,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let injector = Arc::new(Injector::new());
         injector.push(DirWork::fresh(b"/".to_vec(), 0, None));
-        let local = DequeWorker::new_fifo();
+        let local = dir_queue();
         let stealers = Arc::new(vec![local.stealer()]);
         let counter = || Arc::new(AtomicU64::new(0));
         let (dirs, files, bytes, errors, vanished) =
@@ -2565,6 +2592,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
         let pending = Arc::new(AtomicU64::new(1));
+        *nfs.pending.borrow_mut() = Some(Arc::clone(&pending));
         let exclude = Arc::new(exclude);
         let exclude_dirs = Arc::new(Vec::new());
 
@@ -2638,6 +2666,58 @@ mod tests {
 
     /// Both loops must treat every case the same way.
     const LOOPS: [usize; 2] = [0, 4];
+
+    /// A full tree `levels` deep under `/` in which every directory has
+    /// `fanout` subdirectories and each leaf directory holds one file.
+    /// Returns the number of directories, the root included.
+    fn full_tree(nfs: &mut FakeNfs, levels: u32, fanout: u32) -> u64 {
+        fn add(nfs: &mut FakeNfs, path: &[u8], fh: &[u8], below: u32, fanout: u32) -> u64 {
+            if below == 0 {
+                nfs.dir(path, fh, vec![listed(b"leaf", EntryType::File, 1, None)]);
+                return 1;
+            }
+            let mut dirs = 1;
+            let mut entries = Vec::new();
+            for i in 0..fanout {
+                let name = format!("d{i}").into_bytes();
+                let child = join_nfs_path(path, &name);
+                let child_fh = [b"H".as_slice(), &child].concat();
+                entries.push(listed(&name, EntryType::Directory, 2, Some(&child_fh)));
+                dirs += add(nfs, &child, &child_fh, below - 1, fanout);
+            }
+            nfs.dir(path, fh, entries);
+            dirs
+        }
+        add(nfs, b"/", b"R", levels, fanout)
+    }
+
+    /// The directories waiting to be read stay at about depth × fan-out
+    /// however wide the tree grows. Breadth first, this walk held a
+    /// whole level: 1,296 directories, the 6⁴ at the bottom.
+    #[test]
+    fn walk_goes_depth_first_so_waiting_directories_stay_few() {
+        const LEVELS: u32 = 4;
+        const FANOUT: u32 = 6;
+        for depth in LOOPS {
+            let mut nfs = FakeNfs::default();
+            let dirs = full_tree(&mut nfs, LEVELS, FANOUT);
+
+            let w = walk(&nfs, depth, vec![]);
+
+            assert_eq!(w.dirs, dirs, "depth {depth}: every directory was read");
+            assert_eq!(w.files, u64::from(FANOUT).pow(LEVELS), "depth {depth}");
+            assert_eq!(w.errors, 0, "depth {depth}");
+            // Each directory being read holds up to a fan-out of
+            // siblings queued at each level above it.
+            let slots = depth.max(1) as u64;
+            let bound = slots * u64::from(LEVELS * FANOUT);
+            assert!(
+                nfs.max_pending.get() <= bound,
+                "depth {depth}: {} directories waiting at once, more than {bound}",
+                nfs.max_pending.get()
+            );
+        }
+    }
 
     /// The regression this change exists for. A directory READDIRPLUS
     /// returns without attributes used to be written as `unknown` and
