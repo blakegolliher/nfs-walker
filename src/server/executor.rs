@@ -114,8 +114,11 @@ fn batches_to_json(batches: &[RecordBatch]) -> Result<Vec<serde_json::Value>, Se
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Int64Array, StringArray, UInt32Array, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     #[test]
@@ -146,5 +149,92 @@ mod tests {
         assert_eq!(rows[0]["value"], 100);
         assert_eq!(rows[1]["name"], "beta");
         assert_eq!(rows[1]["value"], 200);
+    }
+
+    /// A tiny scan with hard links: inode 20 has both links in the tree,
+    /// inode 30 two of its three, inode 40 one of its two. Directories
+    /// have nlink > 1 too but are never hard-linked.
+    fn hardlink_scan() -> AnalyticsContext {
+        let rows: [(&str, &str, u64, u32, u64); 9] = [
+            ("/a", "directory", 1, 3, 0),
+            ("/a/b", "directory", 2, 2, 0),
+            ("/a/f", "file", 10, 1, 100),
+            ("/a/h", "file", 20, 2, 500),
+            ("/a/b/h", "file", 20, 2, 500),
+            ("/a/m", "file", 30, 3, 7),
+            ("/a/b/m", "file", 30, 3, 7),
+            ("/a/o", "file", 40, 2, 9),
+            ("/a/s", "symlink", 50, 1, 4),
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("file_type", DataType::Utf8, false),
+            Field::new("inode", DataType::UInt64, false),
+            Field::new("nlink", DataType::UInt32, false),
+            Field::new("size", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.0))),
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.1))),
+                Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.2))),
+                Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.3))),
+                Arc::new(UInt64Array::from_iter_values(rows.iter().map(|r| r.4))),
+            ],
+        )
+        .unwrap();
+
+        let ctx = SessionContext::new();
+        let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("entries", Arc::new(table)).unwrap();
+        AnalyticsContext {
+            ctx,
+            scans: HashMap::new(),
+            data_dir: PathBuf::new(),
+            latest_scan_id: Some("test".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_inodes_by_type_counts_each_hard_linked_inode_once() {
+        let result = execute_query(&hardlink_scan(), "Q-004", &HashMap::new(), None)
+            .await
+            .unwrap();
+        let counts: Vec<_> = result
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r["file_type"].as_str().unwrap(),
+                    r["unique_inodes"].as_i64().unwrap(),
+                    r["entries"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            vec![("file", 4, 6), ("directory", 2, 2), ("symlink", 1, 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_inodes_finds_only_repeated_inodes() {
+        let result = execute_query(&hardlink_scan(), "Q-007", &HashMap::new(), None)
+            .await
+            .unwrap();
+        let mut dups: Vec<_> = result
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r["inode"].as_u64().unwrap(),
+                    r["link_count"].as_i64().unwrap(),
+                    r["example_path"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        dups.sort();
+        assert_eq!(dups, vec![(20, 2, "/a/b/h"), (30, 2, "/a/b/m")]);
     }
 }
