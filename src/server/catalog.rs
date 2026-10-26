@@ -114,8 +114,18 @@ const Q004: QueryDef = QueryDef {
     name: "Inodes by Type",
     description: "Inode count breakdown by file type",
     category: QueryCategory::CapacityVolume,
-    sql_template: "SELECT file_type, COUNT(DISTINCT inode) as unique_inodes, COUNT(*) as entries \
-        FROM {table} GROUP BY file_type ORDER BY unique_inodes DESC",
+    // Only a hard-linked non-directory (nlink > 1) can appear under more
+    // than one path, so only those entries go through the DISTINCT set;
+    // COUNT(DISTINCT inode) over every entry OOMs on 200M+ entry scans.
+    sql_template: "WITH e AS ( \
+            SELECT file_type, inode, nlink > 1 AND file_type <> 'directory' as linked \
+            FROM {table} \
+        ) \
+        SELECT file_type, \
+            COUNT(CASE WHEN NOT linked THEN 1 END) \
+                + COUNT(DISTINCT CASE WHEN linked THEN inode END) as unique_inodes, \
+            COUNT(*) as entries \
+        FROM e GROUP BY file_type ORDER BY unique_inodes DESC",
     params: &[],
 };
 
@@ -150,9 +160,10 @@ const Q007: QueryDef = QueryDef {
     name: "Duplicate Inode Detection",
     description: "Inodes appearing in multiple paths (hard links)",
     category: QueryCategory::CapacityVolume,
+    // nlink > 1 limits the GROUP BY to hard-linked files (see Q-004)
     sql_template: "SELECT inode, COUNT(*) as link_count, \
         MIN(path) as example_path, MAX(size) as size \
-        FROM {table} WHERE file_type = 'file' \
+        FROM {table} WHERE file_type = 'file' AND nlink > 1 \
         GROUP BY inode HAVING COUNT(*) > 1 \
         ORDER BY link_count DESC LIMIT {limit}",
     params: &[PARAM_LIMIT],
@@ -630,16 +641,25 @@ const PARAM_THRESHOLD: ParamDef = ParamDef {
 
 // ─── Static catalog ──────────────────────────────────────────────
 
+#[rustfmt::skip]
 pub static QUERY_CATALOG: &[QueryDef] = &[
     // Capacity & Volume
-    Q001, Q002, Q003, Q004, Q005, Q006, Q007, Q008, // Ownership & Access
-    Q010, Q011, Q012, Q013, Q015, // Directory Structure
-    Q020, Q021, Q022, Q025, Q027, // File Size
-    Q030, Q031, Q032, Q033, Q034, Q036, // File Type & Extension
-    Q040, Q041, Q044, // Time-Based
-    Q050, Q051, Q052, Q053, Q055, // Storage Efficiency
-    Q064, // Migration & Compliance
-    Q073, // Scan Operations
+    Q001, Q002, Q003, Q004, Q005, Q006, Q007, Q008,
+    // Ownership & Access
+    Q010, Q011, Q012, Q013, Q015,
+    // Directory Structure
+    Q020, Q021, Q022, Q025, Q027,
+    // File Size
+    Q030, Q031, Q032, Q033, Q034, Q036,
+    // File Type & Extension
+    Q040, Q041, Q044,
+    // Time-Based
+    Q050, Q051, Q052, Q053, Q055,
+    // Storage Efficiency
+    Q064,
+    // Migration & Compliance
+    Q073,
+    // Scan Operations
     Q080, Q081,
 ];
 
